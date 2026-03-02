@@ -33,7 +33,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, 65535)
 		for {
 			select {
 			case <-bridgeCtx.Done():
@@ -55,7 +55,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, 65535)
 		for {
 			select {
 			case <-bridgeCtx.Done():

@@ -177,28 +177,39 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 		ourAddrs[i] = a.RelayAddr.String()
 	}
 
-	// 4. Wait for server peer.
-	_, err = sigClient.WaitForPeer(ctx)
-	if err != nil {
-		sigClient.Close()
-		t.mgr.CloseAll()
-		return fmt.Errorf("wait for peer: %w", err)
-	}
-
-	// 5. Exchange relay addresses.
-	if err := sigClient.SendRelayAddrs(ctx, ourAddrs, "client"); err != nil {
-		sigClient.Close()
-		t.mgr.CloseAll()
-		return fmt.Errorf("send relay addrs: %w", err)
-	}
+	// 4. Exchange relay addresses with retry.
+	sendDone := make(chan struct{})
+	sendCtx, sendCancel := context.WithCancel(ctx)
+	go func() {
+		defer close(sendDone)
+		for {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client"); err != nil {
+				return
+			}
+			select {
+			case <-sendCtx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
 
 	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
 	if err != nil {
+		sendCancel()
+		<-sendDone
 		sigClient.Close()
 		t.mgr.CloseAll()
 		return fmt.Errorf("recv relay addrs: %w", err)
 	}
-	sigClient.Close()
+
+	// Keep sending our addrs for a few more seconds so the peer receives them.
+	go func() {
+		time.Sleep(5 * time.Second)
+		sendCancel()
+		<-sendDone
+		sigClient.Close()
+	}()
 
 	pairCount := len(allocs)
 	if len(serverAddrs) < pairCount {

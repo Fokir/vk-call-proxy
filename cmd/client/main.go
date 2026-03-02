@@ -190,24 +190,38 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		ourAddrs[i] = a.RelayAddr.String()
 	}
 
-	// 4. Wait for remote peer (server) to join.
-	_, err = sigClient.WaitForPeer(ctx)
-	if err != nil {
-		logger.Error("wait for peer failed", "err", err)
-		os.Exit(1)
-	}
-
-	// 5. Exchange relay addresses.
-	if err := sigClient.SendRelayAddrs(ctx, ourAddrs, "client"); err != nil {
-		logger.Error("send relay addrs failed", "err", err)
-		os.Exit(1)
-	}
+	// 4. Exchange relay addresses with retry.
+	// Send our addresses periodically until the peer receives them.
+	sendDone := make(chan struct{})
+	sendCtx, sendCancel := context.WithCancel(ctx)
+	go func() {
+		defer close(sendDone)
+		for {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client"); err != nil {
+				return
+			}
+			select {
+			case <-sendCtx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
 
 	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
 	if err != nil {
+		sendCancel()
+		<-sendDone
 		logger.Error("recv relay addrs failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Keep sending our addrs for a few more seconds so the peer receives them.
+	go func() {
+		time.Sleep(5 * time.Second)
+		sendCancel()
+		<-sendDone
+	}()
 
 	// Match allocations to server addresses.
 	pairCount := len(allocs)

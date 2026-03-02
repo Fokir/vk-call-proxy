@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -82,9 +83,12 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 }
 
 // readLoop reads frames from a single underlying connection.
+// DTLS is message-oriented, so we wrap the connection in a bufio.Reader
+// to provide stream semantics for ReadFrame's io.ReadFull calls.
 func (m *Mux) readLoop(idx int, mc *muxConn) {
+	br := bufio.NewReaderSize(mc.conn, 16384)
 	for {
-		f, err := ReadFrame(mc.conn)
+		f, err := ReadFrame(br)
 		if err != nil {
 			if m.ctx.Err() != nil {
 				return

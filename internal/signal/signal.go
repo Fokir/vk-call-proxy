@@ -91,7 +91,8 @@ func (c *Client) open(blob string) ([]byte, error) {
 
 type notification struct {
 	Name string          `json:"notification"`
-	Data json.RawMessage `json:"data"`
+	Data json.RawMessage `json:"data"` // used by custom-data
+	Raw  json.RawMessage // the entire message (for participant-joined etc.)
 }
 
 type command struct {
@@ -135,6 +136,13 @@ func fromWireRole(mode string) string {
 // Connect dials the VK WebSocket endpoint and starts the read loop.
 // The first message received is a "connection" notification with our peer ID.
 func Connect(ctx context.Context, wsEndpoint string, logger *slog.Logger) (*Client, error) {
+	// VK requires additional query parameters for the signaling WebSocket.
+	sep := "&"
+	if !strings.Contains(wsEndpoint, "?") {
+		sep = "?"
+	}
+	wsEndpoint += sep + "platform=WEB&appVersion=1.1&version=5&device=browser&clientType=PORTAL&deviceIdx=0"
+
 	dialer := websocket.Dialer{}
 	conn, _, err := dialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
@@ -154,16 +162,31 @@ func Connect(ctx context.Context, wsEndpoint string, logger *slog.Logger) (*Clie
 		conn.Close()
 		return nil, fmt.Errorf("read connection notification: %w", err)
 	}
+	logger.Debug("signaling raw connection message", "raw", string(msg))
 
-	var connNotif struct {
+	// The first message can be a "connection" notification or an error.
+	var envelope struct {
+		Type         string `json:"type"`
 		Notification string `json:"notification"`
-		PeerID       string `json:"peerId"`
+		Error        string `json:"error"`
+		Message      string `json:"message"`
+		PeerID       struct {
+			ID json.Number `json:"id"`
+		} `json:"peerId"`
 	}
-	if err := json.Unmarshal(msg, &connNotif); err != nil {
+	if err := json.Unmarshal(msg, &envelope); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("parse connection notification: %w", err)
+		return nil, fmt.Errorf("parse first message (raw=%s): %w", string(msg), err)
 	}
-	c.myPeerID = connNotif.PeerID
+	if envelope.Error != "" {
+		conn.Close()
+		return nil, fmt.Errorf("signaling error: %s: %s", envelope.Error, envelope.Message)
+	}
+	if envelope.Notification != "connection" {
+		conn.Close()
+		return nil, fmt.Errorf("expected 'connection' notification, got %q (raw=%s)", envelope.Notification, string(msg))
+	}
+	c.myPeerID = envelope.PeerID.ID.String()
 	logger.Info("signaling connected", "peer_id", c.myPeerID)
 
 	go c.readLoop()
@@ -176,25 +199,36 @@ func (c *Client) readLoop() {
 	for {
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
-			c.logger.Debug("signaling read error", "err", err)
+			if ce, ok := err.(*websocket.CloseError); ok {
+				c.logger.Warn("signaling websocket closed", "code", ce.Code, "reason", ce.Text)
+			} else {
+				c.logger.Warn("signaling read error", "err", err)
+			}
 			return
 		}
 
 		// VK sends text "ping" for keepalive.
 		if string(msg) == "ping" {
 			c.mu.Lock()
-			c.conn.WriteMessage(websocket.TextMessage, []byte("pong"))
+			err := c.conn.WriteMessage(websocket.TextMessage, []byte("pong"))
 			c.mu.Unlock()
+			if err != nil {
+				c.logger.Warn("signaling pong write failed", "err", err)
+			}
 			continue
 		}
+
+		c.logger.Debug("signaling recv", "raw", string(msg))
 
 		var notif notification
 		if err := json.Unmarshal(msg, &notif); err != nil {
 			c.logger.Debug("signaling parse error", "raw", string(msg), "err", err)
 			continue
 		}
+		notif.Raw = msg // preserve the entire message for top-level fields
 
 		if notif.Name != "" {
+			c.logger.Info("signaling notification", "name", notif.Name)
 			select {
 			case c.incoming <- notif:
 			default:
@@ -204,8 +238,12 @@ func (c *Client) readLoop() {
 	}
 }
 
-// WaitForPeer blocks until a "participant-joined" notification arrives.
-func (c *Client) WaitForPeer(ctx context.Context) (string, error) {
+// WaitForPeer blocks until a "participant-joined" notification arrives
+// from a peer that is not one of our own TURN allocations. skipCount
+// specifies how many participant-joined notifications to skip (typically
+// equal to the number of TURN allocations created before calling this).
+func (c *Client) WaitForPeer(ctx context.Context, skipCount int) (string, error) {
+	skipped := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -214,16 +252,27 @@ func (c *Client) WaitForPeer(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("signaling connection closed")
 		case notif := <-c.incoming:
 			if notif.Name == "participant-joined" {
+				// VK puts participant data at the top level, not inside "data".
 				var data struct {
-					PeerID string `json:"peerId"`
+					Participant struct {
+						PeerID struct {
+							ID json.Number `json:"id"`
+						} `json:"peerId"`
+					} `json:"participant"`
 				}
-				if err := json.Unmarshal(notif.Data, &data); err != nil {
+				if err := json.Unmarshal(notif.Raw, &data); err != nil {
 					c.logger.Warn("parse participant-joined", "err", err)
 					continue
 				}
-				c.remotePeer = data.PeerID
-				c.logger.Info("remote peer joined", "peer_id", data.PeerID)
-				return data.PeerID, nil
+				peerID := data.Participant.PeerID.ID.String()
+				if skipped < skipCount {
+					skipped++
+					c.logger.Debug("skipping own participant-joined", "peer_id", peerID, "skipped", skipped, "of", skipCount)
+					continue
+				}
+				c.remotePeer = peerID
+				c.logger.Info("remote peer joined", "peer_id", peerID)
+				return peerID, nil
 			}
 		}
 	}
@@ -282,10 +331,21 @@ func (c *Client) RecvRelayAddrs(ctx context.Context) (addrs []string, role strin
 			return nil, "", fmt.Errorf("signaling connection closed")
 		case notif := <-c.incoming:
 			if notif.Name == "custom-data" {
-				// data is a JSON string (base64 blob, optionally AES-GCM encrypted).
+				// Try notif.Data first; fall back to top-level "data" from Raw.
+				dataField := notif.Data
+				if len(dataField) == 0 || string(dataField) == "null" {
+					var raw struct {
+						Data json.RawMessage `json:"data"`
+					}
+					if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
+						dataField = raw.Data
+					}
+				}
+				c.logger.Debug("custom-data received", "data_len", len(dataField))
+
 				var blob string
-				if err := json.Unmarshal(notif.Data, &blob); err != nil {
-					c.logger.Debug("custom-data not a string, skip", "err", err)
+				if err := json.Unmarshal(dataField, &blob); err != nil {
+					c.logger.Debug("custom-data not a string, skip", "data", string(dataField), "err", err)
 					continue
 				}
 				innerJSON, err := c.open(blob)

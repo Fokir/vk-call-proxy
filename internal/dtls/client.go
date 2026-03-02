@@ -40,7 +40,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, 65535)
 		for {
 			select {
 			case <-bridgeCtx.Done():
@@ -62,7 +62,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, 65535)
 		for {
 			select {
 			case <-bridgeCtx.Done():
