@@ -9,7 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,12 +21,61 @@ import (
 	"github.com/google/uuid"
 )
 
+// LogBuffer is a thread-safe ring buffer that implements io.Writer.
+// It stores the last N log lines for retrieval by native mobile code.
+type LogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	cap   int
+}
+
+// NewLogBuffer creates a ring buffer with the given capacity.
+func NewLogBuffer(capacity int) *LogBuffer {
+	return &LogBuffer{
+		lines: make([]string, 0, capacity),
+		cap:   capacity,
+	}
+}
+
+// Write implements io.Writer. It splits input by newlines and appends each line.
+func (lb *LogBuffer) Write(p []byte) (int, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	text := string(p)
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if len(lb.lines) >= lb.cap {
+			lb.lines = lb.lines[1:]
+		}
+		lb.lines = append(lb.lines, line)
+	}
+	return len(p), nil
+}
+
+// ReadAll returns all buffered lines joined by newlines.
+func (lb *LogBuffer) ReadAll() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return strings.Join(lb.lines, "\n")
+}
+
+// Clear removes all buffered lines.
+func (lb *LogBuffer) Clear() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.lines = lb.lines[:0]
+}
+
 // Tunnel is the main gomobile-exported type for mobile platforms.
 type Tunnel struct {
 	mu         sync.Mutex
 	mgr        *turn.Manager
 	m          *mux.Mux
 	logger     *slog.Logger
+	logBuf     *LogBuffer
 	cancel     context.CancelFunc
 	cleanups   []context.CancelFunc
 	nextStream atomic.Uint32
@@ -44,9 +93,21 @@ type TunnelConfig struct {
 
 // NewTunnel creates a new tunnel instance.
 func NewTunnel() *Tunnel {
+	lb := NewLogBuffer(50)
 	return &Tunnel{
-		logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		logBuf: lb,
+		logger: slog.New(slog.NewTextHandler(lb, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
+}
+
+// ReadLogs returns all buffered log lines as a single string.
+func (t *Tunnel) ReadLogs() string {
+	return t.logBuf.ReadAll()
+}
+
+// ClearLogs removes all buffered log lines.
+func (t *Tunnel) ClearLogs() {
+	t.logBuf.Clear()
 }
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.

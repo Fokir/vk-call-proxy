@@ -135,6 +135,27 @@ class CallVpnService : VpnService() {
         val mgr = getSystemService(NotificationManager::class.java)
         mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
 
+        // Log poller: reads logs from Go tunnel and broadcasts to UI
+        Thread {
+            while (running) {
+                try {
+                    val logs = tunnel?.readLogs() ?: ""
+                    if (logs.isNotEmpty()) {
+                        tunnel?.clearLogs()
+                        val logIntent = Intent(ACTION_LOG).apply {
+                            putExtra(EXTRA_LOG_TEXT, logs)
+                        }
+                        LocalBroadcastManager.getInstance(this).sendBroadcast(logIntent)
+                    }
+                    Thread.sleep(500)
+                } catch (_: InterruptedException) {
+                    break
+                } catch (_: Exception) {
+                    // ignore
+                }
+            }
+        }.start()
+
         // Read from TUN -> write to tunnel
         Thread {
             val input = FileInputStream(vpnInterface!!.fileDescriptor)
@@ -186,11 +207,13 @@ class CallVpnService : VpnService() {
         const val ACTION_START = "com.callvpn.START"
         const val ACTION_STOP = "com.callvpn.STOP"
         const val ACTION_STATE_CHANGED = "com.callvpn.STATE_CHANGED"
+        const val ACTION_LOG = "com.callvpn.LOG"
         const val EXTRA_CALL_LINK = "call_link"
         const val EXTRA_SERVER_ADDR = "server_addr"
         const val EXTRA_NUM_CONNS = "num_conns"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_STATE = "state"
+        const val EXTRA_LOG_TEXT = "log_text"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1
     }

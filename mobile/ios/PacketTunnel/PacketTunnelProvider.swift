@@ -4,19 +4,25 @@ import Bind // gomobile generated framework
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var tunnel: BindTunnel?
+    private var logTimer: DispatchSourceTimer?
+    private let logDefaults = UserDefaults(suiteName: "group.com.callvpn.app")
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        guard let callLink = options?["callLink"] as? String,
-              let serverAddr = options?["serverAddr"] as? String else {
+        guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
+              let config = proto.providerConfiguration,
+              let callLink = config["callLink"] as? String else {
             completionHandler(NSError(domain: "CallVPN", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing configuration"]))
             return
         }
 
-        let numConns = (options?["numConns"] as? Int) ?? 4
-        let token = (options?["token"] as? String) ?? ""
+        let serverAddr = (config["serverAddr"] as? String) ?? ""
+        let numConns = (config["numConns"] as? Int) ?? 4
+        let token = (config["token"] as? String) ?? ""
+
+        let tunnelRemoteAddr = serverAddr.isEmpty ? "relay.vk.com" : serverAddr
 
         // Configure tunnel network settings
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: serverAddr)
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddr)
 
         let ipv4 = NEIPv4Settings(addresses: ["10.0.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
@@ -33,17 +39,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             // Start Go tunnel
-            let config = BindTunnelConfig()
-            config.callLink = callLink
-            config.serverAddr = serverAddr
-            config.numConns = Int(numConns)
-            config.useTCP = true
-            config.token = token
+            let cfg = BindTunnelConfig()
+            cfg.callLink = callLink
+            cfg.serverAddr = serverAddr
+            cfg.numConns = Int(numConns)
+            cfg.useTCP = true
+            cfg.token = token
 
             let t = BindNewTunnel()!
 
             var startError: NSError?
-            t.start(config, error: &startError)
+            t.start(cfg, error: &startError)
 
             if let err = startError {
                 completionHandler(err)
@@ -51,9 +57,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             self?.tunnel = t
+            self?.startLogForwarding()
             self?.startPacketForwarding()
             completionHandler(nil)
         }
+    }
+
+    private func startLogForwarding() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
+            guard let self = self, let tunnel = self.tunnel else { return }
+            let logs = tunnel.readLogs()
+            if !logs.isEmpty {
+                tunnel.clearLogs()
+                // Append to existing logs in UserDefaults
+                let existing = self.logDefaults?.string(forKey: "vpn_logs") ?? ""
+                let combined = existing.isEmpty ? logs : existing + "\n" + logs
+                self.logDefaults?.set(combined, forKey: "vpn_logs")
+            }
+        }
+        timer.resume()
+        logTimer = timer
     }
 
     private func startPacketForwarding() {
@@ -94,6 +119,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        logTimer?.cancel()
+        logTimer = nil
+        logDefaults?.removeObject(forKey: "vpn_logs")
         tunnel?.stop()
         tunnel = nil
         completionHandler()

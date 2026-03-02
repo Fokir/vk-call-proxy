@@ -48,10 +48,16 @@ enum VpnState {
     }
 }
 
+enum ConnectionMode: String {
+    case relay
+    case direct
+}
+
 struct ContentView: View {
     @AppStorage("callLink") private var callLink = ""
     @AppStorage("serverAddr") private var serverAddr = ""
     @AppStorage("token") private var token = ""
+    @AppStorage("connectionMode") private var connectionModeRaw = "relay"
     @State private var vpnState: VpnState = .disconnected
     @State private var manager: NETunnelProviderManager?
     @State private var showChangeAlert = false
@@ -59,6 +65,12 @@ struct ContentView: View {
     @State private var editingCallLink = ""
     @State private var editingServerAddr = ""
     @State private var editingToken = ""
+    @State private var logLines: [String] = []
+    @State private var logPollTimer: Timer?
+
+    private var currentMode: ConnectionMode {
+        ConnectionMode(rawValue: connectionModeRaw) ?? .relay
+    }
 
     private var parsedId: String {
         parseCallLink(editingCallLink)
@@ -68,90 +80,144 @@ struct ContentView: View {
         editingCallLink.contains("vk.com/call/join/")
     }
 
-    var body: some View {
-        VStack(spacing: 16) {
-            Spacer().frame(height: 32)
-
-            // Title
-            Text("CallVPN")
-                .font(.system(size: 32, weight: .bold))
-
-            // Status
-            Text(vpnState.statusText)
-                .font(.system(size: 16, weight: .medium))
-                .foregroundColor(vpnState.statusColor)
-
-            Spacer().frame(height: 24)
-
-            // Big round button
-            Button(action: handleButtonTap) {
-                Text(vpnState.buttonText)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 140, height: 140)
-                    .background(vpnState.buttonColor)
-                    .clipShape(Circle())
-            }
-            .disabled(vpnState == .connecting)
-
-            Spacer().frame(height: 24)
-
-            // VK link input
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Ссылка VK звонка")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField("https://vk.com/call/join/...", text: $editingCallLink)
-                    .textFieldStyle(.roundedBorder)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .disabled(vpnState != .disconnected)
-                    .onChange(of: editingCallLink) { newValue in
-                        handleFieldChange(saved: callLink, new: newValue) {
-                            editingCallLink = newValue
-                        }
-                    }
-
-                if hasFullLink && !parsedId.isEmpty {
-                    Text("ID: \(parsedId)")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(.horizontal)
-
-            // Server address input
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Адрес сервера")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField("host:port", text: $editingServerAddr)
-                    .textFieldStyle(.roundedBorder)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .disabled(vpnState != .disconnected)
-                    .onChange(of: editingServerAddr) { newValue in
-                        handleFieldChange(saved: serverAddr, new: newValue) {
-                            editingServerAddr = newValue
-                        }
-                    }
-            }
-            .padding(.horizontal)
-
-            // Token input
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Токен")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                SecureField("Токен авторизации", text: $editingToken)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(vpnState != .disconnected)
-            }
-            .padding(.horizontal)
-
-            Spacer()
+    private var canConnect: Bool {
+        switch currentMode {
+        case .relay:
+            return !parsedId.isEmpty
+        case .direct:
+            return !parsedId.isEmpty && !editingServerAddr.isEmpty
         }
-        .padding()
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                Spacer().frame(height: 32)
+
+                // Title
+                Text("CallVPN")
+                    .font(.system(size: 32, weight: .bold))
+
+                // Status
+                Text(vpnState.statusText)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(vpnState.statusColor)
+
+                // Mode picker
+                Picker("Mode", selection: $connectionModeRaw) {
+                    Text("Relay-to-Relay").tag("relay")
+                    Text("Direct").tag("direct")
+                }
+                .pickerStyle(.segmented)
+                .disabled(vpnState != .disconnected)
+                .padding(.horizontal)
+
+                Spacer().frame(height: 24)
+
+                // Big round button
+                Button(action: handleButtonTap) {
+                    Text(vpnState.buttonText)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 170, height: 170)
+                        .background(vpnState.buttonColor)
+                        .clipShape(Circle())
+                }
+                .disabled(vpnState == .connecting)
+
+                Spacer().frame(height: 24)
+
+                // VK link input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Ссылка VK звонка")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("https://vk.com/call/join/...", text: $editingCallLink)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .disabled(vpnState != .disconnected)
+                        .onChange(of: editingCallLink) { newValue in
+                            handleFieldChange(saved: callLink, new: newValue) {
+                                editingCallLink = newValue
+                            }
+                        }
+
+                    if hasFullLink && !parsedId.isEmpty {
+                        Text("ID: \(parsedId)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
+                // Server address input (only in Direct mode)
+                if currentMode == .direct {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Адрес сервера")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("host:port", text: $editingServerAddr)
+                            .textFieldStyle(.roundedBorder)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                            .disabled(vpnState != .disconnected)
+                            .onChange(of: editingServerAddr) { newValue in
+                                handleFieldChange(saved: serverAddr, new: newValue) {
+                                    editingServerAddr = newValue
+                                }
+                            }
+                    }
+                    .padding(.horizontal)
+                }
+
+                // Token input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Токен")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    SecureField("Токен авторизации", text: $editingToken)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(vpnState != .disconnected)
+                }
+                .padding(.horizontal)
+
+                // Log window
+                if !logLines.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Лог")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.secondary)
+
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 2) {
+                                    ForEach(Array(logLines.enumerated()), id: \.offset) { index, line in
+                                        Text(line)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                            .id(index)
+                                    }
+                                }
+                                .padding(8)
+                            }
+                            .frame(height: 150)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                            .onChange(of: logLines.count) { _ in
+                                if let last = logLines.indices.last {
+                                    proxy.scrollTo(last, anchor: .bottom)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+
+                Spacer()
+            }
+            .padding()
+        }
         .alert("Изменить значение?", isPresented: $showChangeAlert) {
             Button("Изменить") {
                 pendingChange?()
@@ -169,19 +235,21 @@ struct ContentView: View {
             editingToken = token
             loadManager()
             observeVPNStatus()
+            startLogPolling()
+        }
+        .onDisappear {
+            stopLogPolling()
         }
     }
 
     private func handleFieldChange(saved: String, new: String, apply: @escaping () -> Void) {
         // Show confirmation only if there's a saved non-empty value being changed
-        // The onChange fires naturally, so we only intercept when saved != empty
-        // and the user is starting to modify it
     }
 
     private func handleButtonTap() {
         switch vpnState {
         case .disconnected:
-            guard !parsedId.isEmpty, !editingServerAddr.isEmpty else { return }
+            guard canConnect else { return }
             callLink = editingCallLink
             serverAddr = editingServerAddr
             token = editingToken
@@ -215,6 +283,8 @@ struct ContentView: View {
                 vpnState = .connecting
             case .disconnected, .invalid:
                 vpnState = .disconnected
+                logLines = []
+                stopLogPolling()
             case .disconnecting:
                 vpnState = .connecting
             @unknown default:
@@ -223,16 +293,37 @@ struct ContentView: View {
         }
     }
 
+    private func startLogPolling() {
+        stopLogPolling()
+        let defaults = UserDefaults(suiteName: "group.com.callvpn.app")
+        logPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            guard let logs = defaults?.string(forKey: "vpn_logs"), !logs.isEmpty else { return }
+            let newLines = logs.split(separator: "\n").map(String.init)
+            DispatchQueue.main.async {
+                logLines = (logLines + newLines).suffix(20)
+            }
+            defaults?.removeObject(forKey: "vpn_logs")
+        }
+    }
+
+    private func stopLogPolling() {
+        logPollTimer?.invalidate()
+        logPollTimer = nil
+    }
+
     private func startVPN() {
         vpnState = .connecting
+
+        let effectiveServerAddr = currentMode == .relay ? "" : editingServerAddr
+        let displayAddr = currentMode == .relay ? "relay.vk.com" : editingServerAddr
 
         let configureAndStart: (NETunnelProviderManager) -> Void = { mgr in
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = "com.callvpn.app.PacketTunnel"
-            proto.serverAddress = editingServerAddr
+            proto.serverAddress = displayAddr
             proto.providerConfiguration = [
                 "callLink": parsedId,
-                "serverAddr": editingServerAddr,
+                "serverAddr": effectiveServerAddr,
                 "numConns": 4,
                 "token": editingToken
             ]
@@ -257,6 +348,7 @@ struct ContentView: View {
                     do {
                         try (mgr.connection as? NETunnelProviderSession)?.startTunnel()
                         self.manager = mgr
+                        startLogPolling()
                     } catch {
                         NSLog("CallVPN: start error: \(error)")
                         vpnState = .disconnected
