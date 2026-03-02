@@ -3,12 +3,20 @@ name: Build Server
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -22,20 +30,35 @@ jobs:
       - name: Build server binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -o server ./cmd/server
 
-      - name: Build Docker image
-        run: docker build -f deploy/docker/Dockerfile -t call-vpn-server:${{ github.sha }} .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push Docker image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          docker tag call-vpn-server:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
-          docker tag call-vpn-server:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.sha }}
-          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
-          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.sha }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

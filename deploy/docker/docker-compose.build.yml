@@ -1,6 +1,10 @@
+## Development: build from source
+## Usage: docker compose -f docker-compose.build.yml up --build
 services:
   server:
-    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-main}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
