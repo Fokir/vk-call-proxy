@@ -94,6 +94,10 @@ jobs:
           mkdir -p mobile/android/app/libs
           gomobile bind -ldflags="-checklinkname=0" -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
 
+      - name: Generate Gradle wrapper
+        working-directory: mobile/android
+        run: gradle wrapper --gradle-version 8.5
+
       - name: Build and sign APK
         env:
           KEYSTORE_FILE: ${{ secrets.KEYSTORE_FILE }}
@@ -102,8 +106,8 @@ jobs:
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         working-directory: mobile/android
         run: |
-          chmod +x gradlew 2>/dev/null || true
-          ./gradlew assembleRelease || gradle assembleRelease
+          chmod +x gradlew
+          ./gradlew assembleRelease
           echo "$KEYSTORE_FILE" | base64 -d > ../../keystore.jks
           apksigner sign \
             --ks ../../keystore.jks \
