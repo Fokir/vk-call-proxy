@@ -31,6 +31,15 @@ type Credentials struct {
 	Port     string
 }
 
+// JoinResponse holds the full response from joining a VK conference,
+// including TURN credentials, WebSocket endpoint, and conversation info.
+type JoinResponse struct {
+	Credentials Credentials
+	WSEndpoint  string // "wss://videowebrtc.okcdn.ru/ws2?userId=...&token=..."
+	ConvID      string // conversation UUID
+	DeviceIdx   int
+}
+
 // FetchCredentials returns TURN credentials from environment variables
 // (TURN_HOST, TURN_PORT, TURN_USERNAME, TURN_PASSWORD) if all are set,
 // otherwise falls back to FetchVKCredentials.
@@ -55,6 +64,17 @@ func FetchCredentials(ctx context.Context, callLink string) (*Credentials, error
 // FetchVKCredentials obtains anonymous TURN credentials from VK using the
 // 6-step authentication chain. Each call generates a fresh anonymous identity.
 func FetchVKCredentials(ctx context.Context, callLink string) (*Credentials, error) {
+	jr, err := FetchJoinResponse(ctx, callLink)
+	if err != nil {
+		return nil, err
+	}
+	return &jr.Credentials, nil
+}
+
+// FetchJoinResponse performs the full 6-step VK authentication chain and
+// returns the complete join response including TURN credentials, WebSocket
+// endpoint, and conversation info needed for relay-to-relay signaling.
+func FetchJoinResponse(ctx context.Context, callLink string) (*JoinResponse, error) {
 	client := &http.Client{Timeout: httpTimeout}
 
 	// Step 1: Get anonymous token
@@ -88,13 +108,18 @@ func FetchVKCredentials(ctx context.Context, callLink string) (*Credentials, err
 		return nil, fmt.Errorf("step5 ok login: %w", err)
 	}
 
-	// Step 6: Join conference and extract TURN credentials
-	creds, err := okJoinConference(ctx, client, callLink, token4, token5)
+	// Step 6: Join conference and extract TURN credentials + WS info
+	result, err := okJoinConference(ctx, client, callLink, token4, token5)
 	if err != nil {
 		return nil, fmt.Errorf("step6 join conference: %w", err)
 	}
 
-	return creds, nil
+	return &JoinResponse{
+		Credentials: *result.creds,
+		WSEndpoint:  result.endpoint,
+		ConvID:      result.convID,
+		DeviceIdx:   result.deviceIdx,
+	}, nil
 }
 
 func vkAnonToken(ctx context.Context, client *http.Client) (string, error) {
@@ -221,7 +246,14 @@ func okAnonLogin(ctx context.Context, client *http.Client, deviceID string) (str
 	return resp.SessionKey, nil
 }
 
-func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, sessionKey string) (*Credentials, error) {
+type joinConferenceResult struct {
+	creds    *Credentials
+	endpoint string
+	convID   string
+	deviceIdx int
+}
+
+func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, sessionKey string) (*joinConferenceResult, error) {
 	data := url.Values{
 		"joinLink":        {link},
 		"isVideo":         {"false"},
@@ -242,6 +274,9 @@ func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, s
 			Credential string   `json:"credential"`
 			URLs       []string `json:"urls"`
 		} `json:"turn_server"`
+		Endpoint  string `json:"endpoint"`
+		ID        string `json:"id"`
+		DeviceIdx int    `json:"device_idx"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
@@ -251,11 +286,16 @@ func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, s
 	}
 
 	host, port := parseTURNURL(resp.TurnServer.URLs[0])
-	return &Credentials{
-		Username: resp.TurnServer.Username,
-		Password: resp.TurnServer.Credential,
-		Host:     host,
-		Port:     port,
+	return &joinConferenceResult{
+		creds: &Credentials{
+			Username: resp.TurnServer.Username,
+			Password: resp.TurnServer.Credential,
+			Host:     host,
+			Port:     port,
+		},
+		endpoint:  resp.Endpoint,
+		convID:    resp.ID,
+		deviceIdx: resp.DeviceIdx,
 	}, nil
 }
 

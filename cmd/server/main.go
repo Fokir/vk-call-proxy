@@ -16,6 +16,8 @@ import (
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
+	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
+	"github.com/call-vpn/call-vpn/internal/turn"
 )
 
 // session groups multiple DTLS connections from a single client.
@@ -35,11 +37,17 @@ var (
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
+	callLink := flag.String("link", "", "VK call link ID for relay-to-relay mode")
+	numConns := flag.Int("n", 4, "number of parallel TURN+DTLS connections (relay mode)")
+	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	flag.Parse()
 
 	// Fall back to environment variable if flag not set.
 	if *authToken == "" {
 		*authToken = os.Getenv("VPN_TOKEN")
+	}
+	if *callLink == "" {
+		*callLink = os.Getenv("VK_CALL_LINK")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -56,14 +64,23 @@ func main() {
 		cancel()
 	}()
 
-	ln, err := internaldtls.Listen(*listenAddr)
+	if *callLink != "" {
+		runRelayMode(ctx, logger, siren, *callLink, *numConns, *useTCP, *authToken)
+	} else {
+		runDirectMode(ctx, logger, siren, *listenAddr, *authToken)
+	}
+}
+
+// runDirectMode starts the server in direct mode (DTLS/UDP listener).
+func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, listenAddr, authToken string) {
+	ln, err := internaldtls.Listen(listenAddr)
 	if err != nil {
 		logger.Error("failed to start DTLS listener", "err", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
 
-	logger.Info("server listening (DTLS/UDP)", "addr", *listenAddr)
+	logger.Info("server listening (DTLS/UDP, direct mode)", "addr", listenAddr)
 
 	go func() {
 		<-ctx.Done()
@@ -79,8 +96,126 @@ func main() {
 			logger.Warn("accept error", "err", err)
 			continue
 		}
-		go handleConnection(ctx, logger, siren, conn, *authToken)
+		go handleConnection(ctx, logger, siren, conn, authToken)
 	}
+}
+
+// runRelayMode starts the server in relay-to-relay mode. Both peers
+// join a VK call, exchange relay addresses via WebSocket signaling,
+// and establish DTLS connections through TURN relays.
+func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	callLink string, numConns int, useTCP bool, authToken string) {
+
+	logger.Info("starting relay-to-relay mode", "link", callLink, "conns", numConns)
+
+	// 1. Join VK conference to get TURN creds and WS endpoint.
+	jr, err := turn.FetchJoinResponse(ctx, callLink)
+	if err != nil {
+		logger.Error("failed to join VK conference", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("joined VK conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+
+	// 2. Connect to VK WebSocket signaling.
+	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, logger.With("component", "signaling"))
+	if err != nil {
+		logger.Error("signaling connect failed", "err", err)
+		os.Exit(1)
+	}
+	defer sigClient.Close()
+
+	// 3. Create TURN allocations.
+	mgr := turn.NewManager(callLink, useTCP, logger)
+	defer mgr.CloseAll()
+
+	allocs, err := mgr.Allocate(ctx, numConns)
+	if err != nil {
+		siren.AlertTURNAuthFailure(ctx, err)
+		logger.Error("failed to allocate TURN connections", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("TURN allocations created", "count", len(allocs))
+
+	// Collect our relay addresses.
+	ourAddrs := make([]string, len(allocs))
+	for i, a := range allocs {
+		ourAddrs[i] = a.RelayAddr.String()
+	}
+
+	// 4. Wait for remote peer to join.
+	_, err = sigClient.WaitForPeer(ctx)
+	if err != nil {
+		logger.Error("wait for peer failed", "err", err)
+		os.Exit(1)
+	}
+
+	// 5. Exchange relay addresses.
+	if err := sigClient.SendRelayAddrs(ctx, ourAddrs, "server"); err != nil {
+		logger.Error("send relay addrs failed", "err", err)
+		os.Exit(1)
+	}
+
+	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
+	if err != nil {
+		logger.Error("recv relay addrs failed", "err", err)
+		os.Exit(1)
+	}
+
+	// Match allocations to client addresses (use min of both counts).
+	pairCount := len(allocs)
+	if len(clientAddrs) < pairCount {
+		pairCount = len(clientAddrs)
+	}
+
+	// 6. Punch relay for each pair.
+	for i := 0; i < pairCount; i++ {
+		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
+		if err != nil {
+			logger.Warn("resolve client relay addr", "index", i, "addr", clientAddrs[i], "err", err)
+			continue
+		}
+		if err := internaldtls.PunchRelay(allocs[i].RelayConn, clientUDP); err != nil {
+			logger.Warn("punch relay failed", "index", i, "err", err)
+		}
+	}
+
+	// Short delay for permissions to propagate.
+	time.Sleep(500 * time.Millisecond)
+
+	// 7. Accept DTLS connections over TURN relays.
+	var cleanups []context.CancelFunc
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	for i := 0; i < pairCount; i++ {
+		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
+		if err != nil {
+			continue
+		}
+
+		dtlsConn, cleanup, err := internaldtls.AcceptOverTURN(ctx, allocs[i].RelayConn, clientUDP)
+		if err != nil {
+			logger.Warn("AcceptOverTURN failed", "index", i, "err", err)
+			continue
+		}
+		cleanups = append(cleanups, cleanup)
+
+		logger.Info("relay DTLS connection accepted", "index", i)
+		go handleConnection(ctx, logger, siren, dtlsConn, authToken)
+	}
+
+	if len(cleanups) == 0 {
+		logger.Error("no relay DTLS connections established")
+		os.Exit(1)
+	}
+
+	logger.Info("relay-to-relay mode active", "connections", len(cleanups))
+
+	// Block until shutdown.
+	<-ctx.Done()
 }
 
 func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn, authToken string) {

@@ -5,6 +5,8 @@ services:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
       - VPN_TOKEN=${VPN_TOKEN:-}
+      - VK_CALL_LINK=${VK_CALL_LINK:-}
+      - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
     restart: unless-stopped
     deploy:
