@@ -62,7 +62,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: ${{ env.GO_VERSION }}
 
       - uses: actions/setup-java@v4
         with:
@@ -73,10 +73,9 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install gomobile
-        env:
-          GOTOOLCHAIN: local
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
 
       - name: Inject version from tag
@@ -90,8 +89,6 @@ jobs:
           echo "Set versionName=$VERSION versionCode=$VERSION_CODE"
 
       - name: Build Go AAR
-        env:
-          GOTOOLCHAIN: local
         run: gomobile bind -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
 
       - name: Build and sign APK
