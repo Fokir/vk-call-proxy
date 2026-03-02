@@ -35,6 +35,9 @@ mobile/ios/*.xcarchive
 *.ipa
 *.apk
 
+# References
+refs/calls-sdk/
+
 # Environment
 .env
 test/integration/.env
