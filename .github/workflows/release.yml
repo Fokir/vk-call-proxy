@@ -7,6 +7,12 @@ on:
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  GO_VERSION: "1.25.7"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-desktop:
@@ -32,9 +38,9 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: ${{ env.GO_VERSION }}
 
-      - name: Build
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -46,31 +52,6 @@ jobs:
           name: ${{ matrix.output }}
           path: ${{ matrix.output }}
 
-  build-server:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Build and push Docker image
-        run: |
-          docker build -f deploy/docker/Dockerfile -t call-vpn-server:${{ github.ref_name }} .
-
-      - name: Login to Docker Registry
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - name: Push Docker image
-        run: |
-          docker tag call-vpn-server:${{ github.ref_name }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.ref_name }}
-          docker tag call-vpn-server:${{ github.ref_name }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
-          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.ref_name }}
-          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
-
   build-android:
     runs-on: ubuntu-latest
 
@@ -81,7 +62,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: ${{ env.GO_VERSION }}
 
       - uses: actions/setup-java@v4
         with:
@@ -95,6 +76,16 @@ jobs:
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
+
+      - name: Inject version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION_CODE=$(echo "$VERSION" | awk -F. '{printf "%d%03d%03d", $1, $2, $3}')
+          # Ensure versionCode is at least 1
+          if [ "$VERSION_CODE" -eq 0 ]; then VERSION_CODE=1; fi
+          sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/" mobile/android/app/build.gradle.kts
+          sed -i "s/versionName = \"[^\"]*\"/versionName = \"$VERSION\"/" mobile/android/app/build.gradle.kts
+          echo "Set versionName=$VERSION versionCode=$VERSION_CODE"
 
       - name: Build Go AAR
         run: gomobile bind -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
@@ -124,68 +115,54 @@ jobs:
           path: app-release.apk
 
   build-ios:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: iOS build skipped
+        run: |
+          echo "::notice::iOS build skipped: no Apple Developer ID configured. Set up Apple signing secrets to enable iOS builds."
+
+  build-server:
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - uses: actions/setup-go@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          go-version: "1.23"
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install gomobile
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          gomobile init
-
-      - name: Build Go XCFramework
-        run: gomobile bind -target ios -o mobile/ios/Bind.xcframework ./mobile/bind/
-
-      - name: Install certificate and build
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
-        run: |
-          CERT_PATH=$RUNNER_TEMP/cert.p12
-          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-
-          echo "$APPLE_CERTIFICATE" | base64 -d > "$CERT_PATH"
-          echo "$APPLE_PROVISIONING_PROFILE" | base64 -d > "$PP_PATH"
-
-          security create-keychain -p "" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
-
-          xcodebuild -project mobile/ios/CallVPN.xcodeproj \
-            -scheme CallVPN \
-            -sdk iphoneos \
-            -configuration Release \
-            -archivePath $RUNNER_TEMP/CallVPN.xcarchive \
-            archive
-
-          xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/CallVPN.xcarchive \
-            -exportOptionsPlist mobile/ios/ExportOptions.plist \
-            -exportPath $RUNNER_TEMP/export
-
-          cp $RUNNER_TEMP/export/*.ipa ./CallVPN.ipa
-
-      - uses: actions/upload-artifact@v4
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          name: CallVPN.ipa
-          path: CallVPN.ipa
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
-    needs: [build-desktop, build-server, build-android, build-ios]
+    needs: [build-desktop, build-android, build-ios, build-server]
     runs-on: ubuntu-latest
 
     steps:
@@ -202,5 +179,4 @@ jobs:
             artifacts/client-darwin-amd64
             artifacts/client-darwin-arm64
             artifacts/app-release.apk
-            artifacts/CallVPN.ipa
           generate_release_notes: true
