@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -28,6 +29,27 @@ type Credentials struct {
 	Password string
 	Host     string
 	Port     string
+}
+
+// FetchCredentials returns TURN credentials from environment variables
+// (TURN_HOST, TURN_PORT, TURN_USERNAME, TURN_PASSWORD) if all are set,
+// otherwise falls back to FetchVKCredentials.
+func FetchCredentials(ctx context.Context, callLink string) (*Credentials, error) {
+	host := os.Getenv("TURN_HOST")
+	port := os.Getenv("TURN_PORT")
+	user := os.Getenv("TURN_USERNAME")
+	pass := os.Getenv("TURN_PASSWORD")
+
+	if host != "" && port != "" && user != "" && pass != "" {
+		return &Credentials{
+			Username: user,
+			Password: pass,
+			Host:     host,
+			Port:     port,
+		}, nil
+	}
+
+	return FetchVKCredentials(ctx, callLink)
 }
 
 // FetchVKCredentials obtains anonymous TURN credentials from VK using the

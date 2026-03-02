@@ -100,7 +100,7 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 
 func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
 	// Each allocation gets fresh credentials (different anonymous identity)
-	creds, err := FetchVKCredentials(ctx, m.callLink)
+	creds, err := FetchCredentials(ctx, m.callLink)
 	if err != nil {
 		return nil, fmt.Errorf("fetch credentials: %w", err)
 	}

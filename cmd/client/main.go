@@ -32,6 +32,9 @@ func main() {
 	signalURL := flag.String("signal", "", "Signal server URL (e.g. http://server:9443/signal)")
 	psk := flag.String("psk", "", "Pre-shared key for authentication")
 
+	// Bind address for proxy listeners
+	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
+
 	// Direct mode flags (legacy)
 	directMode := flag.Bool("direct", false, "Use direct TCP mode (legacy)")
 	serverAddr := flag.String("server", "", "Direct mode: remote VPN server address (host:port)")
@@ -65,19 +68,19 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error: --server is required in direct mode")
 			os.Exit(1)
 		}
-		runDirectMode(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort)
+		runDirectMode(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
 	} else {
 		if *signalURL == "" || *psk == "" {
 			fmt.Fprintln(os.Stderr, "Error: --signal and --psk are required in relay mode")
 			os.Exit(1)
 		}
-		runRelayMode(ctx, logger, siren, *callLink, *signalURL, *psk, *numConns, *useTCP, *socks5Port, *httpPort)
+		runRelayMode(ctx, logger, siren, *callLink, *signalURL, *psk, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
 	}
 }
 
 // runRelayMode establishes a relay-to-relay VPN session via signaling server.
 func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, signalURL, psk string, numConns int, useTCP bool, socks5Port, httpPort int) {
+	callLink, signalURL, psk string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
 
 	// 1. Create client-side TURN allocations
 	logger.Info("establishing TURN connections", "count", numConns, "link", callLink)
@@ -147,12 +150,12 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	go m.StartPingLoop(ctx, 30*time.Second)
 
 	// 7. Start proxies
-	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort)
+	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort, bindAddr)
 }
 
 // runDirectMode uses the legacy direct TCP connection to the VPN server.
 func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, serverAddr string, numConns int, useTCP bool, socks5Port, httpPort int) {
+	callLink, serverAddr string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
 
 	logger.Info("establishing TURN connections", "count", numConns, "link", callLink)
 	mgr := turn.NewManager(callLink, useTCP, logger)
@@ -182,12 +185,12 @@ func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.S
 
 	go m.DispatchLoop(ctx)
 
-	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort)
+	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort, bindAddr)
 }
 
 // startProxies starts SOCKS5 and HTTP proxies over the given Mux.
 func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	m *mux.Mux, activeConns, totalConns, socks5Port, httpPort int) {
+	m *mux.Mux, activeConns, totalConns, socks5Port, httpPort int, bindAddr string) {
 
 	var nextStreamID atomic.Uint32
 
@@ -204,14 +207,14 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		return stream, nil
 	}
 
-	socks5Addr := fmt.Sprintf("127.0.0.1:%d", socks5Port)
+	socks5Addr := fmt.Sprintf("%s:%d", bindAddr, socks5Port)
 	socks5Srv := &socks5.Server{
 		Addr:   socks5Addr,
 		Dial:   dialTunnel,
 		Logger: logger.With("proxy", "socks5"),
 	}
 
-	httpAddr := fmt.Sprintf("127.0.0.1:%d", httpPort)
+	httpAddr := fmt.Sprintf("%s:%d", bindAddr, httpPort)
 	httpSrv := &httpproxy.Server{
 		Addr:   httpAddr,
 		Dial:   dialTunnel,

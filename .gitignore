@@ -36,6 +36,7 @@ mobile/ios/*.xcarchive
 
 # Environment
 .env
+test/integration/.env
 *.p12
 *.mobileprovision
 *.jks
