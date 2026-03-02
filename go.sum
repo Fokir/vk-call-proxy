@@ -1,3 +1,5 @@
+github.com/cbeuw/connutil v1.0.1 h1:LWuNYjwm7JEDYG/ISAO1TfU4G+q2dA5NhR97eq2roCA=
+github.com/cbeuw/connutil v1.0.1/go.mod h1:lKofNtrW7Atmosgp1eNnTt2j2NjA2IkifapgLVI1QtA=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=

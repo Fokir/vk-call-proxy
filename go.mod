@@ -3,13 +3,14 @@ module github.com/call-vpn/call-vpn
 go 1.25.7
 
 require (
+	github.com/cbeuw/connutil v1.0.1
 	github.com/google/uuid v1.6.0
+	github.com/pion/dtls/v3 v3.0.7
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v4 v4.1.4
 )
 
 require (
-	github.com/pion/dtls/v3 v3.0.7 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/stun/v3 v3.0.1 // indirect
 	github.com/pion/transport/v3 v3.0.8 // indirect

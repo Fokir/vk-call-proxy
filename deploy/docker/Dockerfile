@@ -15,10 +15,9 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /server /server
 
-EXPOSE 9443/tcp
-EXPOSE 9000/tcp
+EXPOSE 9000/udp
 
 USER nonroot:nonroot
 
 ENTRYPOINT ["/server"]
-CMD ["--signal=0.0.0.0:9443"]
+CMD ["--listen=0.0.0.0:9000"]

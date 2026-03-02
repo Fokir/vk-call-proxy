@@ -13,38 +13,29 @@ import (
 	"syscall"
 	"time"
 
+	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
 	httpproxy "github.com/call-vpn/call-vpn/internal/proxy/http"
 	"github.com/call-vpn/call-vpn/internal/proxy/socks5"
-	sig "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
+	"github.com/google/uuid"
 )
 
 func main() {
 	socks5Port := flag.Int("socks5-port", 1080, "SOCKS5 proxy listen port")
 	httpPort := flag.Int("http-port", 8080, "HTTP/HTTPS proxy listen port")
 	callLink := flag.String("link", "", "VK call link ID (e.g. abcd1234)")
-	numConns := flag.Int("n", 4, "Number of parallel TURN connections")
+	numConns := flag.Int("n", 4, "Number of parallel TURN+DTLS connections")
 	useTCP := flag.Bool("tcp", true, "Use TCP for TURN connections")
-
-	// Relay mode flags (default)
-	signalURL := flag.String("signal", "", "Signal server URL (e.g. http://server:9443/signal)")
-	psk := flag.String("psk", "", "Pre-shared key for authentication")
-
-	// Bind address for proxy listeners
+	serverAddr := flag.String("server", "", "VPN server address (host:port)")
 	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
-
-	// Direct mode flags (legacy)
-	directMode := flag.Bool("direct", false, "Use direct TCP mode (legacy)")
-	serverAddr := flag.String("server", "", "Direct mode: remote VPN server address (host:port)")
 
 	flag.Parse()
 
-	if *callLink == "" {
-		fmt.Fprintln(os.Stderr, "Error: --link is required")
-		fmt.Fprintln(os.Stderr, "Usage: client --link=<vk-call-link> --signal=<url> --psk=<secret> [options]")
-		fmt.Fprintln(os.Stderr, "       client --link=<vk-call-link> --direct --server=<host:port> [options]")
+	if *callLink == "" || *serverAddr == "" {
+		fmt.Fprintln(os.Stderr, "Error: --link and --server are required")
+		fmt.Fprintln(os.Stderr, "Usage: client --link=<vk-call-link> --server=<host:port> [options]")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -63,100 +54,22 @@ func main() {
 		cancel()
 	}()
 
-	if *directMode {
-		if *serverAddr == "" {
-			fmt.Fprintln(os.Stderr, "Error: --server is required in direct mode")
-			os.Exit(1)
-		}
-		runDirectMode(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
-	} else {
-		if *signalURL == "" || *psk == "" {
-			fmt.Fprintln(os.Stderr, "Error: --signal and --psk are required in relay mode")
-			os.Exit(1)
-		}
-		runRelayMode(ctx, logger, siren, *callLink, *signalURL, *psk, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
-	}
+	run(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
 }
 
-// runRelayMode establishes a relay-to-relay VPN session via signaling server.
-func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, signalURL, psk string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
+func run(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
 
-	// 1. Create client-side TURN allocations
-	logger.Info("establishing TURN connections", "count", numConns, "link", callLink)
-	mgr := turn.NewManager(callLink, useTCP, logger)
-	defer mgr.CloseAll()
-
-	allocs, err := mgr.Allocate(ctx, numConns)
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
-		siren.AlertTURNAuthFailure(ctx, err)
-		logger.Error("failed to allocate TURN connections", "err", err)
+		logger.Error("invalid server address", "addr", server, "err", err)
 		os.Exit(1)
 	}
-	logger.Info("client TURN connections established", "count", len(allocs))
 
-	// 2. Collect client relay addresses
-	clientRelayAddrs := make([]string, len(allocs))
-	for i, a := range allocs {
-		clientRelayAddrs[i] = a.RelayAddr.String()
-	}
+	sessionID := uuid.New()
+	logger.Info("session", "id", sessionID.String())
 
-	// 3. Signal server to create its TURN allocations
-	logger.Info("sending signal request", "url", signalURL)
-	resp, err := sig.Connect(ctx, signalURL, sig.ConnectRequest{
-		CallLink:         callLink,
-		ClientRelayAddrs: clientRelayAddrs,
-		PSK:              psk,
-		UseTCP:           useTCP,
-	})
-	if err != nil {
-		logger.Error("signal request failed", "err", err)
-		os.Exit(1)
-	}
-	logger.Info("signal response received",
-		"session_id", resp.SessionID,
-		"server_relays", len(resp.ServerRelayAddrs),
-	)
-
-	// 4. Parse server relay addresses and create DatagramConn pairs
-	n := len(resp.ServerRelayAddrs)
-	if n > len(allocs) {
-		n = len(allocs)
-	}
-
-	muxConns := make([]io.ReadWriteCloser, n)
-	for i := 0; i < n; i++ {
-		serverRelayAddr, err := net.ResolveUDPAddr("udp", resp.ServerRelayAddrs[i])
-		if err != nil {
-			logger.Error("invalid server relay addr", "index", i, "addr", resp.ServerRelayAddrs[i], "err", err)
-			os.Exit(1)
-		}
-		dc := mux.NewDatagramConn(allocs[i].RelayConn, serverRelayAddr)
-		// Send permission probe
-		if err := dc.SendProbe(); err != nil {
-			logger.Warn("permission probe failed", "index", i, "err", err)
-		}
-		muxConns[i] = dc
-	}
-
-	// 5. Wait briefly for permission probes to propagate
-	time.Sleep(500 * time.Millisecond)
-
-	// 6. Create multiplexer
-	m := mux.New(logger, muxConns...)
-	defer m.Close()
-
-	go m.DispatchLoop(ctx)
-	go m.StartPingLoop(ctx, 30*time.Second)
-
-	// 7. Start proxies
-	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort, bindAddr)
-}
-
-// runDirectMode uses the legacy direct TCP connection to the VPN server.
-func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, serverAddr string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
-
+	// 1. Create TURN allocations.
 	logger.Info("establishing TURN connections", "count", numConns, "link", callLink)
 	mgr := turn.NewManager(callLink, useTCP, logger)
 	defer mgr.CloseAll()
@@ -169,23 +82,50 @@ func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.S
 	}
 	logger.Info("TURN connections established", "count", len(allocs))
 
-	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
-	if err != nil {
-		logger.Error("invalid server address", "addr", serverAddr, "err", err)
+	// 2. Establish DTLS-over-TURN connections and send session ID.
+	var cleanups []context.CancelFunc
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	var muxConns []io.ReadWriteCloser
+	for i, alloc := range allocs {
+		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDPAddr)
+		if err != nil {
+			logger.Warn("DTLS-over-TURN failed", "index", i, "err", err)
+			continue
+		}
+		cleanups = append(cleanups, cleanup)
+
+		// Send session UUID so server can group connections.
+		var sid [16]byte
+		copy(sid[:], sessionID[:])
+		if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+			logger.Warn("write session id failed", "index", i, "err", err)
+			cleanup()
+			continue
+		}
+
+		muxConns = append(muxConns, dtlsConn)
+		logger.Info("DTLS connection established", "index", i)
+	}
+
+	if len(muxConns) == 0 {
+		logger.Error("no DTLS connections established")
 		os.Exit(1)
 	}
 
-	muxConns := make([]io.ReadWriteCloser, len(allocs))
-	for i, a := range allocs {
-		muxConns[i] = mux.NewConn(a.RelayConn, serverUDPAddr)
-	}
-
+	// 3. Create multiplexer over DTLS connections.
 	m := mux.New(logger, muxConns...)
 	defer m.Close()
 
 	go m.DispatchLoop(ctx)
+	go m.StartPingLoop(ctx, 30*time.Second)
 
-	startProxies(ctx, logger, siren, m, len(allocs), numConns, socks5Port, httpPort, bindAddr)
+	// 4. Start proxies.
+	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
 }
 
 // startProxies starts SOCKS5 and HTTP proxies over the given Mux.

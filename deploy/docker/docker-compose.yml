@@ -4,12 +4,10 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "9443:9443"
-      - "9000:9000"
+      - "9000:9000/udp"
     environment:
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
-      - VPN_PSK=${VPN_PSK:?VPN_PSK is required}
-    command: ["--signal=0.0.0.0:9443", "--psk=${VPN_PSK}"]
+    command: ["--listen=0.0.0.0:9000"]
     restart: unless-stopped
     deploy:
       resources:

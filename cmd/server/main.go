@@ -10,23 +10,27 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
+	"time"
 
+	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
-	sig "github.com/call-vpn/call-vpn/internal/signal"
 )
 
+// session groups multiple DTLS connections from a single client.
+type session struct {
+	mu     sync.Mutex
+	m      *mux.Mux
+	logger *slog.Logger
+	cancel context.CancelFunc
+	conns  int
+}
+
+var sessions sync.Map // [16]byte -> *session
+
 func main() {
-	// Relay mode flags (default)
-	signalAddr := flag.String("signal", "0.0.0.0:9443", "Signal server listen address")
-	psk := flag.String("psk", "", "Pre-shared key for client authentication")
-
-	// Direct mode flags (legacy)
-	directMode := flag.Bool("direct", false, "Use direct TCP mode (legacy)")
-	listenAddr := flag.String("listen", "0.0.0.0:9000", "Direct mode: TCP listen address")
-
+	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -43,70 +47,22 @@ func main() {
 		cancel()
 	}()
 
-	if *directMode {
-		runDirectMode(ctx, logger, siren, *listenAddr)
-	} else {
-		if *psk == "" {
-			fmt.Fprintln(os.Stderr, "Error: --psk is required in relay mode")
-			fmt.Fprintln(os.Stderr, "Usage: server --psk=<secret> [--signal=0.0.0.0:9443]")
-			fmt.Fprintln(os.Stderr, "       server --direct [--listen=0.0.0.0:9000]")
-			os.Exit(1)
-		}
-		runRelayMode(ctx, logger, siren, *signalAddr, *psk)
-	}
-}
-
-// runRelayMode starts the signaling server for TURN relay-based VPN sessions.
-func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, signalAddr, psk string) {
-	srv := &sig.Server{
-		Addr:   signalAddr,
-		PSK:    psk,
-		Logger: logger.With("component", "signal"),
-		OnSession: func(ctx context.Context, sessionID string, m *mux.Mux) {
-			sessionLogger := logger.With("session_id", sessionID)
-			sessionLogger.Info("relay session started")
-
-			for {
-				stream, err := m.AcceptStream(ctx)
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					sessionLogger.Warn("accept stream error", "err", err)
-					siren.AlertDisconnect(ctx, fmt.Sprintf("session-%s", sessionID))
-					return
-				}
-				go handleStream(ctx, sessionLogger, stream)
-			}
-		},
-	}
-
-	if err := srv.ListenAndServe(ctx); err != nil {
-		logger.Error("signal server error", "err", err)
-		os.Exit(1)
-	}
-}
-
-// runDirectMode starts the legacy direct TCP server.
-func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, listenAddr string) {
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := internaldtls.Listen(*listenAddr)
 	if err != nil {
-		logger.Error("failed to listen", "err", err)
+		logger.Error("failed to start DTLS listener", "err", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
 
-	logger.Info("server listening (direct mode)", "addr", listenAddr)
+	logger.Info("server listening (DTLS/UDP)", "addr", *listenAddr)
 
 	go func() {
 		<-ctx.Done()
 		ln.Close()
 	}()
 
-	var clientID atomic.Uint64
-
 	for {
-		conn, err := ln.Accept()
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -114,32 +70,93 @@ func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.S
 			logger.Warn("accept error", "err", err)
 			continue
 		}
-		id := clientID.Add(1)
-		logger.Info("client connected", "client_id", id, "remote", conn.RemoteAddr())
-		go handleClient(ctx, logger, siren, conn, id)
+		go handleConnection(ctx, logger, siren, conn)
 	}
 }
 
-func handleClient(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn, clientID uint64) {
-	defer conn.Close()
+func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn) {
+	// Read session ID (first 16 bytes after DTLS handshake).
+	sessionID, err := mux.ReadSessionID(conn)
+	if err != nil {
+		logger.Warn("read session id failed", "remote", conn.RemoteAddr(), "err", err)
+		conn.Close()
+		return
+	}
 
-	clientLogger := logger.With("client_id", clientID)
+	logger.Info("connection received",
+		"remote", conn.RemoteAddr(),
+		"session_id", fmt.Sprintf("%x", sessionID),
+	)
 
-	m := mux.New(clientLogger, conn)
-	defer m.Close()
+	sess := getOrCreateSession(ctx, logger, siren, sessionID)
 
-	for {
-		stream, err := m.AcceptStream(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
+	sess.mu.Lock()
+	sess.m.AddConn(conn)
+	sess.conns++
+	count := sess.conns
+	sess.mu.Unlock()
+
+	logger.Info("connection added to session",
+		"session_id", fmt.Sprintf("%x", sessionID),
+		"total_conns", count,
+	)
+}
+
+func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, id [16]byte) *session {
+	val, loaded := sessions.LoadOrStore(id, (*session)(nil))
+	if loaded && val != nil {
+		return val.(*session)
+	}
+
+	// First connection for this session — create it.
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	sessLogger := logger.With("session_id", fmt.Sprintf("%x", id))
+	m := mux.New(sessLogger) // Zero initial connections; AddConn later.
+
+	sess := &session{
+		m:      m,
+		logger: sessLogger,
+		cancel: sessCancel,
+	}
+	sessions.Store(id, sess)
+
+	// Start AcceptStream loop.
+	go func() {
+		defer func() {
+			sessions.Delete(id)
+			m.Close()
+			sessCancel()
+			sessLogger.Info("session closed")
+		}()
+
+		go m.DispatchLoop(sessCtx)
+
+		for {
+			stream, err := m.AcceptStream(sessCtx)
+			if err != nil {
+				if sessCtx.Err() != nil {
+					return
+				}
+				sessLogger.Warn("accept stream error", "err", err)
+				siren.AlertDisconnect(sessCtx, fmt.Sprintf("session-%x", id))
 				return
 			}
-			clientLogger.Warn("accept stream error", "err", err)
-			siren.AlertDisconnect(ctx, fmt.Sprintf("client-%d", clientID))
-			return
+			go handleStream(sessCtx, sessLogger, stream)
 		}
-		go handleStream(ctx, clientLogger, stream)
-	}
+	}()
+
+	// Cleanup timer: if session gets no activity, close after timeout.
+	go func() {
+		timer := time.NewTimer(5 * time.Minute)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			// Session timeout — only if no streams were handled
+		case <-sessCtx.Done():
+		}
+	}()
+
+	return sess
 }
 
 func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) {

@@ -5,73 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// DatagramConn adapts a net.PacketConn + peer address into an io.ReadWriteCloser
-// with internal buffering so that stream-oriented ReadFrame (io.ReadFull) works
-// correctly over datagram transport.
-//
-// Each call to the underlying PacketConn.ReadFrom returns a complete datagram.
-// DatagramConn stores it in an internal buffer and serves successive Read calls
-// from that buffer until it's exhausted, then reads the next datagram.
-type DatagramConn struct {
-	relay    net.PacketConn
-	peerAddr net.Addr
-	buf      []byte // current datagram buffer
-	pos      int    // read position within buf
-}
-
-// NewDatagramConn creates a DatagramConn that reads datagrams from relay
-// and writes datagrams to peerAddr.
-func NewDatagramConn(relay net.PacketConn, peerAddr net.Addr) *DatagramConn {
-	return &DatagramConn{relay: relay, peerAddr: peerAddr}
-}
-
-func (d *DatagramConn) Read(b []byte) (int, error) {
-	for {
-		// Serve from internal buffer if available.
-		if d.pos < len(d.buf) {
-			n := copy(b, d.buf[d.pos:])
-			d.pos += n
-			return n, nil
-		}
-
-		// Read next datagram into fresh buffer.
-		tmp := make([]byte, 65535+headerSize)
-		n, _, err := d.relay.ReadFrom(tmp)
-		if err != nil {
-			return 0, err
-		}
-		// Skip permission probes (single 0x00 byte).
-		if n == 1 && tmp[0] == 0x00 {
-			continue
-		}
-		d.buf = tmp[:n]
-		d.pos = 0
-	}
-}
-
-func (d *DatagramConn) Write(b []byte) (int, error) {
-	return d.relay.WriteTo(b, d.peerAddr)
-}
-
-func (d *DatagramConn) Close() error {
-	return d.relay.Close()
-}
-
-// SendProbe sends a permission probe (single 0x00 byte) to the peer.
-// Both sides must send probes to establish TURN permissions before data exchange.
-func (d *DatagramConn) SendProbe() error {
-	_, err := d.relay.WriteTo([]byte{0x00}, d.peerAddr)
-	return err
-}
-
 // StartPingLoop sends periodic ping frames through the mux to keep
-// TURN permissions alive. TURN permissions have a 5-minute TTL,
+// TURN allocations alive. TURN allocations have a 5-minute TTL,
 // so we ping every 30 seconds by default. Call in a goroutine.
 func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -91,32 +31,6 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Conn wraps a TURN relay connection (net.PacketConn) into a stream-oriented
-// connection suitable for mux framing. The peerAddr is the remote server
-// address that the TURN relay forwards packets to.
-type Conn struct {
-	relay    net.PacketConn
-	peerAddr net.Addr
-}
-
-// NewConn wraps a TURN relay with a specific peer.
-func NewConn(relay net.PacketConn, peerAddr net.Addr) *Conn {
-	return &Conn{relay: relay, peerAddr: peerAddr}
-}
-
-func (c *Conn) Read(b []byte) (int, error) {
-	n, _, err := c.relay.ReadFrom(b)
-	return n, err
-}
-
-func (c *Conn) Write(b []byte) (int, error) {
-	return c.relay.WriteTo(b, c.peerAddr)
-}
-
-func (c *Conn) Close() error {
-	return c.relay.Close()
-}
-
 // connStats tracks per-connection quality metrics.
 type connStats struct {
 	latency   atomic.Int64 // nanoseconds, rolling average
@@ -128,6 +42,7 @@ type connStats struct {
 // Mux multiplexes framed streams over multiple underlying connections,
 // distributing load based on measured connection quality.
 type Mux struct {
+	mu      sync.Mutex // protects conns
 	conns   []*muxConn
 	streams sync.Map // streamID -> *Stream
 	nextSeq atomic.Uint32
@@ -145,6 +60,7 @@ type muxConn struct {
 }
 
 // New creates a multiplexer over the given connections.
+// Can be called with zero connections; use AddConn to add them later.
 func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Mux{
@@ -189,17 +105,22 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 // selectConn picks the best connection based on quality metrics.
 // Strategy: weighted by inverse latency, preferring connections with fewer errors.
 func (m *Mux) selectConn() *muxConn {
-	if len(m.conns) == 0 {
+	m.mu.Lock()
+	conns := make([]*muxConn, len(m.conns))
+	copy(conns, m.conns)
+	m.mu.Unlock()
+
+	if len(conns) == 0 {
 		return nil
 	}
-	if len(m.conns) == 1 {
-		return m.conns[0]
+	if len(conns) == 1 {
+		return conns[0]
 	}
 
 	var best *muxConn
 	bestScore := int64(-1)
 
-	for _, mc := range m.conns {
+	for _, mc := range conns {
 		lat := mc.stats.latency.Load()
 		if lat == 0 {
 			lat = 1_000_000 // 1ms default
@@ -253,10 +174,13 @@ func (m *Mux) NextSeq() uint32 {
 
 // UpdateLatency reports a measured RTT for a connection index.
 func (m *Mux) UpdateLatency(idx int, rtt time.Duration) {
+	m.mu.Lock()
 	if idx < 0 || idx >= len(m.conns) {
+		m.mu.Unlock()
 		return
 	}
 	mc := m.conns[idx]
+	m.mu.Unlock()
 	old := mc.stats.latency.Load()
 	if old == 0 {
 		mc.stats.latency.Store(rtt.Nanoseconds())
@@ -267,10 +191,29 @@ func (m *Mux) UpdateLatency(idx int, rtt time.Duration) {
 	}
 }
 
+// AddConn dynamically adds a new connection to the multiplexer.
+// A new readLoop goroutine is spawned for the connection.
+// This is used by the server to add DTLS connections as they arrive
+// for a given session.
+func (m *Mux) AddConn(conn io.ReadWriteCloser) {
+	mc := &muxConn{conn: conn}
+	mc.stats.lastUsed.Store(time.Now().UnixNano())
+
+	m.mu.Lock()
+	idx := len(m.conns)
+	m.conns = append(m.conns, mc)
+	m.mu.Unlock()
+
+	go m.readLoop(idx, mc)
+}
+
 // Close shuts down the multiplexer and all underlying connections.
 func (m *Mux) Close() error {
 	m.cancel()
-	for _, mc := range m.conns {
+	m.mu.Lock()
+	conns := m.conns
+	m.mu.Unlock()
+	for _, mc := range conns {
 		mc.conn.Close()
 	}
 	return nil
