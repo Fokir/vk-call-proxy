@@ -38,6 +38,7 @@ type TunnelConfig struct {
 	ServerAddr string // VPN server address (host:port)
 	NumConns   int    // parallel TURN+DTLS connections
 	UseTCP     bool   // TCP vs UDP for TURN
+	Token      string // auth token for server (empty = no auth)
 }
 
 // NewTunnel creates a new tunnel instance.
@@ -86,6 +87,14 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 			continue
 		}
 		t.cleanups = append(t.cleanups, cleanup)
+
+		if cfg.Token != "" {
+			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
+				t.logger.Warn("write auth token failed", "index", i, "err", err)
+				cleanup()
+				continue
+			}
+		}
 
 		var sid [16]byte
 		copy(sid[:], sessionID[:])

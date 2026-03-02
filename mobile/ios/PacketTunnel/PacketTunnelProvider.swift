@@ -13,6 +13,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let numConns = (options?["numConns"] as? Int) ?? 4
+        let token = (options?["token"] as? String) ?? ""
 
         // Configure tunnel network settings
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: serverAddr)
@@ -37,6 +38,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             config.serverAddr = serverAddr
             config.numConns = Int(numConns)
             config.useTCP = true
+            config.token = token
 
             let t = BindNewTunnel()!
 

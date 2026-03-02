@@ -87,6 +87,7 @@ class CallVpnService : VpnService() {
         val callLink = intent.getStringExtra(EXTRA_CALL_LINK) ?: return
         val serverAddr = intent.getStringExtra(EXTRA_SERVER_ADDR) ?: return
         val numConns = intent.getIntExtra(EXTRA_NUM_CONNS, 4)
+        val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
 
         startForeground(NOTIFICATION_ID, buildNotification("Подключение..."))
         broadcastState("connecting")
@@ -114,6 +115,7 @@ class CallVpnService : VpnService() {
             this.serverAddr = serverAddr
             this.numConns = numConns.toLong()
             this.useTCP = true
+            this.token = token
         }
 
         tunnel = Tunnel().also { t ->
@@ -187,6 +189,7 @@ class CallVpnService : VpnService() {
         const val EXTRA_CALL_LINK = "call_link"
         const val EXTRA_SERVER_ADDR = "server_addr"
         const val EXTRA_NUM_CONNS = "num_conns"
+        const val EXTRA_TOKEN = "token"
         const val EXTRA_STATE = "state"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1

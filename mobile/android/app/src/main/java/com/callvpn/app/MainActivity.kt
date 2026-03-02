@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -29,6 +30,7 @@ class MainActivity : ComponentActivity() {
     private var vpnState = mutableStateOf(VpnState.Disconnected)
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
+    private var pendingToken = ""
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -67,7 +69,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     CallVpnScreen(
                         vpnState = vpnState.value,
-                        onConnect = { callLink, serverAddr -> requestConnect(callLink, serverAddr) },
+                        onConnect = { callLink, serverAddr, token -> requestConnect(callLink, serverAddr, token) },
                         onDisconnect = { stopVpn() }
                     )
                 }
@@ -80,9 +82,10 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private fun requestConnect(callLink: String, serverAddr: String) {
+    private fun requestConnect(callLink: String, serverAddr: String, token: String) {
         pendingCallLink = callLink
         pendingServerAddr = serverAddr
+        pendingToken = token
 
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -100,6 +103,7 @@ class MainActivity : ComponentActivity() {
             putExtra(CallVpnService.EXTRA_CALL_LINK, pendingCallLink)
             putExtra(CallVpnService.EXTRA_SERVER_ADDR, pendingServerAddr)
             putExtra(CallVpnService.EXTRA_NUM_CONNS, 4)
+            putExtra(CallVpnService.EXTRA_TOKEN, pendingToken)
         }
         startService(intent)
     }
@@ -122,7 +126,7 @@ private fun parseCallLink(input: String): String {
 @Composable
 fun CallVpnScreen(
     vpnState: VpnState,
-    onConnect: (callLink: String, serverAddr: String) -> Unit,
+    onConnect: (callLink: String, serverAddr: String, token: String) -> Unit,
     onDisconnect: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -132,6 +136,7 @@ fun CallVpnScreen(
 
     var callLinkInput by remember { mutableStateOf(prefs.getString("call_link", "") ?: "") }
     var serverAddr by remember { mutableStateOf(prefs.getString("server_addr", "") ?: "") }
+    var tokenInput by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
     var showChangeDialog by remember { mutableStateOf(false) }
     var pendingFieldChange by remember { mutableStateOf<(() -> Unit)?>(null) }
 
@@ -230,8 +235,9 @@ fun CallVpnScreen(
                             prefs.edit()
                                 .putString("call_link", callLinkInput)
                                 .putString("server_addr", serverAddr)
+                                .putString("token", tokenInput)
                                 .apply()
-                            onConnect(parsedId, serverAddr)
+                            onConnect(parsedId, serverAddr, tokenInput)
                         }
                     }
                     VpnState.Connected -> onDisconnect()
@@ -297,6 +303,18 @@ fun CallVpnScreen(
             placeholder = { Text("host:port") },
             singleLine = true,
             enabled = !isConnected,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        // Token input
+        OutlinedTextField(
+            value = tokenInput,
+            onValueChange = { tokenInput = it },
+            label = { Text("Токен") },
+            placeholder = { Text("Токен авторизации") },
+            singleLine = true,
+            enabled = !isConnected,
+            visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth()
         )
     }

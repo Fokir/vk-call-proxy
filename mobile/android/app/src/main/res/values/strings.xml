@@ -10,6 +10,8 @@
     <string name="hint_server_addr">Адрес сервера</string>
     <string name="placeholder_call_link">https://vk.com/call/join/…</string>
     <string name="placeholder_server_addr">host:port</string>
+    <string name="hint_token">Токен</string>
+    <string name="placeholder_token">Токен авторизации</string>
     <string name="dialog_change_title">Изменить значение?</string>
     <string name="dialog_change_message">Сохранённое значение будет заменено.</string>
     <string name="dialog_change_confirm">Изменить</string>

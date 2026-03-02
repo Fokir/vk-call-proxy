@@ -34,6 +34,7 @@ var (
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
+	authToken := flag.String("token", "", "client auth token (empty = no auth)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -73,11 +74,20 @@ func main() {
 			logger.Warn("accept error", "err", err)
 			continue
 		}
-		go handleConnection(ctx, logger, siren, conn)
+		go handleConnection(ctx, logger, siren, conn, *authToken)
 	}
 }
 
-func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn) {
+func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn, authToken string) {
+	// Validate auth token if configured.
+	if authToken != "" {
+		if err := mux.ValidateAuthToken(conn, authToken); err != nil {
+			logger.Warn("auth failed", "remote", conn.RemoteAddr(), "err", err)
+			conn.Close()
+			return
+		}
+	}
+
 	// Read session ID (first 16 bytes after DTLS handshake).
 	sessionID, err := mux.ReadSessionID(conn)
 	if err != nil {

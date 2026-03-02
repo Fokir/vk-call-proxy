@@ -51,12 +51,14 @@ enum VpnState {
 struct ContentView: View {
     @AppStorage("callLink") private var callLink = ""
     @AppStorage("serverAddr") private var serverAddr = ""
+    @AppStorage("token") private var token = ""
     @State private var vpnState: VpnState = .disconnected
     @State private var manager: NETunnelProviderManager?
     @State private var showChangeAlert = false
     @State private var pendingChange: (() -> Void)?
     @State private var editingCallLink = ""
     @State private var editingServerAddr = ""
+    @State private var editingToken = ""
 
     private var parsedId: String {
         parseCallLink(editingCallLink)
@@ -136,6 +138,17 @@ struct ContentView: View {
             }
             .padding(.horizontal)
 
+            // Token input
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Токен")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                SecureField("Токен авторизации", text: $editingToken)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(vpnState != .disconnected)
+            }
+            .padding(.horizontal)
+
             Spacer()
         }
         .padding()
@@ -153,6 +166,7 @@ struct ContentView: View {
         .onAppear {
             editingCallLink = callLink
             editingServerAddr = serverAddr
+            editingToken = token
             loadManager()
             observeVPNStatus()
         }
@@ -170,6 +184,7 @@ struct ContentView: View {
             guard !parsedId.isEmpty, !editingServerAddr.isEmpty else { return }
             callLink = editingCallLink
             serverAddr = editingServerAddr
+            token = editingToken
             startVPN()
         case .connected:
             stopVPN()
@@ -218,7 +233,8 @@ struct ContentView: View {
             proto.providerConfiguration = [
                 "callLink": parsedId,
                 "serverAddr": editingServerAddr,
-                "numConns": 4
+                "numConns": 4,
+                "token": editingToken
             ]
             mgr.protocolConfiguration = proto
             mgr.localizedDescription = "CallVPN"

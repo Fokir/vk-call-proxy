@@ -30,6 +30,7 @@ func main() {
 	useTCP := flag.Bool("tcp", true, "Use TCP for TURN connections")
 	serverAddr := flag.String("server", "", "VPN server address (host:port)")
 	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
+	authToken := flag.String("token", "", "auth token for server")
 
 	flag.Parse()
 
@@ -54,11 +55,11 @@ func main() {
 		cancel()
 	}()
 
-	run(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr)
+	run(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken)
 }
 
 func run(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr string) {
+	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string) {
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
@@ -98,6 +99,15 @@ func run(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
 			continue
 		}
 		cleanups = append(cleanups, cleanup)
+
+		// Send auth token if configured.
+		if authToken != "" {
+			if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
+				logger.Warn("write auth token failed", "index", i, "err", err)
+				cleanup()
+				continue
+			}
+		}
 
 		// Send session UUID so server can group connections.
 		var sid [16]byte
