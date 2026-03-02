@@ -9,6 +9,7 @@
 
 - [Быстрый старт](#-быстрый-старт)
 - [Как это работает](#-как-это-работает)
+- [Режимы работы](#-режимы-работы)
 - [Конфигурация](#-конфигурация)
 - [Примеры docker-compose.yml](#-примеры-docker-composeyml)
 - [Подключение клиента](#-подключение-клиента)
@@ -45,6 +46,9 @@ services:
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
+      - VPN_TOKEN=${VPN_TOKEN:-}
+      - VK_CALL_LINK=${VK_CALL_LINK:-}
+      - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
     restart: unless-stopped
     deploy:
@@ -64,6 +68,7 @@ services:
 ```env
 IMAGE_TAG=main
 LISTEN_PORT=9000
+VPN_TOKEN=
 SIREN_SLACK_WEBHOOK=
 MEMORY_LIMIT=256M
 CPU_LIMIT=1.0
@@ -73,7 +78,9 @@ CPU_LIMIT=1.0
 docker compose up -d
 ```
 
-Сервер запустится на порту `9000/udp` и готов принимать подключения.
+Сервер запустится на порту `9000/udp` в direct mode и готов принимать подключения.
+
+> Для relay-to-relay mode добавьте `VK_CALL_LINK` — см. раздел [Режимы работы](#-режимы-работы).
 
 ---
 
@@ -102,6 +109,61 @@ docker compose up -d
 
 ---
 
+## Режимы работы
+
+Сервер поддерживает два режима. Режим определяется автоматически по наличию переменной `VK_CALL_LINK`.
+
+### Direct mode (по умолчанию)
+
+Сервер слушает на UDP-порту, клиент подключается через TURN relay.
+
+**Требования:** открытый UDP-порт на сервере.
+
+```env
+# .env
+IMAGE_TAG=main
+LISTEN_PORT=9000
+VPN_TOKEN=your-secret-token
+```
+
+```
+Клиент → TURN Relay (VK) → Сервер:9000/UDP → Интернет
+```
+
+### Relay-to-relay mode
+
+Клиент и сервер join'ят один VK-звонок. Обмен адресами идёт через VK WebSocket signaling (зашифрован AES-256-GCM при наличии `VPN_TOKEN`). Трафик проходит через два VK TURN relay.
+
+**Требования:** VK call link. Открытый порт **не нужен**.
+
+```env
+# .env
+IMAGE_TAG=main
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
+TURN_CONNS=4
+```
+
+```
+Клиент → TURN(клиент) ↔ TURN(сервер) → Интернет
+              VK signaling (WebSocket)
+```
+
+**Как получить VK call link:**
+
+1. Откройте VK → Мессенджер → любой диалог → кнопка «Звонок» → «Ссылка на звонок»
+2. Скопируйте ID из ссылки: `https://vk.com/call/join/AbCdEf123456` → `AbCdEf123456`
+3. Передайте одну и ту же ссылку серверу (`VK_CALL_LINK`) и клиенту (`--link`)
+
+**Порядок запуска:**
+
+1. Запустите сервер — он подключится к VK-звонку и будет ждать клиента
+2. Запустите клиент с той же ссылкой — он подключится к звонку, обменяется адресами и установит туннель
+
+> **Важно:** `VPN_TOKEN` должен совпадать на клиенте и сервере. Он используется как для аутентификации, так и для шифрования signaling-обмена.
+
+---
+
 ## Конфигурация
 
 Все параметры задаются через файл `.env` рядом с `docker-compose.yml`.
@@ -111,16 +173,27 @@ docker compose up -d
 | Переменная | По умолчанию | Описание |
 |:-----------|:-------------|:---------|
 | `IMAGE_TAG` | `main` | Версия Docker-образа. `main` — последняя сборка, `1.0.0` — конкретная версия |
-| `LISTEN_PORT` | `9000` | UDP-порт, открытый на хост-машине |
+| `LISTEN_PORT` | `9000` | UDP-порт, открытый на хост-машине (только direct mode) |
+| `VPN_TOKEN` | *(пусто)* | Токен аутентификации клиентов (рекомендуется) |
+| `VK_CALL_LINK` | *(пусто)* | ID ссылки VK-звонка. Если задан — включается relay-to-relay mode |
+| `TURN_CONNS` | `4` | Количество TURN-соединений (только relay mode) |
 | `SIREN_SLACK_WEBHOOK` | *(пусто)* | URL Slack webhook для алертов мониторинга |
 | `MEMORY_LIMIT` | `256M` | Лимит оперативной памяти контейнера |
 | `CPU_LIMIT` | `1.0` | Лимит CPU (количество ядер) |
 
-### Минимальный .env
+### Минимальный .env (direct mode)
 
 ```env
 IMAGE_TAG=main
 LISTEN_PORT=9000
+```
+
+### Минимальный .env (relay-to-relay mode)
+
+```env
+IMAGE_TAG=main
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
 ```
 
 ### Полный .env
@@ -129,8 +202,17 @@ LISTEN_PORT=9000
 # Версия образа
 IMAGE_TAG=main
 
-# Порт (UDP) — должен быть открыт в firewall
+# Порт (UDP) — только для direct mode, должен быть открыт в firewall
 LISTEN_PORT=9000
+
+# Токен аутентификации (рекомендуется; в relay mode также шифрует signaling)
+VPN_TOKEN=your-secret-token
+
+# VK call link — если задан, включается relay-to-relay mode
+VK_CALL_LINK=
+
+# Количество TURN-соединений (relay mode)
+TURN_CONNS=4
 
 # Slack алерты (опционально)
 SIREN_SLACK_WEBHOOK=<your-slack-webhook-url>
@@ -157,7 +239,7 @@ services:
     restart: unless-stopped
 ```
 
-### Стандартный — с .env файлом
+### Стандартный — с .env файлом (direct mode)
 
 Рекомендуемый вариант с вынесением настроек в `.env`:
 
@@ -169,6 +251,9 @@ services:
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
+      - VPN_TOKEN=${VPN_TOKEN:-}
+      - VK_CALL_LINK=${VK_CALL_LINK:-}
+      - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
     restart: unless-stopped
     deploy:
@@ -187,10 +272,31 @@ services:
 # .env
 IMAGE_TAG=main
 LISTEN_PORT=9000
+VPN_TOKEN=your-secret-token
 SIREN_SLACK_WEBHOOK=
 MEMORY_LIMIT=256M
 CPU_LIMIT=1.0
 ```
+
+### Relay-to-relay mode
+
+Сервер подключается через VK-звонок. Открытый UDP-порт не нужен:
+
+```env
+# .env
+IMAGE_TAG=main
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
+TURN_CONNS=4
+MEMORY_LIMIT=256M
+CPU_LIMIT=1.0
+```
+
+```bash
+docker compose up -d
+```
+
+> `ports` в docker-compose.yml можно убрать — в relay mode сервер не слушает UDP.
 
 ### Нестандартный порт
 
@@ -247,20 +353,31 @@ IMAGE_TAG=1.0.0
 
 После запуска сервера, клиенты подключаются так:
 
-### Desktop
+### Desktop — direct mode
 
 ```bash
 ./client \
   --link=<vk-call-link-id> \
   --server=<your-vps-ip>:9000 \
-  --n=4 \
-  --tcp=true
+  --token=your-secret-token
 ```
+
+### Desktop — relay-to-relay mode
+
+```bash
+./client \
+  --link=<vk-call-link-id> \
+  --token=your-secret-token
+```
+
+> Без `--server` клиент автоматически входит в relay-to-relay mode.
+> Используйте тот же `--link`, что и в `VK_CALL_LINK` на сервере.
 
 | Флаг | Описание |
 |:-----|:---------|
-| `--link` | ID ссылки VK-звонка для получения TURN credentials |
-| `--server` | Адрес вашего VPS с портом (тот же, что в `LISTEN_PORT`) |
+| `--link` | ID ссылки VK-звонка (обязательный) |
+| `--server` | Адрес VPS с портом. Пустой = relay-to-relay mode |
+| `--token` | Токен аутентификации (должен совпадать с сервером) |
 | `--n` | Количество параллельных TURN-соединений (по умолчанию 4) |
 | `--tcp` | Использовать TCP для TURN (по умолчанию true) |
 | `--socks5-port` | Локальный порт SOCKS5 прокси (по умолчанию 1080) |
@@ -272,7 +389,7 @@ IMAGE_TAG=1.0.0
 
 ### Mobile (Android / iOS)
 
-Мобильные приложения используют gomobile API с теми же параметрами подключения.
+Мобильные приложения используют gomobile API с теми же параметрами. Если `ServerAddr` пустой в `TunnelConfig` — используется relay-to-relay mode.
 
 ---
 
