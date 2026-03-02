@@ -24,17 +24,33 @@
 
 ### Как это работает
 
+Система поддерживает два режима:
+
+**Direct mode** — клиент подключается к серверу через VK TURN relay:
+
 1. Клиент получает TURN credentials через VK Call API
 2. Создаёт **N параллельных** TURN allocations (по умолчанию 4)
 3. Поверх каждого устанавливает **DTLS 1.2** шифрование (AES-128-GCM)
 4. Все соединения объединяются **мультиплексором** в единый туннель
-5. Клиент отправляет **16-byte session UUID** для группировки соединений на сервере
-6. Сервер принимает потоки и проксирует TCP-трафик в интернет
+5. Сервер принимает потоки и проксирует TCP-трафик в интернет
+
+**Relay-to-relay mode** — оба узла подключаются через VK TURN relays (сервер не нуждается в открытом порте):
+
+1. Клиент и сервер join'ят один и тот же VK-звонок по ссылке
+2. Оба создают TURN allocations внутри VK-инфраструктуры
+3. Обмениваются relay-адресами через **VK WebSocket signaling** (зашифровано AES-256-GCM)
+4. Устанавливают DTLS relay-to-relay соединения между TURN-серверами VK
+5. Мультиплексор объединяет всё в туннель
 
 ### Поток данных
 
 ```
+# Direct mode
 App → SOCKS5/HTTP → MUX → DTLS → TURN Relay (VK) → Server:9000/UDP → DTLS → MUX → Internet
+
+# Relay-to-relay mode
+App → MUX → DTLS → TURN(client) ↔ TURN(server) → DTLS → MUX → Internet
+                        VK signaling (WebSocket)
 ```
 
 ---
@@ -54,65 +70,58 @@ App → SOCKS5/HTTP → MUX → DTLS → TURN Relay (VK) → Server:9000/UDP →
 
 ### Сервер (Docker)
 
-Создайте на сервере директорию и два файла:
-
-**docker-compose.yml**
-
-```yaml
-services:
-  server:
-    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-main}
-    ports:
-      - "${LISTEN_PORT:-9000}:9000/udp"
-    environment:
-      - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: ${MEMORY_LIMIT:-256M}
-          cpus: "${CPU_LIMIT:-1.0}"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-```
-
-**.env**
+#### Direct mode — сервер слушает на UDP порту
 
 ```env
-# Версия образа: main (latest) или конкретная, например 1.0.0
+# .env
 IMAGE_TAG=main
-
-# UDP-порт на хосте (должен быть открыт в firewall)
 LISTEN_PORT=9000
-
-# Slack webhook для алертов (опционально)
-SIREN_SLACK_WEBHOOK=
-
-# Лимиты ресурсов
-MEMORY_LIMIT=256M
-CPU_LIMIT=1.0
+VPN_TOKEN=your-secret-token
 ```
-
-Запуск:
 
 ```bash
 docker compose up -d
 ```
 
+#### Relay-to-relay mode — сервер подключается через VK-звонок
+
+```env
+# .env
+IMAGE_TAG=main
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
+TURN_CONNS=4
+```
+
+```bash
+docker compose up -d
+```
+
+> При указании `VK_CALL_LINK` сервер автоматически переключается в relay-to-relay mode.
+> Открытый UDP-порт **не нужен** — всё проходит через VK-инфраструктуру.
+
 > Подробная инструкция по деплою, мониторингу и устранению проблем: **[deploy/docker/README.md](deploy/docker/README.md)**
 
 ### Desktop-клиент
+
+#### Direct mode — через сервер с открытым портом
 
 ```bash
 ./client \
   --link=<vk-call-link-id> \
   --server=<your-vps-ip>:9000 \
-  --n=4 \
-  --tcp=true
+  --token=your-secret-token
 ```
+
+#### Relay-to-relay mode — через VK-звонок (без сервера с открытым портом)
+
+```bash
+./client \
+  --link=<vk-call-link-id> \
+  --token=your-secret-token
+```
+
+> Без `--server` клиент автоматически входит в relay-to-relay mode и ждёт сервер в том же VK-звонке.
 
 После запуска настройте прокси в системе или браузере:
 - **SOCKS5** — `127.0.0.1:1080`
@@ -169,16 +178,21 @@ gomobile bind -target=ios -o mobile/ios/Bind.xcframework ./mobile/bind
 
 | Флаг | По умолчанию | Описание |
 |:-----|:-------------|:---------|
-| `--listen` | `0.0.0.0:9000` | UDP-адрес DTLS listener |
+| `--listen` | `0.0.0.0:9000` | UDP-адрес DTLS listener (direct mode) |
+| `--link` | *(пусто)* | ID ссылки VK-звонка (relay-to-relay mode) |
+| `--token` | *(пусто)* | Токен аутентификации клиентов (env: `VPN_TOKEN`) |
+| `--n` | `4` | Количество TURN-соединений (relay mode) |
+| `--tcp` | `true` | TCP для TURN (relay mode) |
 
-Env: `SIREN_SLACK_WEBHOOK` — URL для Slack-алертов (опционально).
+Env: `VK_CALL_LINK` — ссылка VK-звонка (relay mode), `VPN_TOKEN` — токен, `SIREN_SLACK_WEBHOOK` — Slack-алерты.
 
 ### Клиент
 
 | Флаг | По умолчанию | Описание |
 |:-----|:-------------|:---------|
 | `--link` | *(обязательный)* | ID ссылки VK-звонка |
-| `--server` | *(обязательный)* | Адрес VPN-сервера (host:port) |
+| `--server` | *(пусто)* | Адрес сервера (host:port). Пустой = relay-to-relay mode |
+| `--token` | *(пусто)* | Токен аутентификации |
 | `--n` | `4` | Количество параллельных TURN+DTLS соединений |
 | `--tcp` | `true` | TCP вместо UDP для TURN relay |
 | `--socks5-port` | `1080` | Порт SOCKS5 прокси |
@@ -197,14 +211,17 @@ call-vpn/
 ├── internal/
 │   ├── dtls/                   # DTLS шифрование
 │   │   ├── server.go           #   Listener (pion/dtls)
-│   │   └── client.go           #   DialOverTURN + AsyncPacketPipe
+│   │   ├── client.go           #   DialOverTURN + AsyncPacketPipe
+│   │   └── relay.go            #   AcceptOverTURN + PunchRelay (relay-to-relay)
+│   ├── signal/                 # VK WebSocket signaling
+│   │   └── signal.go           #   Обмен relay-адресами (AES-256-GCM)
 │   ├── mux/                    # Мультиплексор потоков
 │   │   ├── protocol.go         #   13-байтовый фрейм, типы сообщений
 │   │   ├── mux.go              #   AddConn, OpenStream, AcceptStream
 │   │   └── session.go          #   16-byte UUID, WriteSessionID/ReadSessionID
 │   ├── turn/                   # TURN relay
 │   │   ├── manager.go          #   Пул allocations
-│   │   └── credentials.go      #   VK Call API credentials
+│   │   └── credentials.go      #   VK Call API + FetchJoinResponse
 │   ├── proxy/
 │   │   ├── socks5/socks5.go    #   SOCKS5 прокси (RFC 1928)
 │   │   └── http/http.go        #   HTTP/HTTPS CONNECT прокси
@@ -267,8 +284,9 @@ call-vpn/
 
 | Пакет | Версия | Назначение |
 |:------|:-------|:-----------|
-| [pion/dtls](https://github.com/pion/dtls) | v3.0.7 | DTLS 1.2 шифрование |
+| [pion/dtls](https://github.com/pion/dtls) | v3.1.2 | DTLS 1.2 шифрование |
 | [pion/turn](https://github.com/pion/turn) | v4.1.4 | TURN RFC 5766 |
+| [gorilla/websocket](https://github.com/gorilla/websocket) | v1.5.3 | VK WebSocket signaling |
 | [cbeuw/connutil](https://github.com/cbeuw/connutil) | v1.0.1 | AsyncPacketPipe — мост datagram ↔ DTLS |
 | [google/uuid](https://github.com/google/uuid) | v1.6.0 | Генерация session UUID |
 | [pion/logging](https://github.com/pion/logging) | v0.2.4 | Логирование |
@@ -289,6 +307,7 @@ call-vpn/
 ## Безопасность
 
 - **Шифрование:** DTLS 1.2 (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+- **Signaling:** AES-256-GCM шифрование обмена адресами (при наличии `--token`)
 - **Сертификаты:** самоподписанные, генерируются при каждом запуске
 - **Контейнер:** distroless runtime, непривилегированный пользователь `nonroot`
 - **Маскировка:** трафик неотличим от VK-звонка для DPI
