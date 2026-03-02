@@ -1,0 +1,3 @@
+[submodule "refs/vk-turn-proxy"]
+	path = refs/vk-turn-proxy
+	url = https://github.com/cacggghp/vk-turn-proxy

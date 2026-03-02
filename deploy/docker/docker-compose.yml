@@ -1,0 +1,20 @@
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

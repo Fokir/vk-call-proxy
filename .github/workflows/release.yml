@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            output: client-windows-amd64.exe
+          - goos: darwin
+            goarch: amd64
+            output: client-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            output: client-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.output }}
+
+  build-server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build and push Docker image
+        run: |
+          docker build -f deploy/docker/Dockerfile -t call-vpn-server:${{ github.ref_name }} .
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Push Docker image
+        run: |
+          docker tag call-vpn-server:${{ github.ref_name }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.ref_name }}
+          docker tag call-vpn-server:${{ github.ref_name }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
+          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.ref_name }}
+          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
+
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      - name: Build Go AAR
+        run: gomobile bind -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
+
+      - name: Build and sign APK
+        env:
+          KEYSTORE_FILE: ${{ secrets.KEYSTORE_FILE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        working-directory: mobile/android
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew assembleRelease || gradle assembleRelease
+          echo "$KEYSTORE_FILE" | base64 -d > ../../keystore.jks
+          apksigner sign \
+            --ks ../../keystore.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          mv app/build/outputs/apk/release/app-release-unsigned.apk ../../app-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release.apk
+          path: app-release.apk
+
+  build-ios:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      - name: Build Go XCFramework
+        run: gomobile bind -target ios -o mobile/ios/Bind.xcframework ./mobile/bind/
+
+      - name: Install certificate and build
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo "$APPLE_CERTIFICATE" | base64 -d > "$CERT_PATH"
+          echo "$APPLE_PROVISIONING_PROFILE" | base64 -d > "$PP_PATH"
+
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+          xcodebuild -project mobile/ios/CallVPN.xcodeproj \
+            -scheme CallVPN \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/CallVPN.xcarchive \
+            archive
+
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/CallVPN.xcarchive \
+            -exportOptionsPlist mobile/ios/ExportOptions.plist \
+            -exportPath $RUNNER_TEMP/export
+
+          cp $RUNNER_TEMP/export/*.ipa ./CallVPN.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CallVPN.ipa
+          path: CallVPN.ipa
+
+  release:
+    needs: [build-desktop, build-server, build-android, build-ios]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/client-windows-amd64.exe
+            artifacts/client-darwin-amd64
+            artifacts/client-darwin-arm64
+            artifacts/app-release.apk
+            artifacts/CallVPN.ipa
+          generate_release_notes: true

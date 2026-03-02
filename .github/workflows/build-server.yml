@@ -1,0 +1,41 @@
+name: Build Server
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build server binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o server ./cmd/server
+
+      - name: Build Docker image
+        run: docker build -f deploy/docker/Dockerfile -t call-vpn-server:${{ github.sha }} .
+
+      - name: Login to Docker Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Push Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker tag call-vpn-server:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
+          docker tag call-vpn-server:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.sha }}
+          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:latest
+          docker push ${{ secrets.REGISTRY_USERNAME }}/call-vpn-server:${{ github.sha }}
