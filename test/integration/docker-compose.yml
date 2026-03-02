@@ -1,0 +1,96 @@
+services:
+  coturn:
+    image: coturn/coturn:latest
+    volumes:
+      - ./coturn.conf:/etc/coturn/turnserver.conf:ro
+    networks:
+      testnet:
+        ipv4_address: 10.77.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/tmp/turnserver.pid"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  target:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile
+      target: target
+    networks:
+      testnet:
+        ipv4_address: 10.77.0.20
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile
+      target: server
+    command: ["--signal=0.0.0.0:9443", "--psk=test-secret"]
+    environment:
+      - TURN_HOST=10.77.0.10
+      - TURN_PORT=3478
+      - TURN_USERNAME=testuser
+      - TURN_PASSWORD=testpassword
+    depends_on:
+      coturn:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    networks:
+      testnet:
+        ipv4_address: 10.77.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9443/health || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  client:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile
+      target: client
+    command:
+      - "--link=test"
+      - "--signal=http://server:9443/signal"
+      - "--psk=test-secret"
+      - "--n=2"
+      - "--tcp=true"
+      - "--bind=0.0.0.0"
+    environment:
+      - TURN_HOST=10.77.0.10
+      - TURN_PORT=3478
+      - TURN_USERNAME=testuser
+      - TURN_PASSWORD=testpassword
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: "on-failure:5"
+    networks:
+      testnet:
+        ipv4_address: 10.77.0.40
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile
+      target: runner
+    depends_on:
+      client:
+        condition: service_started
+    networks:
+      testnet:
+        ipv4_address: 10.77.0.50
+
+networks:
+  testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
