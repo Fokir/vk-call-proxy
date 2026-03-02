@@ -27,7 +27,10 @@ type session struct {
 	conns  int
 }
 
-var sessions sync.Map // [16]byte -> *session
+var (
+	sessionsMu sync.Mutex
+	sessions   = make(map[[16]byte]*session)
+)
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
@@ -103,12 +106,13 @@ func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitorin
 }
 
 func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, id [16]byte) *session {
-	val, loaded := sessions.LoadOrStore(id, (*session)(nil))
-	if loaded && val != nil {
-		return val.(*session)
+	sessionsMu.Lock()
+	if sess, ok := sessions[id]; ok {
+		sessionsMu.Unlock()
+		return sess
 	}
 
-	// First connection for this session — create it.
+	// First connection for this session — create it while holding the lock.
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	sessLogger := logger.With("session_id", fmt.Sprintf("%x", id))
 	m := mux.New(sessLogger) // Zero initial connections; AddConn later.
@@ -118,12 +122,15 @@ func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitor
 		logger: sessLogger,
 		cancel: sessCancel,
 	}
-	sessions.Store(id, sess)
+	sessions[id] = sess
+	sessionsMu.Unlock()
 
 	// Start AcceptStream loop.
 	go func() {
 		defer func() {
-			sessions.Delete(id)
+			sessionsMu.Lock()
+			delete(sessions, id)
+			sessionsMu.Unlock()
 			m.Close()
 			sessCancel()
 			sessLogger.Info("session closed")
