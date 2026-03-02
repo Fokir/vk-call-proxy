@@ -2,14 +2,17 @@
 // address exchange. Both peers (client and server) join the same VK call
 // and use custom-data messages to exchange their TURN relay addresses.
 //
-// On the wire, messages use neutral identifiers to avoid revealing intent:
-//   - type "av-sync" (instead of "vpn-relay")
-//   - roles "pub"/"sub" (instead of "server"/"client")
-//   - addresses encoded in base64
+// On the wire, the entire payload is encrypted with AES-256-GCM when a
+// shared token is provided, making custom-data contents opaque to VK.
+// Without a token, payloads are base64-encoded with neutral identifiers.
 package signal
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -37,6 +40,53 @@ type Client struct {
 	seq        int
 	incoming   chan notification
 	done       chan struct{}
+	aead       cipher.AEAD // nil = no encryption (base64 only)
+}
+
+// SetKey derives an AES-256-GCM key from the shared token.
+// When set, SendRelayAddrs encrypts and RecvRelayAddrs decrypts payloads.
+func (c *Client) SetKey(token string) error {
+	if token == "" {
+		return nil
+	}
+	h := sha256.Sum256([]byte(token))
+	block, err := aes.NewCipher(h[:])
+	if err != nil {
+		return fmt.Errorf("aes cipher: %w", err)
+	}
+	c.aead, err = cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("gcm: %w", err)
+	}
+	return nil
+}
+
+// seal encrypts plaintext with AES-GCM and returns base64(nonce+ciphertext).
+// If no key is set, returns base64(plaintext).
+func (c *Client) seal(plaintext []byte) string {
+	if c.aead == nil {
+		return base64.StdEncoding.EncodeToString(plaintext)
+	}
+	nonce := make([]byte, c.aead.NonceSize())
+	rand.Read(nonce)
+	ct := c.aead.Seal(nonce, nonce, plaintext, nil)
+	return base64.StdEncoding.EncodeToString(ct)
+}
+
+// open decodes base64 and decrypts AES-GCM. If no key is set, just decodes base64.
+func (c *Client) open(blob string) ([]byte, error) {
+	raw, err := base64.StdEncoding.DecodeString(blob)
+	if err != nil {
+		return nil, err
+	}
+	if c.aead == nil {
+		return raw, nil
+	}
+	ns := c.aead.NonceSize()
+	if len(raw) < ns {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	return c.aead.Open(nil, raw[:ns], raw[ns:], nil)
 }
 
 type notification struct {
@@ -197,7 +247,7 @@ func (c *Client) SendRelayAddrs(ctx context.Context, addrs []string, role string
 	if err != nil {
 		return fmt.Errorf("marshal inner: %w", err)
 	}
-	blob := base64.StdEncoding.EncodeToString(innerJSON)
+	blob := c.seal(innerJSON)
 
 	cmd := command{
 		Command:  "custom-data",
@@ -232,15 +282,15 @@ func (c *Client) RecvRelayAddrs(ctx context.Context) (addrs []string, role strin
 			return nil, "", fmt.Errorf("signaling connection closed")
 		case notif := <-c.incoming:
 			if notif.Name == "custom-data" {
-				// data is a JSON string (base64 blob).
+				// data is a JSON string (base64 blob, optionally AES-GCM encrypted).
 				var blob string
 				if err := json.Unmarshal(notif.Data, &blob); err != nil {
 					c.logger.Debug("custom-data not a string, skip", "err", err)
 					continue
 				}
-				innerJSON, err := base64.StdEncoding.DecodeString(blob)
+				innerJSON, err := c.open(blob)
 				if err != nil {
-					c.logger.Debug("custom-data base64 decode failed", "err", err)
+					c.logger.Debug("custom-data decode/decrypt failed", "err", err)
 					continue
 				}
 				var data relayData

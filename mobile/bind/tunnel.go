@@ -158,6 +158,10 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 	if err != nil {
 		return fmt.Errorf("signaling connect: %w", err)
 	}
+	if err := sigClient.SetKey(cfg.Token); err != nil {
+		sigClient.Close()
+		return fmt.Errorf("set signaling key: %w", err)
+	}
 
 	// 3. Create TURN allocations.
 	t.mgr = turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)

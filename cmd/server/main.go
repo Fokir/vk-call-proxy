@@ -124,6 +124,11 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	}
 	defer sigClient.Close()
 
+	if err := sigClient.SetKey(authToken); err != nil {
+		logger.Error("set signaling key failed", "err", err)
+		os.Exit(1)
+	}
+
 	// 3. Create TURN allocations.
 	mgr := turn.NewManager(callLink, useTCP, logger)
 	defer mgr.CloseAll()
