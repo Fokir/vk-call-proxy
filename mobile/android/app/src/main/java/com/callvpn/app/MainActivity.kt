@@ -260,23 +260,29 @@ fun CallVpnScreen(
             fontWeight = FontWeight.Medium
         )
 
-        // Mode selector (segmented button)
-        val modeOptions = listOf("Relay-to-Relay", "Direct")
-        val selectedIndex = if (connectionMode == ConnectionMode.Relay) 0 else 1
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-            modeOptions.forEachIndexed { index, label ->
-                SegmentedButton(
-                    selected = index == selectedIndex,
-                    onClick = {
-                        connectionMode = if (index == 0) ConnectionMode.Relay else ConnectionMode.Direct
-                        prefs.edit().putString("connection_mode", connectionMode.name).apply()
-                    },
-                    shape = SegmentedButtonDefaults.itemShape(index = index, count = modeOptions.size),
-                    enabled = !isConnected
-                ) {
-                    Text(label)
-                }
-            }
+        // Mode selector
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+        ) {
+            FilterChip(
+                selected = connectionMode == ConnectionMode.Relay,
+                onClick = {
+                    connectionMode = ConnectionMode.Relay
+                    prefs.edit().putString("connection_mode", connectionMode.name).apply()
+                },
+                label = { Text("Relay-to-Relay") },
+                enabled = !isConnected
+            )
+            FilterChip(
+                selected = connectionMode == ConnectionMode.Direct,
+                onClick = {
+                    connectionMode = ConnectionMode.Direct
+                    prefs.edit().putString("connection_mode", connectionMode.name).apply()
+                },
+                label = { Text("Direct") },
+                enabled = !isConnected
+            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
