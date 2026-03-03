@@ -495,6 +495,13 @@ func (c *Client) RecvPayload(ctx context.Context, tag string) ([]byte, error) {
 	}
 }
 
+// Done returns a channel that is closed when the signaling WebSocket
+// connection dies (read loop exits). Use this to detect signaling death
+// without blocking on WaitForHungup.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
+}
+
 // PeerID returns our peer ID assigned by the signaling server.
 func (c *Client) PeerID() string {
 	return c.myPeerID

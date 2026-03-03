@@ -121,6 +121,7 @@ func (m *Mux) SetIdleTimeout(d time.Duration) {
 // to provide stream semantics for ReadFrame's io.ReadFull calls.
 func (m *Mux) readLoop(idx int, mc *muxConn) {
 	defer func() {
+		mc.conn.Close() // close DTLS connection immediately to free resources
 		if m.activeReaders.Add(-1) == 0 {
 			m.allDeadOnce.Do(func() { close(m.allDead) })
 			m.closeInFrames.Do(func() { close(m.inFrames) })

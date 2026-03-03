@@ -211,9 +211,6 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		<-sendDone
 	}()
 
-	// Drain signaling notifications to prevent incoming buffer overflow.
-	go sigClient.WaitForHungup(ctx)
-
 	// Match allocations to client addresses (use min of both counts).
 	pairCount := len(allocs)
 	if len(clientAddrs) < pairCount {
@@ -308,10 +305,10 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 
 	// 8. Serve streams and raw IP packets (hybrid mode).
 	// Idle timeout detects client disconnect: if no frames arrive
-	// for 2 min (client pings every 30s), readLoop exits → Dead() fires.
+	// for 90s (client pings every 30s), readLoop exits → Dead() fires.
 	m.EnableRawPackets(256)
 	m.EnableStreamAccept(64)
-	m.SetIdleTimeout(2 * time.Minute)
+	m.SetIdleTimeout(90 * time.Second)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
@@ -326,12 +323,21 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		defer ns.Close()
 	}
 
+	// Drain signaling notifications and cancel session on hungup or WS death.
+	// WaitForHungup returns on: "hungup" notification, WS close, or ctx cancel.
+	// In all cases we call sessCancel() to immediately tear down the session.
+	go func() {
+		sigClient.WaitForHungup(sessCtx)
+		logger.Info("signaling hungup/closed, cancelling session")
+		sessCancel()
+	}()
+
 	// Cancel session context when all MUX connections are dead.
 	go func() {
 		select {
 		case <-m.Dead():
 			sessCancel()
-		case <-ctx.Done():
+		case <-sessCtx.Done():
 		}
 	}()
 
@@ -403,7 +409,7 @@ func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitor
 	// Enable hybrid mode: both raw IP packets and streams.
 	m.EnableRawPackets(256)
 	m.EnableStreamAccept(64)
-	m.SetIdleTimeout(2 * time.Minute)
+	m.SetIdleTimeout(90 * time.Second)
 
 	sess := &session{
 		m:      m,
