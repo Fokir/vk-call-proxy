@@ -323,13 +323,15 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		defer ns.Close()
 	}
 
-	// Drain signaling notifications and cancel session on hungup or WS death.
-	// WaitForHungup returns on: "hungup" notification, WS close, or ctx cancel.
-	// In all cases we call sessCancel() to immediately tear down the session.
+	// Drain signaling notifications. On hungup or WS close, reduce idle
+	// timeout so connections die quickly if the client is truly gone.
+	// We do NOT cancel immediately because VK sends "hungup" for old
+	// participants during client reconnection — cancelling would kill
+	// active connections prematurely.
 	go func() {
 		sigClient.WaitForHungup(sessCtx)
-		logger.Info("signaling hungup/closed, cancelling session")
-		sessCancel()
+		logger.Info("signaling hungup/closed, reducing idle timeout")
+		m.SetIdleTimeout(15 * time.Second)
 	}()
 
 	// Cancel session context when all MUX connections are dead.
