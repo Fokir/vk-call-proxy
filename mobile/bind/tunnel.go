@@ -69,6 +69,15 @@ func (lb *LogBuffer) Clear() {
 	lb.lines = lb.lines[:0]
 }
 
+// ReadAndClear atomically returns all buffered lines and clears the buffer.
+func (lb *LogBuffer) ReadAndClear() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	result := strings.Join(lb.lines, "\n")
+	lb.lines = lb.lines[:0]
+	return result
+}
+
 // tunnelState holds the result of a connection attempt.
 // Returned by connectDirect/connectRelay for applyState to install.
 type tunnelState struct {
@@ -114,9 +123,10 @@ func NewTunnel() *Tunnel {
 	}
 }
 
-// ReadLogs returns all buffered log lines as a single string.
+// ReadLogs returns all buffered log lines as a single string
+// and atomically clears the buffer.
 func (t *Tunnel) ReadLogs() string {
-	return t.logBuf.ReadAll()
+	return t.logBuf.ReadAndClear()
 }
 
 // ClearLogs removes all buffered log lines.
@@ -348,6 +358,8 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 
 // applyState installs a new tunnelState into the tunnel, starting
 // DispatchLoop and PingLoop, and signals muxReady.
+// Raw packet mode is enabled so DispatchLoop routes StreamID=0 FrameData
+// to a dedicated channel consumed by ReadPacket.
 func (t *Tunnel) applyState(state *tunnelState) {
 	t.mu.Lock()
 	t.m = state.m
@@ -358,6 +370,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	ready := t.muxReady
 	t.mu.Unlock()
 
+	state.m.EnableRawPackets(256)
 	go state.m.DispatchLoop(muxCtx)
 	go state.m.StartPingLoop(muxCtx, 30*time.Second)
 
@@ -524,6 +537,8 @@ func (t *Tunnel) WritePacket(data []byte) error {
 
 // ReadPacket reads a raw IP packet from the tunnel.
 // Blocks during reconnect until the mux is re-established.
+// Only receives FrameData with StreamID=0 (raw IP packets) via the
+// dedicated RawPackets channel, avoiding contention with DispatchLoop.
 func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 	for {
 		m, err := t.getMux()
@@ -531,21 +546,41 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 			return 0, err
 		}
 
-		frame, ok := <-m.RecvFrames()
-		if !ok {
-			// Mux died (inFrames closed). Wait briefly for reconnect loop
-			// to call teardownMux (sets t.m=nil), then loop back —
-			// getMux will block on the new muxReady channel.
-			select {
-			case <-t.rootCtx.Done():
-				return 0, fmt.Errorf("tunnel stopped")
-			case <-time.After(100 * time.Millisecond):
+		ch := m.RawPackets()
+		if ch == nil {
+			return 0, fmt.Errorf("raw packet mode not enabled")
+		}
+
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				// Channel closed — mux died. Wait briefly for reconnect loop
+				// to call teardownMux (sets t.m=nil), then loop back —
+				// getMux will block on the new muxReady channel.
+				select {
+				case <-t.rootCtx.Done():
+					return 0, fmt.Errorf("tunnel stopped")
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+			if len(frame.Payload) == 0 {
 				continue
 			}
+			n := copy(buf, frame.Payload)
+			return n, nil
+		case <-t.rootCtx.Done():
+			return 0, fmt.Errorf("tunnel stopped")
 		}
-		n := copy(buf, frame.Payload)
-		return n, nil
 	}
+}
+
+// IsConnected reports whether the tunnel currently has an active mux.
+// Returns false during reconnection.
+func (t *Tunnel) IsConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.m != nil
 }
 
 // Stop tears down all connections and stops the reconnect loop.

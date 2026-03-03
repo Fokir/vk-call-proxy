@@ -21,6 +21,8 @@ class CallVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     @Volatile
     private var running = false
+    @Volatile
+    private var lastBroadcastState = ""
 
     override fun onCreate() {
         super.onCreate()
@@ -77,6 +79,7 @@ class CallVpnService : VpnService() {
     }
 
     private fun broadcastState(state: String) {
+        lastBroadcastState = state
         val intent = Intent(ACTION_STATE_CHANGED).apply {
             putExtra(EXTRA_STATE, state)
         }
@@ -122,6 +125,8 @@ class CallVpnService : VpnService() {
                 .setSession("CallVPN")
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
+                .addAddress("fd00::2", 128)
+                .addRoute("::", 0)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("8.8.4.4")
                 .setMtu(1280)
@@ -133,14 +138,15 @@ class CallVpnService : VpnService() {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) { /* API 21+ */ }
 
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
+            val vpn = builder.establish()
+            if (vpn == null) {
                 t.stop()
                 tunnel = null
                 broadcastState("disconnected")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 return@Thread
             }
+            vpnInterface = vpn
 
             running = true
             broadcastState("connected")
@@ -148,18 +154,31 @@ class CallVpnService : VpnService() {
             val mgr = getSystemService(NotificationManager::class.java)
             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
 
-            // Log poller: reads logs from Go tunnel and broadcasts to UI
+            // Log poller: reads logs from Go tunnel, broadcasts to UI,
+            // and monitors tunnel connection state for reconnect awareness.
             Thread {
                 while (running) {
                     try {
+                        // ReadLogs atomically reads and clears the buffer.
                         val logs = tunnel?.readLogs() ?: ""
                         if (logs.isNotEmpty()) {
-                            tunnel?.clearLogs()
                             val logIntent = Intent(ACTION_LOG).apply {
                                 putExtra(EXTRA_LOG_TEXT, logs)
                             }
-                            LocalBroadcastManager.getInstance(this@CallVpnService).sendBroadcast(logIntent)
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(logIntent)
                         }
+
+                        // Monitor tunnel connection state for reconnect.
+                        val isConnected = tunnel?.isConnected ?: false
+                        if (!isConnected && lastBroadcastState == "connected") {
+                            broadcastState("connecting")
+                            mgr.notify(NOTIFICATION_ID, buildNotification("Переподключение..."))
+                        } else if (isConnected && lastBroadcastState == "connecting") {
+                            broadcastState("connected")
+                            mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
+                        }
+
                         Thread.sleep(500)
                     } catch (_: InterruptedException) {
                         break
@@ -171,7 +190,7 @@ class CallVpnService : VpnService() {
 
             // Read from TUN -> write to tunnel
             Thread {
-                val input = FileInputStream(vpnInterface!!.fileDescriptor)
+                val input = FileInputStream(vpn.fileDescriptor)
                 val buf = ByteArray(1500)
                 while (running) {
                     try {
@@ -180,14 +199,19 @@ class CallVpnService : VpnService() {
                             tunnel?.writePacket(buf.copyOf(len))
                         }
                     } catch (e: Exception) {
-                        if (running) continue else break
+                        if (running) {
+                            Thread.sleep(10)
+                            continue
+                        } else {
+                            break
+                        }
                     }
                 }
             }.start()
 
             // Read from tunnel -> write to TUN
             Thread {
-                val output = FileOutputStream(vpnInterface!!.fileDescriptor)
+                val output = FileOutputStream(vpn.fileDescriptor)
                 val buf = ByteArray(1500)
                 while (running) {
                     try {
@@ -196,7 +220,12 @@ class CallVpnService : VpnService() {
                             output.write(buf, 0, len.toInt())
                         }
                     } catch (e: Exception) {
-                        if (running) continue else break
+                        if (running) {
+                            Thread.sleep(10)
+                            continue
+                        } else {
+                            break
+                        }
                     }
                 }
             }.start()

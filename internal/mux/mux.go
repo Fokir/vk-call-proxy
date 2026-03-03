@@ -60,6 +60,9 @@ type Mux struct {
 	allDeadOnce    sync.Once
 	closeInFrames  sync.Once
 	idleTimeout    time.Duration // 0 = no idle timeout
+
+	rawPackets   chan *Frame // if set, StreamID=0 FrameData is routed here by DispatchLoop
+	closeRawOnce sync.Once
 }
 
 type muxConn struct {
@@ -199,6 +202,20 @@ func (m *Mux) RecvFrames() <-chan *Frame {
 	return m.inFrames
 }
 
+// EnableRawPackets creates a dedicated channel for raw IP packets
+// (StreamID=0, FrameData). DispatchLoop routes matching frames here
+// instead of dispatching them as stream data. Must be called before
+// DispatchLoop is started.
+func (m *Mux) EnableRawPackets(bufSize int) {
+	m.rawPackets = make(chan *Frame, bufSize)
+}
+
+// RawPackets returns the channel for raw IP packets, or nil if
+// EnableRawPackets was not called.
+func (m *Mux) RawPackets() <-chan *Frame {
+	return m.rawPackets
+}
+
 // NextSeq returns a monotonically increasing sequence number.
 func (m *Mux) NextSeq() uint32 {
 	return m.nextSeq.Add(1)
@@ -250,6 +267,9 @@ func (m *Mux) Dead() <-chan struct{} {
 func (m *Mux) Close() error {
 	m.cancel()
 	m.closeInFrames.Do(func() { close(m.inFrames) })
+	if m.rawPackets != nil {
+		m.closeRawOnce.Do(func() { close(m.rawPackets) })
+	}
 	m.mu.Lock()
 	conns := m.conns
 	m.mu.Unlock()
@@ -261,10 +281,11 @@ func (m *Mux) Close() error {
 
 // Stream represents a logical bidirectional stream within the mux.
 type Stream struct {
-	ID     uint32
-	mux    *Mux
-	recv   chan []byte
-	closed atomic.Bool
+	ID       uint32
+	mux      *Mux
+	recv     chan []byte
+	closed   atomic.Bool
+	leftover []byte // unread remainder from previous Read
 }
 
 // OpenStream creates a new logical stream and sends an open frame to the peer.
@@ -272,7 +293,7 @@ func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 	s := &Stream{
 		ID:   id,
 		mux:  m,
-		recv: make(chan []byte, 64),
+		recv: make(chan []byte, 1024),
 	}
 	m.streams.Store(id, s)
 
@@ -300,7 +321,7 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 				s := &Stream{
 					ID:   f.StreamID,
 					mux:  m,
-					recv: make(chan []byte, 64),
+					recv: make(chan []byte, 1024),
 				}
 				m.streams.Store(f.StreamID, s)
 				return s, nil
@@ -336,19 +357,34 @@ func (m *Mux) dispatch(f *Frame) {
 
 // DispatchLoop processes incoming frames and routes them to streams.
 // Call this in a goroutine on the client/server side.
+// If EnableRawPackets was called, StreamID=0 FrameData frames are
+// forwarded to the RawPackets channel instead of being dispatched.
 func (m *Mux) DispatchLoop(ctx context.Context) {
+	defer func() {
+		if m.rawPackets != nil {
+			m.closeRawOnce.Do(func() { close(m.rawPackets) })
+		}
+	}()
 	for {
 		select {
 		case f, ok := <-m.inFrames:
 			if !ok {
 				return
 			}
+			// Route raw IP packets to dedicated channel.
+			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
+				select {
+				case m.rawPackets <- f:
+				default:
+					m.logger.Warn("raw packet buffer full, dropping frame")
+				}
+				continue
+			}
 			if f.Type == FrameOpen {
-				// Handled by AcceptStream
 				s := &Stream{
 					ID:   f.StreamID,
 					mux:  m,
-					recv: make(chan []byte, 64),
+					recv: make(chan []byte, 1024),
 				}
 				m.streams.Store(f.StreamID, s)
 				continue
@@ -380,11 +416,21 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 // Read receives data from the stream.
 func (s *Stream) Read(p []byte) (int, error) {
+	// Return leftover data from a previous Read first.
+	if len(s.leftover) > 0 {
+		n := copy(p, s.leftover)
+		s.leftover = s.leftover[n:]
+		return n, nil
+	}
+
 	data, ok := <-s.recv
 	if !ok {
 		return 0, io.EOF
 	}
 	n := copy(p, data)
+	if n < len(data) {
+		s.leftover = data[n:]
+	}
 	return n, nil
 }
 

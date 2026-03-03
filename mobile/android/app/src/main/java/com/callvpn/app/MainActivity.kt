@@ -1,10 +1,13 @@
 package com.callvpn.app
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -24,6 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 enum class VpnState { Disconnected, Connecting, Connected }
@@ -46,6 +50,10 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "VPN permission denied", Toast.LENGTH_SHORT).show()
         }
     }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* proceed regardless of result */ }
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -71,6 +79,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Request notification permission on Android 13+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
 
         val lbm = LocalBroadcastManager.getInstance(this)
         lbm.registerReceiver(stateReceiver, IntentFilter(CallVpnService.ACTION_STATE_CHANGED))
@@ -123,7 +140,7 @@ class MainActivity : ComponentActivity() {
             putExtra(CallVpnService.EXTRA_NUM_CONNS, 4)
             putExtra(CallVpnService.EXTRA_TOKEN, pendingToken)
         }
-        startService(intent)
+        ContextCompat.startForegroundService(this, intent)
     }
 
     private fun stopVpn() {
@@ -160,8 +177,6 @@ fun CallVpnScreen(
         val saved = prefs.getString("connection_mode", "Relay") ?: "Relay"
         mutableStateOf(if (saved == "Direct") ConnectionMode.Direct else ConnectionMode.Relay)
     }
-    var showChangeDialog by remember { mutableStateOf(false) }
-    var pendingFieldChange by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val isConnected = vpnState != VpnState.Disconnected
     val parsedId = remember(callLinkInput) { parseCallLink(callLinkInput) }
@@ -197,35 +212,6 @@ fun CallVpnScreen(
         VpnState.Disconnected -> "Подключиться"
         VpnState.Connecting -> "Подключение..."
         VpnState.Connected -> "Отключиться"
-    }
-
-    // Confirmation dialog
-    if (showChangeDialog) {
-        AlertDialog(
-            onDismissRequest = {
-                showChangeDialog = false
-                pendingFieldChange = null
-            },
-            title = { Text("Изменить значение?") },
-            text = { Text("Сохранённое значение будет заменено.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingFieldChange?.invoke()
-                    showChangeDialog = false
-                    pendingFieldChange = null
-                }) {
-                    Text("Изменить")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    showChangeDialog = false
-                    pendingFieldChange = null
-                }) {
-                    Text("Отмена")
-                }
-            }
-        )
     }
 
     // Log auto-scroll state
@@ -324,15 +310,7 @@ fun CallVpnScreen(
         // VK link input
         OutlinedTextField(
             value = callLinkInput,
-            onValueChange = { newValue ->
-                val savedValue = prefs.getString("call_link", "") ?: ""
-                if (savedValue.isNotEmpty() && savedValue != callLinkInput && callLinkInput == savedValue) {
-                    pendingFieldChange = { callLinkInput = newValue }
-                    showChangeDialog = true
-                } else {
-                    callLinkInput = newValue
-                }
-            },
+            onValueChange = { callLinkInput = it },
             label = { Text("Ссылка VK звонка") },
             placeholder = { Text("https://vk.com/call/join/...") },
             singleLine = true,
@@ -353,15 +331,7 @@ fun CallVpnScreen(
         if (connectionMode == ConnectionMode.Direct) {
             OutlinedTextField(
                 value = serverAddr,
-                onValueChange = { newValue ->
-                    val savedValue = prefs.getString("server_addr", "") ?: ""
-                    if (savedValue.isNotEmpty() && savedValue != serverAddr && serverAddr == savedValue) {
-                        pendingFieldChange = { serverAddr = newValue }
-                        showChangeDialog = true
-                    } else {
-                        serverAddr = newValue
-                    }
-                },
+                onValueChange = { serverAddr = it },
                 label = { Text("Адрес сервера") },
                 placeholder = { Text("host:port") },
                 singleLine = true,
