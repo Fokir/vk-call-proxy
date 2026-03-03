@@ -26,10 +26,9 @@ type Server struct {
 // ListenAndServe starts the HTTP proxy server.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.server = &http.Server{
-		Addr:         s.Addr,
-		Handler:      s,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:              s.Addr,
+		Handler:           s,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	s.Logger.Info("HTTP proxy listening", "addr", s.Addr)
@@ -87,6 +86,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer client.Close()
+
+	// Clear any deadlines inherited from the HTTP server so the
+	// CONNECT tunnel can stay open indefinitely.
+	if d, ok := client.(interface{ SetDeadline(time.Time) error }); ok {
+		d.SetDeadline(time.Time{})
+	}
 
 	// Send 200 Connection Established
 	fmt.Fprintf(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
