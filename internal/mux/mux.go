@@ -14,9 +14,10 @@ import (
 // ErrMuxClosed is returned when the mux has been closed.
 var ErrMuxClosed = errors.New("mux closed")
 
-// StartPingLoop sends periodic ping frames through the mux to keep
-// TURN allocations alive. TURN allocations have a 5-minute TTL,
-// so we ping every 30 seconds by default. Call in a goroutine.
+// StartPingLoop sends periodic ping frames on EVERY underlying connection
+// to keep TURN allocations alive. Sending on all connections prevents idle
+// connections from timing out (TURN allocations have a 5-minute TTL,
+// server idle timeout is typically 2 min). Call in a goroutine.
 func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -24,11 +25,21 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			_ = m.SendFrame(&Frame{
-				StreamID: 0,
-				Type:     FramePing,
-				Sequence: m.NextSeq(),
-			})
+			f := &Frame{StreamID: 0, Type: FramePing, Sequence: m.NextSeq()}
+			data, err := f.MarshalBinary()
+			if err != nil {
+				continue
+			}
+			m.mu.Lock()
+			conns := make([]*muxConn, len(m.conns))
+			copy(conns, m.conns)
+			m.mu.Unlock()
+
+			for _, mc := range conns {
+				mc.mu.Lock()
+				mc.conn.Write(data)
+				mc.mu.Unlock()
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -63,6 +74,9 @@ type Mux struct {
 
 	rawPackets   chan *Frame // if set, StreamID=0 FrameData is routed here by DispatchLoop
 	closeRawOnce sync.Once
+
+	acceptedStreams   chan *Stream // DispatchLoop pushes FrameOpen streams here
+	closeAcceptOnce  sync.Once
 }
 
 type muxConn struct {
@@ -216,6 +230,19 @@ func (m *Mux) RawPackets() <-chan *Frame {
 	return m.rawPackets
 }
 
+// EnableStreamAccept creates a channel for accepted streams.
+// When DispatchLoop encounters a FrameOpen, the new stream is pushed here.
+// Must be called before DispatchLoop.
+func (m *Mux) EnableStreamAccept(bufSize int) {
+	m.acceptedStreams = make(chan *Stream, bufSize)
+}
+
+// AcceptedStreams returns the channel of streams opened by the remote peer,
+// or nil if EnableStreamAccept was not called.
+func (m *Mux) AcceptedStreams() <-chan *Stream {
+	return m.acceptedStreams
+}
+
 // NextSeq returns a monotonically increasing sequence number.
 func (m *Mux) NextSeq() uint32 {
 	return m.nextSeq.Add(1)
@@ -269,6 +296,9 @@ func (m *Mux) Close() error {
 	m.closeInFrames.Do(func() { close(m.inFrames) })
 	if m.rawPackets != nil {
 		m.closeRawOnce.Do(func() { close(m.rawPackets) })
+	}
+	if m.acceptedStreams != nil {
+		m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
 	}
 	m.mu.Lock()
 	conns := m.conns
@@ -359,10 +389,15 @@ func (m *Mux) dispatch(f *Frame) {
 // Call this in a goroutine on the client/server side.
 // If EnableRawPackets was called, StreamID=0 FrameData frames are
 // forwarded to the RawPackets channel instead of being dispatched.
+// If EnableStreamAccept was called, new streams from FrameOpen are
+// pushed to AcceptedStreams channel.
 func (m *Mux) DispatchLoop(ctx context.Context) {
 	defer func() {
 		if m.rawPackets != nil {
 			m.closeRawOnce.Do(func() { close(m.rawPackets) })
+		}
+		if m.acceptedStreams != nil {
+			m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
 		}
 	}()
 	for {
@@ -370,6 +405,14 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 		case f, ok := <-m.inFrames:
 			if !ok {
 				return
+			}
+			// Handle Ping/Pong keepalive.
+			if f.Type == FramePing {
+				_ = m.SendFrame(&Frame{StreamID: 0, Type: FramePong, Sequence: m.NextSeq()})
+				continue
+			}
+			if f.Type == FramePong {
+				continue
 			}
 			// Route raw IP packets to dedicated channel.
 			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
@@ -387,6 +430,13 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					recv: make(chan []byte, 1024),
 				}
 				m.streams.Store(f.StreamID, s)
+				if m.acceptedStreams != nil {
+					select {
+					case m.acceptedStreams <- s:
+					default:
+						m.logger.Warn("accepted streams buffer full")
+					}
+				}
 				continue
 			}
 			m.dispatch(f)
@@ -396,22 +446,40 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 	}
 }
 
-// Write sends data on the stream.
+// MaxFramePayload limits the payload per MUX frame to stay within safe
+// DTLS record sizes for TURN relay transport. VK TURN relays use UDP
+// internally between peers, so frames must fit within path MTU (~1400)
+// minus DTLS overhead (~41 bytes) and MUX header (13 bytes).
+const MaxFramePayload = 1200
+
+// Write sends data on the stream, chunking into multiple frames if needed.
 func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, errors.New("stream closed")
 	}
-	err := s.mux.SendFrame(&Frame{
-		StreamID: s.ID,
-		Type:     FrameData,
-		Sequence: s.mux.NextSeq(),
-		Length:   uint32(len(p)),
-		Payload:  p,
-	})
-	if err != nil {
-		return 0, err
+	total := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > MaxFramePayload {
+			chunk = p[:MaxFramePayload]
+		}
+		err := s.mux.SendFrame(&Frame{
+			StreamID: s.ID,
+			Type:     FrameData,
+			Sequence: s.mux.NextSeq(),
+			Length:   uint32(len(chunk)),
+			Payload:  chunk,
+		})
+		if err != nil {
+			if total > 0 {
+				return total, err
+			}
+			return 0, err
+		}
+		total += len(chunk)
+		p = p[len(chunk):]
 	}
-	return len(p), nil
+	return total, nil
 }
 
 // Read receives data from the stream.

@@ -16,6 +16,7 @@ import (
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
+	"github.com/call-vpn/call-vpn/internal/netstack"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
@@ -289,13 +290,25 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		return fmt.Errorf("no connections passed auth/session handshake")
 	}
 
-	// 8. Serve streams until all connections die.
+	// 8. Serve streams and raw IP packets (hybrid mode).
 	// Idle timeout detects client disconnect: if no frames arrive
 	// for 2 min (client pings every 30s), readLoop exits → Dead() fires.
+	m.EnableRawPackets(256)
+	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(2 * time.Minute)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
+
+	go m.DispatchLoop(sessCtx)
+	go m.StartPingLoop(sessCtx, 30*time.Second)
+
+	// Start netstack for raw IP packets (mobile clients).
+	ns := netstack.New(logger, m)
+	if ns != nil {
+		ns.Start(sessCtx)
+		defer ns.Close()
+	}
 
 	// Cancel session context when all MUX connections are dead.
 	go func() {
@@ -306,12 +319,19 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		}
 	}()
 
+	// Accept streams from desktop clients (FrameOpen).
 	for {
-		stream, err := m.AcceptStream(sessCtx)
-		if err != nil {
-			return nil // session over
+		select {
+		case stream, ok := <-m.AcceptedStreams():
+			if !ok {
+				return nil
+			}
+			go handleStream(sessCtx, logger, stream)
+		case <-m.Dead():
+			return nil
+		case <-sessCtx.Done():
+			return nil
 		}
-		go handleStream(sessCtx, logger, stream)
 	}
 }
 
@@ -364,6 +384,11 @@ func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitor
 	sessLogger := logger.With("session_id", fmt.Sprintf("%x", id))
 	m := mux.New(sessLogger) // Zero initial connections; AddConn later.
 
+	// Enable hybrid mode: both raw IP packets and streams.
+	m.EnableRawPackets(256)
+	m.EnableStreamAccept(64)
+	m.SetIdleTimeout(2 * time.Minute)
+
 	sess := &session{
 		m:      m,
 		logger: sessLogger,
@@ -372,28 +397,43 @@ func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitor
 	sessions[id] = sess
 	sessionsMu.Unlock()
 
-	// Start AcceptStream loop.
+	// Start DispatchLoop + ping loop.
+	go m.DispatchLoop(sessCtx)
+	go m.StartPingLoop(sessCtx, 30*time.Second)
+
+	// Start netstack for raw IP packets (mobile clients).
+	ns := netstack.New(sessLogger, m)
+	if ns != nil {
+		ns.Start(sessCtx)
+	}
+
+	// Accept streams and handle session lifecycle.
 	go func() {
 		defer func() {
 			sessionsMu.Lock()
 			delete(sessions, id)
 			sessionsMu.Unlock()
+			if ns != nil {
+				ns.Close()
+			}
 			m.Close()
 			sessCancel()
 			sessLogger.Info("session closed")
 		}()
 
 		for {
-			stream, err := m.AcceptStream(sessCtx)
-			if err != nil {
-				if sessCtx.Err() != nil {
+			select {
+			case stream, ok := <-m.AcceptedStreams():
+				if !ok {
 					return
 				}
-				sessLogger.Warn("accept stream error", "err", err)
+				go handleStream(sessCtx, sessLogger, stream)
+			case <-m.Dead():
 				siren.AlertDisconnect(sessCtx, fmt.Sprintf("session-%x", id))
 				return
+			case <-sessCtx.Done():
+				return
 			}
-			go handleStream(sessCtx, sessLogger, stream)
 		}
 	}()
 
@@ -432,17 +472,20 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 	}
 	defer outConn.Close()
 
+	buf := make([]byte, mux.MaxFramePayload)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(outConn, stream)
+		io.CopyBuffer(outConn, stream, buf)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, outConn)
+		buf2 := make([]byte, mux.MaxFramePayload)
+		io.CopyBuffer(stream, outConn, buf2)
 	}()
 
 	wg.Wait()

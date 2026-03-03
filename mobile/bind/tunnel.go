@@ -515,8 +515,13 @@ func (t *Tunnel) DialStream(addr string) (io.ReadWriteCloser, error) {
 	return stream, nil
 }
 
+// TunMTU is the recommended MTU for the native TUN device.
+// Keeps raw IP packets + MUX header + DTLS overhead within TURN relay limits.
+const TunMTU = 1280
+
 // WritePacket sends a raw IP packet through the tunnel (for VpnService / NEPacketTunnelProvider).
 // Returns error immediately during reconnect (packets are dropped; native code retries).
+// Packets larger than TunMTU are silently dropped (like an oversized datagram on a real interface).
 func (t *Tunnel) WritePacket(data []byte) error {
 	t.mu.Lock()
 	m := t.m
@@ -524,6 +529,10 @@ func (t *Tunnel) WritePacket(data []byte) error {
 
 	if m == nil {
 		return fmt.Errorf("tunnel reconnecting")
+	}
+
+	if len(data) > TunMTU {
+		return nil // drop oversized packet
 	}
 
 	return m.SendFrame(&mux.Frame{
