@@ -27,7 +27,7 @@ func main() {
 	socks5Port := flag.Int("socks5-port", 1080, "SOCKS5 proxy listen port")
 	httpPort := flag.Int("http-port", 8080, "HTTP/HTTPS proxy listen port")
 	callLink := flag.String("link", "", "VK call link ID (e.g. abcd1234)")
-	numConns := flag.Int("n", 4, "Number of parallel TURN+DTLS connections")
+	numConns := flag.Int("n", 16, "Number of parallel TURN+DTLS connections")
 	useTCP := flag.Bool("tcp", true, "Use TCP for TURN connections")
 	serverAddr := flag.String("server", "", "VPN server address (host:port), empty = relay-to-relay mode")
 	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
@@ -208,7 +208,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		}
 	}()
 
-	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
+	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "client")
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -223,30 +223,66 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		<-sendDone
 	}()
 
+	// Drain signaling notifications to prevent incoming buffer overflow.
+	go sigClient.WaitForHungup(ctx)
+
 	// Match allocations to server addresses.
 	pairCount := len(allocs)
 	if len(serverAddrs) < pairCount {
 		pairCount = len(serverAddrs)
 	}
 
-	// 6. Punch relay for each pair.
+	// 6. Punch relay and establish DTLS in parallel.
+	sessionID := uuid.New()
+	logger.Info("session (relay-to-relay mode)", "id", sessionID.String())
+
+	type dtlsResult struct {
+		index   int
+		conn    io.ReadWriteCloser
+		cleanup context.CancelFunc
+		err     error
+	}
+	results := make(chan dtlsResult, pairCount)
+	punchCtx, punchCancel := context.WithCancel(ctx)
+
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
 		if err != nil {
 			logger.Warn("resolve server relay addr", "index", i, "addr", serverAddrs[i], "err", err)
+			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		if err := internaldtls.PunchRelay(allocs[i].RelayConn, serverUDP); err != nil {
-			logger.Warn("punch relay failed", "index", i, "err", err)
-		}
+		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
+			internaldtls.PunchRelay(relayConn, addr)
+			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
+			time.Sleep(500 * time.Millisecond)
+
+			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr)
+			if err != nil {
+				results <- dtlsResult{index: idx, err: err}
+				return
+			}
+
+			if authToken != "" {
+				if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
+					cleanup()
+					results <- dtlsResult{index: idx, err: fmt.Errorf("write auth token: %w", err)}
+					return
+				}
+			}
+
+			var sid [16]byte
+			copy(sid[:], sessionID[:])
+			if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+				cleanup()
+				results <- dtlsResult{index: idx, err: fmt.Errorf("write session id: %w", err)}
+				return
+			}
+
+			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup}
+		}(i, allocs[i].RelayConn, serverUDP)
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	sessionID := uuid.New()
-	logger.Info("session (relay-to-relay mode)", "id", sessionID.String())
-
-	// 7. Establish DTLS-over-TURN to each server relay address.
 	var cleanups []context.CancelFunc
 	defer func() {
 		for _, c := range cleanups {
@@ -255,38 +291,17 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	}()
 
 	var muxConns []io.ReadWriteCloser
-	for i := 0; i < pairCount; i++ {
-		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
-		if err != nil {
+	for j := 0; j < pairCount; j++ {
+		r := <-results
+		if r.err != nil {
+			logger.Warn("relay DTLS failed", "index", r.index, "err", r.err)
 			continue
 		}
-
-		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, allocs[i].RelayConn, serverUDP)
-		if err != nil {
-			logger.Warn("DTLS-over-TURN (relay) failed", "index", i, "err", err)
-			continue
-		}
-		cleanups = append(cleanups, cleanup)
-
-		if authToken != "" {
-			if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
-				logger.Warn("write auth token failed", "index", i, "err", err)
-				cleanup()
-				continue
-			}
-		}
-
-		var sid [16]byte
-		copy(sid[:], sessionID[:])
-		if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-			logger.Warn("write session id failed", "index", i, "err", err)
-			cleanup()
-			continue
-		}
-
-		muxConns = append(muxConns, dtlsConn)
-		logger.Info("relay DTLS connection established", "index", i)
+		cleanups = append(cleanups, r.cleanup)
+		muxConns = append(muxConns, r.conn)
+		logger.Info("relay DTLS connection established", "index", r.index)
 	}
+	punchCancel()
 
 	if len(muxConns) == 0 {
 		logger.Error("no relay DTLS connections established")

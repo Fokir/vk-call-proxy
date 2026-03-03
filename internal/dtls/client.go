@@ -36,7 +36,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// relay -> pipe: read from TURN relay, write to pipe
+	// relay -> pipe: read from TURN relay, write to pipe (filter out punch probes)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -50,6 +50,9 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
 				return
+			}
+			if isPunch(buf, n) {
+				continue
 			}
 			_, err = conn2.WriteTo(buf[:n], serverAddr)
 			if err != nil {

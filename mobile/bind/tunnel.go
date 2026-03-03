@@ -144,6 +144,9 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		t.mu.Unlock()
 		return fmt.Errorf("tunnel already running")
 	}
+	if cfg.NumConns <= 0 {
+		cfg.NumConns = 16
+	}
 	t.cfg = cfg
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
@@ -277,7 +280,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		}
 	}()
 
-	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
+	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "client")
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -293,55 +296,74 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		sigClient.Close()
 	}()
 
+	// Drain signaling notifications to prevent incoming buffer overflow.
+	go sigClient.WaitForHungup(ctx)
+
 	pairCount := len(allocs)
 	if len(serverAddrs) < pairCount {
 		pairCount = len(serverAddrs)
 	}
 
+	sessionID := uuid.New()
+
+	type dtlsResult struct {
+		index   int
+		conn    io.ReadWriteCloser
+		cleanup context.CancelFunc
+		err     error
+	}
+	results := make(chan dtlsResult, pairCount)
+	punchCtx, punchCancel := context.WithCancel(ctx)
+
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
 		if err != nil {
+			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		internaldtls.PunchRelay(allocs[i].RelayConn, serverUDP)
-	}
-	time.Sleep(500 * time.Millisecond)
+		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
+			internaldtls.PunchRelay(relayConn, addr)
+			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
+			time.Sleep(500 * time.Millisecond)
 
-	sessionID := uuid.New()
+			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr)
+			if err != nil {
+				results <- dtlsResult{index: idx, err: err}
+				return
+			}
+
+			if cfg.Token != "" {
+				if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
+					cleanup()
+					results <- dtlsResult{index: idx, err: fmt.Errorf("write auth token: %w", err)}
+					return
+				}
+			}
+
+			var sid [16]byte
+			copy(sid[:], sessionID[:])
+			if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+				cleanup()
+				results <- dtlsResult{index: idx, err: fmt.Errorf("write session id: %w", err)}
+				return
+			}
+
+			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup}
+		}(i, allocs[i].RelayConn, serverUDP)
+	}
 
 	var muxConns []io.ReadWriteCloser
 	var cleanups []context.CancelFunc
-	for i := 0; i < pairCount; i++ {
-		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
-		if err != nil {
+	for j := 0; j < pairCount; j++ {
+		r := <-results
+		if r.err != nil {
+			t.logger.Warn("relay DTLS failed", "index", r.index, "err", r.err)
 			continue
 		}
-
-		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, allocs[i].RelayConn, serverUDP)
-		if err != nil {
-			t.logger.Warn("relay DTLS failed", "index", i, "err", err)
-			continue
-		}
-		cleanups = append(cleanups, cleanup)
-
-		if cfg.Token != "" {
-			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
-				t.logger.Warn("write auth token failed", "index", i, "err", err)
-				cleanup()
-				continue
-			}
-		}
-
-		var sid [16]byte
-		copy(sid[:], sessionID[:])
-		if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-			t.logger.Warn("write session id failed", "index", i, "err", err)
-			cleanup()
-			continue
-		}
-
-		muxConns = append(muxConns, dtlsConn)
+		cleanups = append(cleanups, r.cleanup)
+		muxConns = append(muxConns, r.conn)
 	}
+	punchCancel()
 
 	if len(muxConns) == 0 {
 		mgr.CloseAll()

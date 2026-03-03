@@ -39,16 +39,21 @@ func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
 	callLink := flag.String("link", "", "VK call link ID for relay-to-relay mode")
-	numConns := flag.Int("n", 4, "number of parallel TURN+DTLS connections (relay mode)")
+	numConns := flag.Int("n", 16, "number of parallel TURN+DTLS connections (relay mode)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	flag.Parse()
 
-	// Fall back to environment variable if flag not set.
+	// Fall back to environment variables if flags not set.
 	if *authToken == "" {
 		*authToken = os.Getenv("VPN_TOKEN")
 	}
 	if *callLink == "" {
 		*callLink = os.Getenv("VK_CALL_LINK")
+	}
+	if v := os.Getenv("TURN_CONNS"); v != "" {
+		if n, err := fmt.Sscan(v, numConns); n == 1 && err == nil {
+			// parsed from env
+		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -192,7 +197,7 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		}
 	}()
 
-	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx)
+	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -206,28 +211,43 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		<-sendDone
 	}()
 
+	// Drain signaling notifications to prevent incoming buffer overflow.
+	go sigClient.WaitForHungup(ctx)
+
 	// Match allocations to client addresses (use min of both counts).
 	pairCount := len(allocs)
 	if len(clientAddrs) < pairCount {
 		pairCount = len(clientAddrs)
 	}
 
-	// 5. Punch relay for each pair.
+	// 5. Punch relay and accept DTLS connections in parallel.
+	type dtlsResult struct {
+		index   int
+		conn    net.Conn
+		cleanup context.CancelFunc
+		err     error
+	}
+	results := make(chan dtlsResult, pairCount)
+	punchCtx, punchCancel := context.WithCancel(ctx)
+
 	for i := 0; i < pairCount; i++ {
 		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
 		if err != nil {
 			logger.Warn("resolve client relay addr", "index", i, "addr", clientAddrs[i], "err", err)
+			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		if err := internaldtls.PunchRelay(allocs[i].RelayConn, clientUDP); err != nil {
-			logger.Warn("punch relay failed", "index", i, "err", err)
-		}
+		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
+			// Initial punch + continuous punching during handshake.
+			internaldtls.PunchRelay(relayConn, addr)
+			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
+			time.Sleep(500 * time.Millisecond)
+
+			dtlsConn, cleanup, err := internaldtls.AcceptOverTURN(ctx, relayConn, addr)
+			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: err}
+		}(i, allocs[i].RelayConn, clientUDP)
 	}
 
-	// Short delay for permissions to propagate.
-	time.Sleep(500 * time.Millisecond)
-
-	// 6. Accept DTLS connections over TURN relays.
 	var dtlsConns []net.Conn
 	var cleanups []context.CancelFunc
 	defer func() {
@@ -236,21 +256,17 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		}
 	}()
 
-	for i := 0; i < pairCount; i++ {
-		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
-		if err != nil {
+	for j := 0; j < pairCount; j++ {
+		r := <-results
+		if r.err != nil {
+			logger.Warn("AcceptOverTURN failed", "index", r.index, "err", r.err)
 			continue
 		}
-
-		dtlsConn, cleanup, err := internaldtls.AcceptOverTURN(ctx, allocs[i].RelayConn, clientUDP)
-		if err != nil {
-			logger.Warn("AcceptOverTURN failed", "index", i, "err", err)
-			continue
-		}
-		cleanups = append(cleanups, cleanup)
-		dtlsConns = append(dtlsConns, dtlsConn)
-		logger.Info("relay DTLS connection accepted", "index", i)
+		cleanups = append(cleanups, r.cleanup)
+		dtlsConns = append(dtlsConns, r.conn)
+		logger.Info("relay DTLS connection accepted", "index", r.index)
 	}
+	punchCancel()
 
 	if len(dtlsConns) == 0 {
 		return fmt.Errorf("no relay DTLS connections established")

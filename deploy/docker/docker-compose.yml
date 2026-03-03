@@ -6,7 +6,7 @@ services:
     environment:
       - VPN_TOKEN=${VPN_TOKEN:-}
       - VK_CALL_LINK=${VK_CALL_LINK:-}
-      - TURN_CONNS=${TURN_CONNS:-4}
+      - TURN_CONNS=${TURN_CONNS:-16}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
     restart: unless-stopped
     deploy:

@@ -13,6 +13,15 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
+// punchByte is the single-byte probe used by PunchRelay / StartPunchLoop.
+// Filtered out in bridge goroutines to avoid corrupting the DTLS state machine.
+const punchByte = 0x00
+
+// isPunch returns true if the packet is a PunchRelay probe (single 0x00 byte).
+func isPunch(buf []byte, n int) bool {
+	return n == 1 && buf[0] == punchByte
+}
+
 // AcceptOverTURN establishes a server-side DTLS connection through a TURN
 // relay PacketConn. Mirrors DialOverTURN but uses dtls.Server() instead
 // of dtls.Client(). The clientRelayAddr is the remote peer's relay address.
@@ -29,7 +38,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// relay -> pipe
+	// relay -> pipe (filter out punch probes)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -43,6 +52,9 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
 				return
+			}
+			if isPunch(buf, n) {
+				continue
 			}
 			_, err = conn2.WriteTo(buf[:n], clientRelayAddr)
 			if err != nil {
@@ -121,6 +133,21 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 // PunchRelay sends a probe packet to the remote relay address to create
 // a TURN permission. Both sides must call this before DTLS handshake.
 func PunchRelay(relayConn net.PacketConn, remoteAddr *net.UDPAddr) error {
-	_, err := relayConn.WriteTo([]byte{0x00}, remoteAddr)
+	_, err := relayConn.WriteTo([]byte{punchByte}, remoteAddr)
 	return err
+}
+
+// StartPunchLoop sends periodic probe packets to keep TURN permissions
+// alive during the DTLS handshake. Stops when ctx is cancelled.
+func StartPunchLoop(ctx context.Context, relayConn net.PacketConn, remoteAddr *net.UDPAddr) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			relayConn.WriteTo([]byte{punchByte}, remoteAddr)
+		}
+	}
 }

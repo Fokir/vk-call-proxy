@@ -321,8 +321,9 @@ func (c *Client) SendRelayAddrs(ctx context.Context, addrs []string, role string
 
 // RecvRelayAddrs waits for a custom-data notification containing
 // the remote peer's relay addresses. The data field is a base64 blob
-// wrapping the inner JSON structure.
-func (c *Client) RecvRelayAddrs(ctx context.Context) (addrs []string, role string, err error) {
+// wrapping the inner JSON structure. Messages whose role matches
+// skipRole are silently discarded (filters out our own echoed broadcasts).
+func (c *Client) RecvRelayAddrs(ctx context.Context, skipRole string) (addrs []string, role string, err error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -367,6 +368,10 @@ func (c *Client) RecvRelayAddrs(ctx context.Context) (addrs []string, role strin
 					continue
 				}
 				role := fromWireRole(data.Mode)
+				if skipRole != "" && role == skipRole {
+					c.logger.Debug("skipping own echoed relay addrs", "role", role)
+					continue
+				}
 				c.logger.Info("received relay addresses", "count", len(addrs), "role", role)
 				return addrs, role, nil
 			}
