@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -271,41 +272,12 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 
 	logger.Info("relay-to-relay mode active", "connections", len(dtlsConns))
 
-	// 7. Process auth and session protocol on each connection,
-	// then create a local MUX for this relay session.
+	// 7. Create MUX and start serving immediately so that connections
+	// added below can process traffic right away (no blocking on slow
+	// handshakes from other connections).
 	m := mux.New(logger)
 	defer m.Close()
 
-	added := 0
-	for i, conn := range dtlsConns {
-		if authToken != "" {
-			if err := mux.ValidateAuthToken(conn, authToken); err != nil {
-				logger.Warn("auth failed on relay conn", "index", i, "err", err)
-				conn.Close()
-				continue
-			}
-		}
-		sessionID, err := mux.ReadSessionID(conn)
-		if err != nil {
-			logger.Warn("read session id failed on relay conn", "index", i, "err", err)
-			conn.Close()
-			continue
-		}
-		logger.Info("connection received",
-			"index", i,
-			"session_id", fmt.Sprintf("%x", sessionID),
-		)
-		m.AddConn(conn)
-		added++
-	}
-
-	if added == 0 {
-		return fmt.Errorf("no connections passed auth/session handshake")
-	}
-
-	// 8. Serve streams and raw IP packets (hybrid mode).
-	// Idle timeout detects client disconnect: if no frames arrive
-	// for 90s (client pings every 30s), readLoop exits → Dead() fires.
 	m.EnableRawPackets(256)
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
@@ -321,6 +293,42 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 	if ns != nil {
 		ns.Start(sessCtx)
 		defer ns.Close()
+	}
+
+	// 8. Process auth and session protocol on each connection in parallel.
+	// Each connection joins the active MUX as soon as its handshake succeeds,
+	// so a slow/broken connection doesn't block others.
+	var wg sync.WaitGroup
+	var added atomic.Int32
+	for i, conn := range dtlsConns {
+		wg.Add(1)
+		go func(idx int, c net.Conn) {
+			defer wg.Done()
+			if authToken != "" {
+				if err := mux.ValidateAuthToken(c, authToken); err != nil {
+					logger.Warn("auth failed on relay conn", "index", idx, "err", err)
+					c.Close()
+					return
+				}
+			}
+			sessionID, err := mux.ReadSessionID(c)
+			if err != nil {
+				logger.Warn("read session id failed on relay conn", "index", idx, "err", err)
+				c.Close()
+				return
+			}
+			logger.Info("connection received",
+				"index", idx,
+				"session_id", fmt.Sprintf("%x", sessionID),
+			)
+			m.AddConn(c)
+			added.Add(1)
+		}(i, conn)
+	}
+	wg.Wait()
+
+	if added.Load() == 0 {
+		return fmt.Errorf("no connections passed auth/session handshake")
 	}
 
 	// Drain signaling notifications. On hungup or WS close, reduce idle

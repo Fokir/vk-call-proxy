@@ -104,6 +104,7 @@ type Tunnel struct {
 	muxReady       chan struct{}       // closed when mux is available; recreated on teardown
 	muxCancel      context.CancelFunc // cancels DispatchLoop/PingLoop for current mux
 	forceReconnect chan struct{}       // buffered(1), signals network change
+	connectedAt    time.Time          // when the current MUX was established
 }
 
 // TunnelConfig holds configuration for starting the tunnel.
@@ -389,6 +390,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	t.m = state.m
 	t.mgr = state.mgr
 	t.cleanups = state.cleanups
+	t.connectedAt = time.Now()
 	muxCtx, muxCancel := context.WithCancel(t.rootCtx)
 	t.muxCancel = muxCancel
 	ready := t.muxReady
@@ -667,8 +669,16 @@ func (t *Tunnel) Stop() {
 func (t *Tunnel) OnNetworkChanged() {
 	t.mu.Lock()
 	running := t.running
+	connAge := time.Since(t.connectedAt)
 	t.mu.Unlock()
 	if !running {
+		return
+	}
+	// Ignore network change events shortly after connection:
+	// Android fires onAvailable callbacks for existing networks when
+	// registerNetworkCallback is called right after VPN interface creation.
+	if connAge < 5*time.Second {
+		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
 	}
 	select {
