@@ -169,7 +169,7 @@ func Connect(ctx context.Context, wsEndpoint string, logger *slog.Logger) (*Clie
 	c := &Client{
 		conn:     conn,
 		logger:   logger,
-		incoming: make(chan notification, 64),
+		incoming: make(chan notification, 256),
 		done:     make(chan struct{}),
 	}
 

@@ -302,6 +302,36 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 	go m.readLoop(idx, mc)
 }
 
+// ProbeConnections sends an immediate ping on all connections and sets
+// a short read deadline so that dead connections are detected quickly.
+// Live connections will respond with pong, resetting the normal idle
+// timeout on the next readLoop iteration. Dead connections will timeout
+// after probeTimeout and trigger ConnDied via the normal readLoop exit path.
+func (m *Mux) ProbeConnections(probeTimeout time.Duration) {
+	f := &Frame{StreamID: 0, Type: FramePing, Sequence: m.NextSeq()}
+	data, err := f.MarshalBinary()
+	if err != nil {
+		return
+	}
+
+	m.mu.Lock()
+	conns := make([]*muxConn, len(m.conns))
+	copy(conns, m.conns)
+	m.mu.Unlock()
+
+	for _, mc := range conns {
+		if mc == nil {
+			continue
+		}
+		mc.mu.Lock()
+		if d, ok := mc.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			d.SetReadDeadline(time.Now().Add(probeTimeout))
+		}
+		mc.conn.Write(data)
+		mc.mu.Unlock()
+	}
+}
+
 // Dead returns a channel that is closed when all readLoop goroutines
 // have exited (all underlying connections are dead).
 func (m *Mux) Dead() <-chan struct{} {

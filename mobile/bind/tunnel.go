@@ -103,10 +103,9 @@ type Tunnel struct {
 	cfg            *TunnelConfig
 	rootCtx        context.Context
 	rootCancel     context.CancelFunc
-	muxReady       chan struct{}       // closed when mux is available; recreated on teardown
-	muxCancel      context.CancelFunc // cancels DispatchLoop/PingLoop for current mux
-	forceReconnect chan struct{}       // buffered(1), signals network change
-	connectedAt    time.Time          // when the current MUX was established
+	muxReady    chan struct{}       // closed when mux is available; recreated on teardown
+	muxCancel   context.CancelFunc // cancels DispatchLoop/PingLoop for current mux
+	connectedAt time.Time          // when the current MUX was established
 	sigClient      *internalsignal.Client // kept alive in relay mode for per-conn reconnects
 	sessionID      uuid.UUID              // current session ID
 }
@@ -156,7 +155,6 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	t.cfg = cfg
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
-	t.forceReconnect = make(chan struct{}, 1)
 	t.running = true
 	t.mu.Unlock()
 
@@ -456,9 +454,11 @@ func (t *Tunnel) teardownMux() {
 	}
 }
 
-// reconnectLoop watches the current mux for death (or a forced network change
-// signal) and re-establishes the tunnel with exponential backoff (1s → 60s).
-// On forceReconnect the first attempt is made immediately (no backoff delay).
+// reconnectLoop watches the current mux for death and re-establishes
+// the tunnel with exponential backoff (1s → 60s).
+// Network changes are handled separately by OnNetworkChanged which
+// probes connections — dead ones trigger ConnDied → reconnectConns,
+// and if all die, Dead() fires and this loop handles full reconnect.
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 30 * time.Second
@@ -473,45 +473,26 @@ func (t *Tunnel) reconnectLoop() {
 			select {
 			case <-t.rootCtx.Done():
 				return
-			case <-t.forceReconnect:
-				continue
 			case <-time.After(backoff):
 				continue
 			}
 		}
 
-		forced := false
 		select {
 		case <-m.Dead():
 			t.logger.Info("all connections dead, starting reconnect")
-		case <-t.forceReconnect:
-			t.logger.Info("network changed, forcing reconnect")
-			forced = true
 		case <-t.rootCtx.Done():
 			return
 		}
 
 		t.teardownMux()
 
-		// Drain any pending forceReconnect signal so it doesn't fire again
-		// immediately after we reconnect.
-		select {
-		case <-t.forceReconnect:
-		default:
-		}
-
 		for {
-			// On forced reconnect the first attempt is immediate (no delay).
-			if !forced {
-				select {
-				case <-t.rootCtx.Done():
-					return
-				case <-t.forceReconnect:
-					// Network changed again — skip remaining backoff.
-				case <-time.After(backoff):
-				}
+			select {
+			case <-t.rootCtx.Done():
+				return
+			case <-time.After(backoff):
 			}
-			forced = false
 
 			attemptCtx, attemptCancel := context.WithTimeout(t.rootCtx, attemptTimeout)
 			var state *tunnelState
@@ -781,11 +762,6 @@ func (t *Tunnel) Stop() {
 		rootCancel()
 	}
 	t.teardownMux()
-	// Drain pending forceReconnect signal for clean state.
-	select {
-	case <-t.forceReconnect:
-	default:
-	}
 	t.logger.Info("tunnel stopped")
 }
 
@@ -796,6 +772,7 @@ func (t *Tunnel) Stop() {
 func (t *Tunnel) OnNetworkChanged() {
 	t.mu.Lock()
 	running := t.running
+	m := t.m
 	connAge := time.Since(t.connectedAt)
 	t.mu.Unlock()
 	if !running {
@@ -808,12 +785,16 @@ func (t *Tunnel) OnNetworkChanged() {
 		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
 	}
-	select {
-	case t.forceReconnect <- struct{}{}:
-		t.logger.Info("network change signalled, will reconnect")
-	default:
-		// Already pending — no need to signal again.
+	if m == nil {
+		t.logger.Info("ignoring network change, no active mux")
+		return
 	}
+	// Instead of tearing down the tunnel, probe existing connections.
+	// If connections are alive (network change was harmless), pong arrives
+	// within 3s and nothing happens. If connections are dead, readLoop
+	// exits after 3s → ConnDied fires → reconnectConns/reconnectLoop handle it.
+	t.logger.Info("network change detected, probing connections")
+	m.ProbeConnections(3 * time.Second)
 }
 
 // IsRunning returns whether the tunnel is active.
