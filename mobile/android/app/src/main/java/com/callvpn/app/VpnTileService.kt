@@ -5,7 +5,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
@@ -44,13 +43,6 @@ class VpnTileService : TileService() {
                 startService(intent)
             }
             else -> {
-                // Check if VPN permission is granted
-                val vpnIntent = VpnService.prepare(this)
-                if (vpnIntent != null) {
-                    openApp()
-                    return
-                }
-
                 // Check saved settings
                 val prefs = getSharedPreferences("callvpn", Context.MODE_PRIVATE)
                 val callLink = prefs.getString("call_link", "") ?: ""
@@ -65,6 +57,15 @@ class VpnTileService : TileService() {
                 val serverAddr = if (connectionMode == "Direct") {
                     prefs.getString("server_addr", "") ?: ""
                 } else ""
+
+                // Check if VPN permission has been granted previously.
+                // VpnService.prepare() must NOT be called from a non-Activity context
+                // on many Android versions. We store the grant state in prefs instead.
+                val vpnGranted = prefs.getBoolean("vpn_permission_granted", false)
+                if (!vpnGranted) {
+                    openApp()
+                    return
+                }
 
                 val intent = Intent(this, CallVpnService::class.java).apply {
                     action = CallVpnService.ACTION_START

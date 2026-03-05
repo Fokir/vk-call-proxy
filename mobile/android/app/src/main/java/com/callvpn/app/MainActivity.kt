@@ -53,6 +53,8 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
+            getSharedPreferences("callvpn", Context.MODE_PRIVATE)
+                .edit().putBoolean("vpn_permission_granted", true).apply()
             startVpnService()
         } else {
             Toast.makeText(this, "VPN permission denied", Toast.LENGTH_SHORT).show()
@@ -106,6 +108,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Sync initial state in case VPN was started from tile before activity.
+        vpnState.value = when (CallVpnService.currentState) {
+            "connecting" -> VpnState.Connecting
+            "connected" -> VpnState.Connected
+            else -> VpnState.Disconnected
+        }
+
         val lbm = LocalBroadcastManager.getInstance(this)
         lbm.registerReceiver(stateReceiver, IntentFilter(CallVpnService.ACTION_STATE_CHANGED))
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
@@ -150,6 +159,8 @@ class MainActivity : ComponentActivity() {
         if (intent != null) {
             vpnPermissionLauncher.launch(intent)
         } else {
+            getSharedPreferences("callvpn", Context.MODE_PRIVATE)
+                .edit().putBoolean("vpn_permission_granted", true).apply()
             startVpnService()
         }
     }
