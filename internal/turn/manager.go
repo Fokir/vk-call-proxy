@@ -197,11 +197,18 @@ func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
 			allocs := make([]*Allocation, len(m.allocations))
 			copy(allocs, m.allocations)
 			m.mu.Unlock()
-			for _, a := range allocs {
+			for i, a := range allocs {
 				if a != nil && a.Client != nil {
 					if _, err := a.Client.SendBindingRequest(); err != nil {
-						m.logger.Debug("TURN keepalive failed", "err", err)
+						m.logger.Debug("TURN keepalive failed", "index", i, "err", err)
 					}
+				}
+				if a != nil {
+					m.logger.Debug("TURN allocation alive",
+						"index", i,
+						"age", time.Since(a.CreatedAt).Round(time.Second),
+						"relay", a.RelayAddr,
+					)
 				}
 			}
 		case <-ctx.Done():
@@ -217,9 +224,11 @@ func (m *Manager) CloseAll() {
 	m.allocations = nil
 	m.mu.Unlock()
 
-	for _, a := range allocs {
+	for i, a := range allocs {
+		age := time.Since(a.CreatedAt).Round(time.Second)
+		m.logger.Info("closing TURN allocation", "index", i, "age", age, "relay", a.RelayAddr)
 		if err := a.Close(); err != nil {
-			m.logger.Warn("error closing allocation", "err", err)
+			m.logger.Warn("error closing allocation", "index", i, "err", err)
 		}
 	}
 }

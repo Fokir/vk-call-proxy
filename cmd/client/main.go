@@ -367,7 +367,13 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 					return
 				}
 				m.RemoveConn(idx)
-				logger.Info("connection died", "index", idx)
+				// Log allocation age if available.
+				allocs := mgr.Allocations()
+				var ageStr string
+				if idx < len(allocs) && allocs[idx] != nil {
+					ageStr = time.Since(allocs[idx].CreatedAt).Round(time.Second).String()
+				}
+				logger.Info("connection died", "index", idx, "allocation_age", ageStr)
 				triggerWakeup()
 			}
 		}

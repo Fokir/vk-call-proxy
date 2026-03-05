@@ -739,7 +739,31 @@ func (c *Client) PeerID() string {
 	return c.myPeerID
 }
 
-// Close shuts down the WebSocket connection.
+// SendHangup sends a "hangup" command to VK signaling to explicitly
+// leave the call. This removes the anonymous participant from the call
+// instead of leaving a ghost user until VK's idle timeout fires.
+func (c *Client) SendHangup() error {
+	c.mu.Lock()
+	c.seq++
+	seq := c.seq
+	c.mu.Unlock()
+
+	cmd := command{
+		Command:  "hangup",
+		Sequence: seq,
+	}
+	msg, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal hangup: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(websocket.TextMessage, msg)
+}
+
+// Close sends a hangup to leave the VK call, then shuts down the WebSocket.
 func (c *Client) Close() error {
+	_ = c.SendHangup() // best-effort: don't fail Close on hangup error
 	return c.conn.Close()
 }
