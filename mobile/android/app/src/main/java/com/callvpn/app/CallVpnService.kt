@@ -208,8 +208,8 @@ class CallVpnService : VpnService() {
                         }
 
                         // Broadcast connection count.
-                        val active = tunnel?.activeConns?.toInt() ?: 0
-                        val total = tunnel?.totalConns?.toInt() ?: 0
+                        val active = tunnel?.activeConns()?.toInt() ?: 0
+                        val total = tunnel?.totalConns()?.toInt() ?: 0
                         val connIntent = Intent(ACTION_CONN_COUNT).apply {
                             putExtra(EXTRA_ACTIVE_CONNS, active)
                             putExtra(EXTRA_TOTAL_CONNS, total)
