@@ -183,6 +183,33 @@ func (m *Manager) Allocations() []*Allocation {
 	return out
 }
 
+// StartKeepalive sends periodic STUN Binding requests on all active
+// allocations to keep the TURN control channel alive. VK TURN servers
+// appear to have a short idle timeout (~30s) that only resets on STUN
+// transactions, not on ChannelData frames. Call in a goroutine.
+func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.mu.Lock()
+			allocs := make([]*Allocation, len(m.allocations))
+			copy(allocs, m.allocations)
+			m.mu.Unlock()
+			for _, a := range allocs {
+				if a != nil && a.Client != nil {
+					if _, err := a.Client.SendBindingRequest(); err != nil {
+						m.logger.Debug("TURN keepalive failed", "err", err)
+					}
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // CloseAll tears down all allocations.
 func (m *Manager) CloseAll() {
 	m.mu.Lock()

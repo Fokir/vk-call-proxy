@@ -314,6 +314,11 @@ func (m *Mux) ConnDied() <-chan int {
 	return m.connDied
 }
 
+// ActiveConns returns the number of readLoop goroutines still running.
+func (m *Mux) ActiveConns() int {
+	return int(m.activeReaders.Load())
+}
+
 // RemoveConn sets the connection at the given index to nil.
 // The slot can later be filled by AddConn (which appends, so the old
 // index stays nil — this prevents index shift).

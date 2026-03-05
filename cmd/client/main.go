@@ -138,7 +138,7 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	defer m.Close()
 
 	go m.DispatchLoop(ctx)
-	go m.StartPingLoop(ctx, 30*time.Second)
+	go m.StartPingLoop(ctx, 10*time.Second)
 
 	// 4. Start proxies.
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
@@ -313,10 +313,11 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	defer m.Close()
 
 	go m.DispatchLoop(ctx)
-	go m.StartPingLoop(ctx, 30*time.Second)
+	go m.StartPingLoop(ctx, 10*time.Second)
+	go mgr.StartKeepalive(ctx, 10*time.Second)
 
-	// 9. Start per-connection reconnect goroutine.
-	go reconnectConns(ctx, sigClient, mgr, m, sessionID, authToken, logger)
+	// 9. Start unified reconnect manager (serialized to avoid ackCh mix-up).
+	go reconnectManager(ctx, sigClient, mgr, m, sessionID, authToken, numConns, logger)
 
 	// 10. Monitor signaling for session end.
 	go func() {
@@ -327,64 +328,89 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		}
 	}()
 
-	// Reconnect initially failed connections.
-	if missing := numConns - len(muxConns); missing > 0 {
-		logger.Info("attempting to reconnect initially failed connections", "missing", missing)
-		go func() {
-			ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
-			defer unsub()
-			for i := 0; i < missing; i++ {
-				m.BeginReconnect()
-				if err := reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger); err != nil {
-					logger.Warn("initial reconnect failed", "err", err)
-				}
-				m.EndReconnect()
-			}
-		}()
-	}
-
 	// 11. Start proxies.
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
 }
 
-// reconnectConns monitors ConnDied and reconnects individual dead connections
-// via VK signaling. Each dead connection triggers up to 3 reconnect attempts.
-func reconnectConns(ctx context.Context, sigClient *internalsignal.Client,
-	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string, logger *slog.Logger) {
+// reconnectManager is a unified, serialized reconnect loop. It handles both
+// initially missing connections and runtime deaths. Serialization prevents the
+// ackCh mix-up bug where parallel reconnects receive each other's server
+// responses, causing relay address mismatches and DTLS cookie failures.
+func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string,
+	targetConns int, logger *slog.Logger) {
 
 	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
 	defer unsub()
+
+	// Wakeup signal: triggered on connection death for fast response.
+	wakeup := make(chan struct{}, 1)
+	triggerWakeup := func() {
+		select {
+		case wakeup <- struct{}{}:
+		default:
+		}
+	}
+
+	// Drain ConnDied and trigger wakeup.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				m.RemoveConn(idx)
+				logger.Info("connection died", "index", idx)
+				triggerWakeup()
+			}
+		}
+	}()
+
+	// Unified loop: check every 5s or on wakeup, maintain target connection count.
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case idx, ok := <-m.ConnDied():
-			if !ok {
-				return
-			}
-			logger.Info("connection died, starting reconnect", "index", idx)
-			m.RemoveConn(idx)
-			m.BeginReconnect()
+		case <-ticker.C:
+		case <-wakeup:
+		}
 
-			go func(deadIdx int) {
-				defer m.EndReconnect()
-				var err error
-				for attempt := 1; attempt <= 3; attempt++ {
-					err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
-					if err == nil {
-						logger.Info("reconnected connection successfully", "dead_index", deadIdx, "attempt", attempt)
-						return
-					}
-					logger.Warn("reconnect attempt failed", "dead_index", deadIdx, "attempt", attempt, "err", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(time.Duration(attempt*2) * time.Second):
-					}
+		active := m.ActiveConns()
+		if active >= targetConns {
+			continue
+		}
+
+		needed := targetConns - active
+		logger.Info("connections below target, reconnecting",
+			"active", active, "target", targetConns, "needed", needed)
+
+		for i := 0; i < needed; i++ {
+			m.BeginReconnect()
+			var err error
+			for attempt := 1; attempt <= 3; attempt++ {
+				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
+				if err == nil {
+					break
 				}
-				logger.Error("failed to reconnect after 3 attempts", "dead_index", deadIdx)
-			}(idx)
+				logger.Warn("reconnect attempt failed", "attempt", attempt, "err", err)
+				select {
+				case <-ctx.Done():
+					m.EndReconnect()
+					return
+				case <-time.After(time.Duration(attempt) * time.Second):
+				}
+			}
+			m.EndReconnect()
+			if err != nil {
+				logger.Error("reconnect failed after 3 attempts", "err", err)
+				break // don't spam on persistent failure
+			}
 		}
 	}
 }
@@ -432,9 +458,11 @@ func reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
 	defer punchCancel()
 	internaldtls.PunchRelay(alloc.RelayConn, serverUDP)
 	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, serverUDP)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	dtlsConn, _, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDP)
+	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer reconnCancel()
+	dtlsConn, _, err := internaldtls.DialOverTURN(reconnCtx, alloc.RelayConn, serverUDP)
 	if err != nil {
 		return fmt.Errorf("DialOverTURN: %w", err)
 	}

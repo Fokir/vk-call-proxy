@@ -276,7 +276,8 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 	defer pingCancel()
 
 	go m.DispatchLoop(sessCtx)
-	go m.StartPingLoop(pingCtx, 30*time.Second)
+	go m.StartPingLoop(pingCtx, 10*time.Second)
+	go mgr.StartKeepalive(sessCtx, 10*time.Second)
 
 	// Start netstack for raw IP packets (mobile clients).
 	ns := netstack.New(logger, m)
@@ -424,9 +425,11 @@ func handleOneReconnect(ctx context.Context, sigClient *internalsignal.Client,
 	defer punchCancel()
 	internaldtls.PunchRelay(alloc.RelayConn, clientUDP)
 	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, clientUDP)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	dtlsConn, _, err := internaldtls.AcceptOverTURN(ctx, alloc.RelayConn, clientUDP)
+	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer reconnCancel()
+	dtlsConn, _, err := internaldtls.AcceptOverTURN(reconnCtx, alloc.RelayConn, clientUDP)
 	if err != nil {
 		return fmt.Errorf("AcceptOverTURN: %w", err)
 	}
@@ -513,7 +516,7 @@ func getOrCreateSession(ctx context.Context, logger *slog.Logger, siren *monitor
 
 	// Start DispatchLoop + ping loop.
 	go m.DispatchLoop(sessCtx)
-	go m.StartPingLoop(sessCtx, 30*time.Second)
+	go m.StartPingLoop(sessCtx, 10*time.Second)
 
 	// Start netstack for raw IP packets (mobile clients).
 	ns := netstack.New(sessLogger, m)
