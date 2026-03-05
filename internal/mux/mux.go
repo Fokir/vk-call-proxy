@@ -330,14 +330,25 @@ func (m *Mux) UpdateLatency(idx int, rtt time.Duration) {
 // AddConn dynamically adds a new connection to the multiplexer.
 // A new readLoop goroutine is spawned for the connection.
 // This is used by the server to add DTLS connections as they arrive
-// for a given session.
+// for a given session. Reuses nil slots left by RemoveConn to prevent
+// unbounded growth of the connection slice.
 func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 	mc := &muxConn{conn: conn}
 	mc.stats.lastUsed.Store(time.Now().UnixNano())
 
 	m.mu.Lock()
-	idx := len(m.conns)
-	m.conns = append(m.conns, mc)
+	idx := -1
+	for i, c := range m.conns {
+		if c == nil {
+			idx = i
+			m.conns[i] = mc
+			break
+		}
+	}
+	if idx == -1 {
+		idx = len(m.conns)
+		m.conns = append(m.conns, mc)
+	}
 	m.mu.Unlock()
 
 	m.activeReaders.Add(1)
@@ -391,17 +402,21 @@ func (m *Mux) ActiveConns() int {
 	return int(m.activeReaders.Load())
 }
 
-// TotalConns returns the total number of connection slots (including dead/nil ones).
+// TotalConns returns the number of non-nil connection slots.
 func (m *Mux) TotalConns() int {
 	m.mu.Lock()
-	n := len(m.conns)
+	n := 0
+	for _, c := range m.conns {
+		if c != nil {
+			n++
+		}
+	}
 	m.mu.Unlock()
 	return n
 }
 
 // RemoveConn sets the connection at the given index to nil.
-// The slot can later be filled by AddConn (which appends, so the old
-// index stays nil — this prevents index shift).
+// The slot is reused by subsequent AddConn calls.
 func (m *Mux) RemoveConn(idx int) {
 	m.mu.Lock()
 	if idx >= 0 && idx < len(m.conns) {

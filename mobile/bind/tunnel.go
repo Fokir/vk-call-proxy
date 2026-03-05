@@ -763,16 +763,15 @@ func (t *Tunnel) ActiveConns() int {
 	return m.ActiveConns()
 }
 
-// TotalConns returns the total number of connection slots in the mux.
-// Returns 0 if the tunnel is not connected.
+// TotalConns returns the target number of connections (from config).
+// Returns 0 if the tunnel is not running.
 func (t *Tunnel) TotalConns() int {
 	t.mu.Lock()
-	m := t.m
-	t.mu.Unlock()
-	if m == nil {
+	defer t.mu.Unlock()
+	if t.cfg == nil {
 		return 0
 	}
-	return m.TotalConns()
+	return int(t.cfg.NumConns)
 }
 
 // Stop tears down all connections and stops the reconnect loop.
@@ -817,12 +816,20 @@ func (t *Tunnel) OnNetworkChanged() {
 		t.logger.Info("ignoring network change, no active mux")
 		return
 	}
-	// Instead of tearing down the tunnel, probe existing connections.
-	// If connections are alive (network change was harmless), pong arrives
-	// within 3s and nothing happens. If connections are dead, readLoop
-	// exits after 3s → ConnDied fires → reconnectConns/reconnectLoop handle it.
+	// Probe existing connections: if alive, pong arrives within 3s.
+	// If dead, readLoop exits after 3s → ConnDied fires.
+	// After probing, check if all connections died and force teardown
+	// so reconnectLoop can do a full reconnect immediately.
 	t.logger.Info("network change detected, probing connections")
 	m.ProbeConnections(3 * time.Second)
+
+	go func() {
+		time.Sleep(4 * time.Second)
+		if m.ActiveConns() == 0 {
+			t.logger.Info("all connections dead after network change, forcing teardown")
+			t.teardownMux()
+		}
+	}()
 }
 
 // IsRunning returns whether the tunnel is active.
