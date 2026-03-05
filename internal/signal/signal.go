@@ -390,6 +390,11 @@ func (c *Client) RecvRelayAddrs(ctx context.Context, skipRole string) (addrs []s
 					continue
 				}
 				c.logger.Info("received relay addresses", "count", len(addrs), "role", role)
+
+				// Remember the sender's participantId so we can filter
+				// hungup notifications later (ignore anonymous TURN users).
+				c.setRemotePeerFromNotif(notif)
+
 				return addrs, role, nil
 			}
 		}
@@ -433,11 +438,14 @@ func (c *Client) SendDisconnect(ctx context.Context) error {
 }
 
 // WaitForSessionEnd blocks until one of the following occurs:
-//   - "hungup" notification → SessionEndHungup
+//   - "hungup" notification from the remote peer → SessionEndHungup
 //   - explicit disconnect signal (custom-data "av-reset") → SessionEndDisconnect
 //   - connection close or ctx cancellation → SessionEndClosed
 //
-// It drains other notifications to prevent buffer overflow.
+// Hungup notifications from other participants (e.g. anonymous TURN
+// identities) are ignored — only a hungup matching remotePeer triggers
+// session end.
+// It also routes custom-data to subscribers to keep reconnect signaling alive.
 func (c *Client) WaitForSessionEnd(ctx context.Context) SessionEndReason {
 	for {
 		select {
@@ -447,7 +455,10 @@ func (c *Client) WaitForSessionEnd(ctx context.Context) SessionEndReason {
 			return SessionEndClosed
 		case notif := <-c.incoming:
 			if notif.Name == "hungup" {
-				return SessionEndHungup
+				if c.isRemotePeerHungup(notif) {
+					return SessionEndHungup
+				}
+				continue
 			}
 			if notif.Name == "custom-data" {
 				// Route to subscribers first (reconnect signals, etc.).
@@ -457,6 +468,75 @@ func (c *Client) WaitForSessionEnd(ctx context.Context) SessionEndReason {
 				if c.isDisconnectSignal(notif) {
 					return SessionEndDisconnect
 				}
+			}
+		}
+	}
+}
+
+// setRemotePeerFromNotif extracts participantId from a VK notification
+// and stores it as the remote peer identity for hungup filtering.
+func (c *Client) setRemotePeerFromNotif(notif notification) {
+	var data struct {
+		ParticipantID json.Number `json:"participantId"`
+	}
+	if err := json.Unmarshal(notif.Raw, &data); err != nil {
+		return
+	}
+	pid := data.ParticipantID.String()
+	if pid == "" || pid == "0" {
+		return
+	}
+	c.mu.Lock()
+	c.remotePeer = pid
+	c.mu.Unlock()
+	c.logger.Info("remote peer identified", "participant_id", pid)
+}
+
+// isRemotePeerHungup checks if the hungup notification came from the
+// remote peer we're paired with. Returns false for hungups from other
+// anonymous TURN participants sharing the same VK conference.
+func (c *Client) isRemotePeerHungup(notif notification) bool {
+	var data struct {
+		ParticipantID json.Number `json:"participantId"`
+	}
+	if err := json.Unmarshal(notif.Raw, &data); err != nil {
+		c.logger.Warn("parse hungup participantId", "err", err)
+		return true // fail-open: treat unparseable hungup as remote
+	}
+	pid := data.ParticipantID.String()
+	if pid == "" || pid == "0" {
+		return true // no participant info — assume remote
+	}
+	c.mu.Lock()
+	remote := c.remotePeer
+	c.mu.Unlock()
+	if remote == "" {
+		return true // no remote peer set yet — assume remote
+	}
+	if pid == remote {
+		c.logger.Info("remote peer hungup", "participant_id", pid)
+		return true
+	}
+	c.logger.Debug("ignoring hungup from non-remote peer", "participant_id", pid, "remote", remote)
+	return false
+}
+
+// DrainAndRoute reads from incoming and routes custom-data to subscribers
+// until ctx is cancelled or the connection closes. Use after WaitForSessionEnd
+// returns SessionEndHungup to keep routing reconnect signals.
+func (c *Client) DrainAndRoute(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case notif, ok := <-c.incoming:
+			if !ok {
+				return
+			}
+			if notif.Name == "custom-data" {
+				c.routeToSubscriber(notif)
 			}
 		}
 	}

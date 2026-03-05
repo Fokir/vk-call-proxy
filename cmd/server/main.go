@@ -40,7 +40,6 @@ func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
 	callLink := flag.String("link", "", "VK call link ID for relay-to-relay mode")
-	numConns := flag.Int("n", 16, "number of parallel TURN+DTLS connections (relay mode)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	flag.Parse()
 
@@ -50,11 +49,6 @@ func main() {
 	}
 	if *callLink == "" {
 		*callLink = os.Getenv("VK_CALL_LINK")
-	}
-	if v := os.Getenv("TURN_CONNS"); v != "" {
-		if n, err := fmt.Sscan(v, numConns); n == 1 && err == nil {
-			// parsed from env
-		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -72,7 +66,7 @@ func main() {
 	}()
 
 	if *callLink != "" {
-		runRelayMode(ctx, logger, siren, *callLink, *numConns, *useTCP, *authToken)
+		runRelayMode(ctx, logger, siren, *callLink, *useTCP, *authToken)
 	} else {
 		runDirectMode(ctx, logger, siren, *listenAddr, *authToken)
 	}
@@ -111,9 +105,9 @@ func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.S
 // accept successive client sessions. Each iteration creates a fresh
 // VK session with new signaling and TURN allocations.
 func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink string, numConns int, useTCP bool, authToken string) {
+	callLink string, useTCP bool, authToken string) {
 
-	logger.Info("starting relay-to-relay mode", "link", callLink, "conns", numConns)
+	logger.Info("starting relay-to-relay mode", "link", callLink)
 
 	for {
 		if ctx.Err() != nil {
@@ -121,7 +115,7 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		}
 
 		logger.Info("waiting for client session...")
-		err := runOneRelaySession(ctx, logger, siren, callLink, numConns, useTCP, authToken)
+		err := runOneRelaySession(ctx, logger, siren, callLink, useTCP, authToken)
 		if ctx.Err() != nil {
 			return
 		}
@@ -140,11 +134,11 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 }
 
 // runOneRelaySession handles a single relay-to-relay client session.
-// It creates fresh VK credentials, signaling, TURN allocations, and
-// a local MUX. Returns when the session ends (all connections die)
-// or an error occurs.
+// The server does NOT pre-allocate TURN connections. Instead it waits
+// for the client's relay addresses, allocates the matching number of
+// TURN connections on demand, and sends its addresses back.
 func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink string, numConns int, useTCP bool, authToken string) error {
+	callLink string, useTCP bool, authToken string) error {
 
 	// 1. Join VK conference to get fresh TURN creds and WS endpoint.
 	jr, err := turn.FetchJoinResponse(ctx, callLink)
@@ -164,24 +158,32 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		return fmt.Errorf("set signaling key: %w", err)
 	}
 
-	// 3. Create TURN allocations.
+	// 3. Wait for client relay addresses (client determines connection count).
 	mgr := turn.NewManager(callLink, useTCP, logger)
 	defer mgr.CloseAll()
 
-	allocs, err := mgr.Allocate(ctx, numConns)
+	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
+	if err != nil {
+		return fmt.Errorf("recv relay addrs: %w", err)
+	}
+	logger.Info("received client relay addresses", "count", len(clientAddrs))
+
+	// 4. Allocate TURN connections to match client count.
+	pairCount := len(clientAddrs)
+	allocs, err := mgr.Allocate(ctx, pairCount)
 	if err != nil {
 		siren.AlertTURNAuthFailure(ctx, err)
 		return fmt.Errorf("allocate TURN connections: %w", err)
 	}
-	logger.Info("TURN allocations created", "count", len(allocs))
+	logger.Info("TURN allocations created on demand", "count", len(allocs))
 
-	// Collect our relay addresses.
+	// Collect our relay addresses and send to client.
 	ourAddrs := make([]string, len(allocs))
 	for i, a := range allocs {
 		ourAddrs[i] = a.RelayAddr.String()
 	}
 
-	// 4. Exchange relay addresses with retry.
+	// Send our addresses repeatedly so the client receives them reliably.
 	sendDone := make(chan struct{})
 	sendCtx, sendCancel := context.WithCancel(ctx)
 	go func() {
@@ -197,26 +199,11 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 			}
 		}
 	}()
-
-	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
-	if err != nil {
-		sendCancel()
-		<-sendDone
-		return fmt.Errorf("recv relay addrs: %w", err)
-	}
-
-	// Keep sending our addrs for a few more seconds so the peer receives them.
 	go func() {
 		time.Sleep(5 * time.Second)
 		sendCancel()
 		<-sendDone
 	}()
-
-	// Match allocations to client addresses (use min of both counts).
-	pairCount := len(allocs)
-	if len(clientAddrs) < pairCount {
-		pairCount = len(clientAddrs)
-	}
 
 	// 5. Punch relay and accept DTLS connections in parallel.
 	type dtlsResult struct {
@@ -353,6 +340,8 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 			logger.Info("signaling hungup, stopping pings and reducing idle timeout")
 			pingCancel()
 			m.SetIdleTimeout(15 * time.Second)
+			// Keep draining signaling so reconnect requests still get routed.
+			go sigClient.DrainAndRoute(sessCtx)
 		}
 	}()
 

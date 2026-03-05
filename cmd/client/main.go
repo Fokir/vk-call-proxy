@@ -323,6 +323,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		reason := sigClient.WaitForSessionEnd(ctx)
 		if reason == internalsignal.SessionEndHungup {
 			logger.Info("signaling hungup (server left call)")
+			sigClient.DrainAndRoute(ctx)
 		}
 	}()
 

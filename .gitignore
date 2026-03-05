@@ -7,7 +7,7 @@
 /server
 /client
 /tmp
-
+/logs
 # Test
 *.test
 *.out

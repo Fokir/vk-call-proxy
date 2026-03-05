@@ -411,7 +411,10 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	if state.sigClient != nil {
 		go t.reconnectConns(muxCtx, state.sigClient, state.mgr, state.m, state.sessionID)
 		go func() {
-			state.sigClient.WaitForSessionEnd(muxCtx)
+			reason := state.sigClient.WaitForSessionEnd(muxCtx)
+			if reason == internalsignal.SessionEndHungup {
+				state.sigClient.DrainAndRoute(muxCtx)
+			}
 		}()
 	}
 
