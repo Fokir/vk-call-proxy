@@ -125,7 +125,7 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 		}
 
 		muxConns = append(muxConns, dtlsConn)
-		logger.Info("DTLS connection established", "index", i)
+		logger.Info("DTLS connection established", "index", i, "progress", fmt.Sprintf("%d/%d", len(muxConns), numConns))
 	}
 
 	if len(muxConns) == 0 {
@@ -136,6 +136,8 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	// 3. Create multiplexer over DTLS connections.
 	m := mux.New(logger, muxConns...)
 	defer m.Close()
+
+	logger.Info("MUX ready", "active", m.ActiveConns(), "target", numConns)
 
 	go m.DispatchLoop(ctx)
 	go m.StartPingLoop(ctx, 10*time.Second)
@@ -299,7 +301,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		}
 		cleanups = append(cleanups, r.cleanup)
 		muxConns = append(muxConns, r.conn)
-		logger.Info("relay DTLS connection established", "index", r.index)
+		logger.Info("relay DTLS connection established", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(muxConns), pairCount))
 	}
 	punchCancel()
 
@@ -311,6 +313,8 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	// 8. Create multiplexer over relay DTLS connections.
 	m := mux.New(logger, muxConns...)
 	defer m.Close()
+
+	logger.Info("MUX ready", "active", m.ActiveConns(), "target", numConns)
 
 	go m.DispatchLoop(ctx)
 	go m.StartPingLoop(ctx, 10*time.Second)
@@ -483,7 +487,10 @@ func reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
 	}
 
 	m.AddConn(dtlsConn)
-	logger.Info("reconnect: new connection added to MUX")
+	logger.Info("reconnect: new connection added to MUX",
+		"active", m.ActiveConns(),
+		"total", m.TotalConns(),
+	)
 	return nil
 }
 
@@ -530,11 +537,30 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		errCh <- httpSrv.ListenAndServe(ctx)
 	}()
 
-	logger.Info("proxies started", "socks5", socks5Addr, "http", httpAddr)
+	logger.Info("proxies started", "socks5", socks5Addr, "http", httpAddr,
+		"active_conns", m.ActiveConns(), "target_conns", totalConns)
 
 	go func() {
 		if activeConns < totalConns {
 			siren.AlertTunnelDegradation(ctx, activeConns, totalConns)
+		}
+	}()
+
+	// Periodically log connection status.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logger.Info("connection status",
+					"active", m.ActiveConns(),
+					"total", m.TotalConns(),
+					"target", totalConns,
+				)
+			}
 		}
 	}()
 

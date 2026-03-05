@@ -145,10 +145,17 @@ func (s *appState) handleConfig(w http.ResponseWriter, r *http.Request) {
 func (s *appState) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	connected := s.connected
+	srv := s.srv
 	s.mu.Unlock()
 
+	resp := map[string]any{"connected": connected}
+	if connected && srv != nil {
+		sessions := srv.GetSessionsInfo()
+		resp["sessions"] = sessions
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"connected": connected})
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {

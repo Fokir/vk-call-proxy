@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,9 +87,10 @@ type Mux struct {
 }
 
 type muxConn struct {
-	conn  io.ReadWriteCloser
-	stats connStats
-	mu    sync.Mutex // serializes writes
+	conn       io.ReadWriteCloser
+	stats      connStats
+	mu         sync.Mutex // serializes writes
+	wrrCurrent int64      // smooth weighted round-robin current weight (protected by Mux.mu)
 }
 
 // New creates a multiplexer over the given connections.
@@ -168,20 +170,25 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 
 // selectConn picks the best connection based on quality metrics.
 // Strategy: weighted by inverse latency, preferring connections with fewer errors.
+// selectConn picks a connection using smooth weighted round-robin.
+// Connections with lower latency get proportionally more traffic.
+// Algorithm (nginx-style SWRR):
+//  1. For each live conn: currentWeight += effectiveWeight
+//  2. Pick conn with highest currentWeight
+//  3. Winner's currentWeight -= totalWeight
 func (m *Mux) selectConn() *muxConn {
 	m.mu.Lock()
-	conns := make([]*muxConn, len(m.conns))
-	copy(conns, m.conns)
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 
-	if len(conns) == 0 {
+	if len(m.conns) == 0 {
 		return nil
 	}
 
 	var best *muxConn
-	bestScore := int64(-1)
+	bestCW := int64(math.MinInt64)
+	var totalWeight int64
 
-	for _, mc := range conns {
+	for _, mc := range m.conns {
 		if mc == nil {
 			continue
 		}
@@ -190,20 +197,40 @@ func (m *Mux) selectConn() *muxConn {
 			lat = 1_000_000 // 1ms default
 		}
 		errs := mc.stats.errors.Load()
-		// Score: lower latency and fewer errors = higher score.
-		// Inverse latency scaled, penalty for errors.
-		score := (1_000_000_000 / lat) - errs*100
-		if best == nil || score > bestScore {
-			best = mc
-			bestScore = score
+
+		// Weight: inverse latency (higher = better), penalty for errors.
+		weight := 1_000_000_000/lat - errs*10
+		if weight < 1 {
+			weight = 1
 		}
+
+		mc.wrrCurrent += weight
+		totalWeight += weight
+
+		if mc.wrrCurrent > bestCW {
+			bestCW = mc.wrrCurrent
+			best = mc
+		}
+	}
+
+	if best != nil {
+		best.wrrCurrent -= totalWeight
 	}
 	return best
 }
 
-// SendFrame writes a frame to the best available connection.
+// SendFrame writes a frame using the SWRR-selected connection.
+// Use this for non-stream frames (raw packets, pings, control).
 func (m *Mux) SendFrame(f *Frame) error {
-	mc := m.selectConn()
+	return m.sendFrameOn(m.selectConn(), f)
+}
+
+// sendFrameOn writes a frame on a specific connection.
+// If mc is nil or dead, falls back to selectConn.
+func (m *Mux) sendFrameOn(mc *muxConn, f *Frame) error {
+	if mc == nil {
+		mc = m.selectConn()
+	}
 	if mc == nil {
 		return errors.New("no connections available")
 	}
@@ -219,6 +246,21 @@ func (m *Mux) SendFrame(f *Frame) error {
 
 	if err != nil {
 		mc.stats.errors.Add(1)
+		// Try fallback to another connection.
+		fallback := m.selectConn()
+		if fallback != nil && fallback != mc {
+			mc = fallback
+			mc.mu.Lock()
+			_, err = mc.conn.Write(data)
+			mc.mu.Unlock()
+			if err != nil {
+				mc.stats.errors.Add(1)
+				return err
+			}
+			mc.stats.bytesSent.Add(int64(len(data)))
+			mc.stats.lastUsed.Store(time.Now().UnixNano())
+			return nil
+		}
 		return err
 	}
 	mc.stats.bytesSent.Add(int64(len(data)))
@@ -349,6 +391,14 @@ func (m *Mux) ActiveConns() int {
 	return int(m.activeReaders.Load())
 }
 
+// TotalConns returns the total number of connection slots (including dead/nil ones).
+func (m *Mux) TotalConns() int {
+	m.mu.Lock()
+	n := len(m.conns)
+	m.mu.Unlock()
+	return n
+}
+
 // RemoveConn sets the connection at the given index to nil.
 // The slot can later be filled by AddConn (which appends, so the old
 // index stays nil — this prevents index shift).
@@ -398,23 +448,27 @@ func (m *Mux) Close() error {
 
 // Stream represents a logical bidirectional stream within the mux.
 type Stream struct {
-	ID       uint32
-	mux      *Mux
-	recv     chan []byte
-	closed   atomic.Bool
-	leftover []byte // unread remainder from previous Read
+	ID           uint32
+	mux          *Mux
+	recv         chan []byte
+	closed       atomic.Bool
+	leftover     []byte    // unread remainder from previous Read
+	assignedConn *muxConn  // pinned connection for write ordering (set once at creation)
 }
 
 // OpenStream creates a new logical stream and sends an open frame to the peer.
+// The stream is pinned to a connection chosen via SWRR for write ordering.
 func (m *Mux) OpenStream(id uint32) (*Stream, error) {
+	assigned := m.selectConn()
 	s := &Stream{
-		ID:   id,
-		mux:  m,
-		recv: make(chan []byte, 1024),
+		ID:           id,
+		mux:          m,
+		recv:         make(chan []byte, 1024),
+		assignedConn: assigned,
 	}
 	m.streams.Store(id, s)
 
-	err := m.SendFrame(&Frame{
+	err := m.sendFrameOn(assigned, &Frame{
 		StreamID: id,
 		Type:     FrameOpen,
 		Sequence: m.NextSeq(),
@@ -512,11 +566,13 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 			}
 			if f.Type == FrameOpen {
 				s := &Stream{
-					ID:   f.StreamID,
-					mux:  m,
-					recv: make(chan []byte, 1024),
+					ID:           f.StreamID,
+					mux:          m,
+					recv:         make(chan []byte, 1024),
+					assignedConn: m.selectConn(),
 				}
 				m.streams.Store(f.StreamID, s)
+
 				if m.acceptedStreams != nil {
 					select {
 					case m.acceptedStreams <- s:
@@ -550,7 +606,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 		if len(chunk) > MaxFramePayload {
 			chunk = p[:MaxFramePayload]
 		}
-		err := s.mux.SendFrame(&Frame{
+		err := s.mux.sendFrameOn(s.assignedConn, &Frame{
 			StreamID: s.ID,
 			Type:     FrameData,
 			Sequence: s.mux.NextSeq(),
@@ -595,7 +651,7 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.mux.streams.Delete(s.ID)
-	return s.mux.SendFrame(&Frame{
+	return s.mux.sendFrameOn(s.assignedConn, &Frame{
 		StreamID: s.ID,
 		Type:     FrameClose,
 		Sequence: s.mux.NextSeq(),

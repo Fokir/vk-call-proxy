@@ -233,7 +233,9 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	}
 
 	m := mux.New(t.logger, muxConns...)
-	t.logger.Info("tunnel connected (direct)", "connections", len(muxConns), "session_id", sessionID.String())
+	t.logger.Info("tunnel connected (direct)",
+		"active", m.ActiveConns(), "target", cfg.NumConns,
+		"session_id", sessionID.String())
 	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups}, nil
 }
 
@@ -379,7 +381,9 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}
 
 	m := mux.New(t.logger, muxConns...)
-	t.logger.Info("tunnel connected (relay-to-relay)", "connections", len(muxConns), "session_id", sessionID.String())
+	t.logger.Info("tunnel connected (relay-to-relay)",
+		"active", m.ActiveConns(), "target", cfg.NumConns,
+		"session_id", sessionID.String())
 	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups, sigClient: sigClient, sessionID: sessionID}, nil
 }
 

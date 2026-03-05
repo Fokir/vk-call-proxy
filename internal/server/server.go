@@ -46,6 +46,32 @@ type session struct {
 	conns  int
 }
 
+// SessionInfo holds public session statistics.
+type SessionInfo struct {
+	SessionID   string `json:"session_id"`
+	ActiveConns int    `json:"active_conns"`
+	TotalConns  int    `json:"total_conns"`
+}
+
+// GetSessionsInfo returns info about all active sessions.
+func (s *Server) GetSessionsInfo() []SessionInfo {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+
+	infos := make([]SessionInfo, 0, len(s.sessions))
+	for id, sess := range s.sessions {
+		sess.mu.Lock()
+		info := SessionInfo{
+			SessionID:   fmt.Sprintf("%x", id),
+			ActiveConns: sess.m.ActiveConns(),
+			TotalConns:  sess.conns,
+		}
+		sess.mu.Unlock()
+		infos = append(infos, info)
+	}
+	return infos
+}
+
 // New creates a new Server instance.
 func New(cfg Config) *Server {
 	if cfg.Logger == nil {
@@ -149,6 +175,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	s.cfg.Logger.Info("connection added to session",
 		"session_id", fmt.Sprintf("%x", sessionID),
 		"total_conns", count,
+		"active_conns", sess.m.ActiveConns(),
 	)
 }
 
@@ -355,7 +382,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		}
 		cleanups = append(cleanups, r.cleanup)
 		dtlsConns = append(dtlsConns, r.conn)
-		s.cfg.Logger.Info("relay DTLS connection accepted", "index", r.index)
+		s.cfg.Logger.Info("relay DTLS connection accepted", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(dtlsConns), pairCount))
 	}
 	punchCancel()
 
@@ -420,6 +447,11 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	if added.Load() == 0 {
 		return fmt.Errorf("no connections passed auth/session handshake")
 	}
+
+	s.cfg.Logger.Info("MUX connections ready",
+		"active", m.ActiveConns(),
+		"total", int(added.Load()),
+	)
 
 	go s.handleReconnections(sessCtx, sigClient, mgr, m)
 
@@ -530,7 +562,10 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient *internalsign
 	}
 
 	m.AddConn(dtlsConn)
-	s.cfg.Logger.Info("reconnect: new connection added to MUX")
+	s.cfg.Logger.Info("reconnect: new connection added to MUX",
+		"active", m.ActiveConns(),
+		"total", m.TotalConns(),
+	)
 	return nil
 }
 

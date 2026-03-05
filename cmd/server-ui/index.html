@@ -187,6 +187,36 @@
   .status-dot.off { background: var(--text-dim); }
   .status-dot.on { background: var(--success); }
 
+  .conn-info {
+    margin-top: 8px;
+    padding: 8px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+    display: none;
+  }
+
+  .conn-info.visible { display: block; }
+
+  .conn-bar {
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    margin-top: 6px;
+    overflow: hidden;
+  }
+
+  .conn-bar-fill {
+    height: 100%;
+    background: var(--success);
+    border-radius: 3px;
+    transition: width 0.3s;
+  }
+
+  .conn-bar-fill.degraded { background: #f59e0b; }
+  .conn-bar-fill.critical { background: var(--danger); }
+
   .logs-section {
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -320,6 +350,13 @@
     </span>
   </div>
 
+  <div class="conn-info" id="connInfo">
+    <span id="connText">Connections: —</span>
+    <div class="conn-bar">
+      <div class="conn-bar-fill" id="connBarFill" style="width: 0%"></div>
+    </div>
+  </div>
+
   <div class="logs-section">
     <div class="logs-header" onclick="toggleLogs()">
       <div class="logs-header-left">
@@ -389,6 +426,7 @@ async function toggleConnection() {
       await fetch('/api/disconnect', { method: 'POST' });
     } catch(e) {}
     setStatus(false, 'Disconnected');
+    stopStatusPolling();
   } else {
     const link = $('link').value.trim();
     if (!link) {
@@ -406,6 +444,7 @@ async function toggleConnection() {
       if (res.ok) {
         setStatus(true, 'Connected');
         connectSSE();
+        startStatusPolling();
       } else {
         const data = await res.json().catch(() => ({}));
         setStatus(false, data.error || 'Connection failed');
@@ -473,6 +512,55 @@ function generateToken() {
   });
 }
 
+let statusInterval = null;
+
+function updateConnInfo(sessions) {
+  const info = $('connInfo');
+  const text = $('connText');
+  const bar = $('connBarFill');
+
+  if (!sessions || sessions.length === 0) {
+    info.className = 'conn-info';
+    return;
+  }
+
+  info.className = 'conn-info visible';
+  let totalActive = 0, totalConns = 0;
+  sessions.forEach(s => {
+    totalActive += s.active_conns;
+    totalConns += s.total_conns;
+  });
+
+  text.textContent = 'MUX connections: ' + totalActive + ' / ' + totalConns +
+    ' (' + sessions.length + ' session' + (sessions.length > 1 ? 's' : '') + ')';
+
+  const pct = totalConns > 0 ? Math.round(totalActive / totalConns * 100) : 0;
+  bar.style.width = pct + '%';
+  bar.className = 'conn-bar-fill' + (pct < 30 ? ' critical' : pct < 70 ? ' degraded' : '');
+}
+
+function startStatusPolling() {
+  if (statusInterval) return;
+  statusInterval = setInterval(async () => {
+    try {
+      const st = await fetch('/api/status').then(r => r.json());
+      if (st.sessions) updateConnInfo(st.sessions);
+      if (!st.connected && connected) {
+        setStatus(false, 'Disconnected (server stopped)');
+        stopStatusPolling();
+      }
+    } catch(e) {}
+  }, 3000);
+}
+
+function stopStatusPolling() {
+  if (statusInterval) {
+    clearInterval(statusInterval);
+    statusInterval = null;
+  }
+  $('connInfo').className = 'conn-info';
+}
+
 function connectSSE() {
   if (evtSource) evtSource.close();
   logLines = [];
@@ -508,6 +596,8 @@ function connectSSE() {
     if (st.connected) {
       setStatus(true, 'Connected');
       connectSSE();
+      startStatusPolling();
+      if (st.sessions) updateConnInfo(st.sessions);
       // Open logs automatically if connected.
       if (!logsOpen) toggleLogs();
     }
