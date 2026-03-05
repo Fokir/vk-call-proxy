@@ -42,6 +42,8 @@ enum class ConnectionMode { Relay, Direct }
 class MainActivity : ComponentActivity() {
 
     private var vpnState = mutableStateOf(VpnState.Disconnected)
+    private var activeConns = mutableStateOf(0)
+    private var totalConns = mutableStateOf(0)
     private var logLines = mutableStateOf<List<String>>(emptyList())
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
@@ -71,6 +73,8 @@ class MainActivity : ComponentActivity() {
             }
             if (state == "disconnected") {
                 logLines.value = emptyList()
+                activeConns.value = 0
+                totalConns.value = 0
             }
         }
     }
@@ -80,6 +84,13 @@ class MainActivity : ComponentActivity() {
             val text = intent?.getStringExtra(CallVpnService.EXTRA_LOG_TEXT) ?: return
             val newLines = text.split("\n").filter { it.isNotBlank() }
             logLines.value = (logLines.value + newLines).takeLast(20)
+        }
+    }
+
+    private val connCountReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            activeConns.value = intent?.getIntExtra(CallVpnService.EXTRA_ACTIVE_CONNS, 0) ?: 0
+            totalConns.value = intent?.getIntExtra(CallVpnService.EXTRA_TOTAL_CONNS, 0) ?: 0
         }
     }
 
@@ -98,6 +109,7 @@ class MainActivity : ComponentActivity() {
         val lbm = LocalBroadcastManager.getInstance(this)
         lbm.registerReceiver(stateReceiver, IntentFilter(CallVpnService.ACTION_STATE_CHANGED))
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
+        lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -107,6 +119,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     CallVpnScreen(
                         vpnState = vpnState.value,
+                        activeConns = activeConns.value,
+                        totalConns = totalConns.value,
                         logLines = logLines.value,
                         onConnect = { callLink, serverAddr, token, numConns -> requestConnect(callLink, serverAddr, token, numConns) },
                         onDisconnect = { stopVpn() }
@@ -120,6 +134,7 @@ class MainActivity : ComponentActivity() {
         val lbm = LocalBroadcastManager.getInstance(this)
         lbm.unregisterReceiver(stateReceiver)
         lbm.unregisterReceiver(logReceiver)
+        lbm.unregisterReceiver(connCountReceiver)
         super.onDestroy()
     }
 
@@ -170,6 +185,8 @@ private fun parseCallLink(input: String): String {
 @Composable
 fun CallVpnScreen(
     vpnState: VpnState,
+    activeConns: Int,
+    totalConns: Int,
     logLines: List<String>,
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int) -> Unit,
     onDisconnect: () -> Unit
@@ -264,6 +281,19 @@ fun CallVpnScreen(
             color = statusColor,
             fontWeight = FontWeight.Medium
         )
+
+        // Connection count
+        if (vpnState != VpnState.Disconnected && totalConns > 0) {
+            Text(
+                text = "Подключения: $activeConns / $totalConns",
+                fontSize = 13.sp,
+                color = if (activeConns == totalConns)
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                else
+                    Color(0xFFFFC107),
+                fontFamily = FontFamily.Monospace
+            )
+        }
 
         // Mode selector
         Row(

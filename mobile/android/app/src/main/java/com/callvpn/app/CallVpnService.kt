@@ -85,6 +85,7 @@ class CallVpnService : VpnService() {
 
     private fun broadcastState(state: String) {
         lastBroadcastState = state
+        currentState = state
         val intent = Intent(ACTION_STATE_CHANGED).apply {
             putExtra(EXTRA_STATE, state)
         }
@@ -206,6 +207,16 @@ class CallVpnService : VpnService() {
                             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
                         }
 
+                        // Broadcast connection count.
+                        val active = tunnel?.activeConns?.toInt() ?: 0
+                        val total = tunnel?.totalConns?.toInt() ?: 0
+                        val connIntent = Intent(ACTION_CONN_COUNT).apply {
+                            putExtra(EXTRA_ACTIVE_CONNS, active)
+                            putExtra(EXTRA_TOTAL_CONNS, total)
+                        }
+                        LocalBroadcastManager.getInstance(this@CallVpnService)
+                            .sendBroadcast(connIntent)
+
                         Thread.sleep(500)
                     } catch (_: InterruptedException) {
                         break
@@ -314,7 +325,14 @@ class CallVpnService : VpnService() {
         const val EXTRA_TOKEN = "token"
         const val EXTRA_STATE = "state"
         const val EXTRA_LOG_TEXT = "log_text"
+        const val ACTION_CONN_COUNT = "com.callvpn.CONN_COUNT"
+        const val EXTRA_ACTIVE_CONNS = "active_conns"
+        const val EXTRA_TOTAL_CONNS = "total_conns"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1
+
+        @Volatile
+        var currentState: String = "disconnected"
+            private set
     }
 }

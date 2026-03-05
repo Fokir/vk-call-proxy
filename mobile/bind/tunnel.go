@@ -751,6 +751,30 @@ func (t *Tunnel) IsConnected() bool {
 	return t.m != nil
 }
 
+// ActiveConns returns the number of active DTLS connections in the mux.
+// Returns 0 if the tunnel is not connected.
+func (t *Tunnel) ActiveConns() int {
+	t.mu.Lock()
+	m := t.m
+	t.mu.Unlock()
+	if m == nil {
+		return 0
+	}
+	return m.ActiveConns()
+}
+
+// TotalConns returns the total number of connection slots in the mux.
+// Returns 0 if the tunnel is not connected.
+func (t *Tunnel) TotalConns() int {
+	t.mu.Lock()
+	m := t.m
+	t.mu.Unlock()
+	if m == nil {
+		return 0
+	}
+	return m.TotalConns()
+}
+
 // Stop tears down all connections and stops the reconnect loop.
 func (t *Tunnel) Stop() {
 	t.mu.Lock()
