@@ -264,7 +264,7 @@ jobs:
 
   notify-discord:
     needs: [release]
-    if: secrets.DISCORD_WEBHOOK_URL != ''
+    if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
