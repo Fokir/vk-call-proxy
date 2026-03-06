@@ -113,22 +113,27 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 	)
 
 	var conn net.Conn
+	var turnConn net.PacketConn
 	if m.useTCP {
 		d := net.Dialer{Timeout: 10 * time.Second}
 		conn, err = d.DialContext(ctx, "tcp", addr)
-	} else {
-		d := net.Dialer{Timeout: 10 * time.Second}
-		conn, err = d.DialContext(ctx, "udp", addr)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("dial TURN server: %w", err)
-	}
-
-	var turnConn net.PacketConn
-	if m.useTCP {
+		if err != nil {
+			return nil, fmt.Errorf("dial TURN server: %w", err)
+		}
+		// Reduce TCP write buffer to provide backpressure when the TURN relay
+		// can't forward data fast enough. Default OS buffers (128-256KB) absorb
+		// burst writes, causing the inter-server UDP relay to overflow and drop
+		// packets. A small buffer forces the bridge goroutine to block earlier.
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetWriteBuffer(16384)
+		}
 		turnConn = pionTurn.NewSTUNConn(conn)
 	} else {
-		turnConn = conn.(net.PacketConn)
+		turnConn, err = net.ListenPacket("udp4", "")
+		if err != nil {
+			return nil, fmt.Errorf("listen UDP: %w", err)
+		}
+		conn = turnConn.(net.Conn)
 	}
 
 	cfg := &pionTurn.ClientConfig{

@@ -22,6 +22,17 @@ func isPunch(buf []byte, n int) bool {
 	return n == 1 && buf[0] == punchByte
 }
 
+// bridgePipeBufferSize limits the AsyncPacketPipe buffer between DTLS and
+// the TURN relay bridge. Without a limit, burst writes fill the pipe faster
+// than the bridge can drain to the TURN relay, causing the inter-server
+// UDP relay to overflow and drop packets.
+const bridgePipeBufferSize = 64 * 1024
+
+// bridgeWritePace is the minimum delay between consecutive writes from
+// the pipe to the TURN relay. VK TURN relays drop packets when burst
+// traffic exceeds their internal forwarding capacity (~200 pkts burst).
+const bridgeWritePace = 5 * time.Millisecond
+
 // AcceptOverTURN establishes a server-side DTLS connection through a TURN
 // relay PacketConn. Mirrors DialOverTURN but uses dtls.Server() instead
 // of dtls.Client(). The clientRelayAddr is the remote peer's relay address.
@@ -31,7 +42,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		return nil, nil, fmt.Errorf("generate self-signed cert: %w", err)
 	}
 
-	conn1, conn2 := connutil.AsyncPacketPipe()
+	conn1, conn2 := connutil.LimitedAsyncPacketPipe(bridgePipeBufferSize)
 
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 
@@ -63,7 +74,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		}
 	}()
 
-	// pipe -> relay
+	// pipe -> relay (paced to avoid overwhelming TURN relay)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -82,6 +93,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 			if err != nil {
 				return
 			}
+			time.Sleep(bridgeWritePace)
 		}
 	}()
 

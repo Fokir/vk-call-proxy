@@ -14,7 +14,7 @@ import (
 )
 
 // DialOverTURN establishes a DTLS connection to serverAddr through
-// a TURN relay PacketConn. It uses an AsyncPacketPipe to bridge the
+// a TURN relay PacketConn. It uses a LimitedAsyncPacketPipe to bridge the
 // datagram-based TURN relay with the DTLS handshake layer.
 //
 // Returns a net.Conn that implements io.ReadWriteCloser, suitable
@@ -26,13 +26,10 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		return nil, nil, fmt.Errorf("generate self-signed cert: %w", err)
 	}
 
-	// AsyncPacketPipe creates a pair of connected PacketConns.
-	// Writes to conn1 are reads on conn2 and vice versa.
-	conn1, conn2 := connutil.AsyncPacketPipe()
+	conn1, conn2 := connutil.LimitedAsyncPacketPipe(bridgePipeBufferSize)
 
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 
-	// Bridge conn2 <-> relayConn (two goroutines).
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -61,7 +58,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		}
 	}()
 
-	// pipe -> relay: read from pipe, write to TURN relay targeting serverAddr
+	// pipe -> relay: read from pipe, write to TURN relay (paced)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -80,6 +77,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 			if err != nil {
 				return
 			}
+			time.Sleep(bridgeWritePace)
 		}
 	}()
 
