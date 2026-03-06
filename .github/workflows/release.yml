@@ -264,7 +264,6 @@ jobs:
 
   notify-discord:
     needs: [release]
-    if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -273,6 +272,7 @@ jobs:
           fetch-depth: 0
 
       - name: Send to Discord
+        if: ${{ env.DISCORD_WEBHOOK != '' }}
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TAG: ${{ github.ref_name }}
