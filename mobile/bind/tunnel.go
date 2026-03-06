@@ -125,7 +125,7 @@ type TunnelConfig struct {
 
 // NewTunnel creates a new tunnel instance.
 func NewTunnel() *Tunnel {
-	lb := NewLogBuffer(50)
+	lb := NewLogBuffer(500)
 	return &Tunnel{
 		logBuf: lb,
 		logger: slog.New(slog.NewTextHandler(lb, &slog.HandlerOptions{Level: slog.LevelInfo})),

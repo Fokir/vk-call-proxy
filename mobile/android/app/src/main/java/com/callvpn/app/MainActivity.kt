@@ -87,7 +87,7 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val text = intent?.getStringExtra(CallVpnService.EXTRA_LOG_TEXT) ?: return
             val newLines = text.split("\n").filter { it.isNotBlank() }
-            logLines.value = (logLines.value + newLines).takeLast(20)
+            logLines.value = (logLines.value + newLines).takeLast(500)
         }
     }
 
@@ -515,7 +515,7 @@ fun CallVpnScreen(
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(150.dp)
+                .height(300.dp)
                 .clickable {
                     if (logLines.isNotEmpty()) {
                         clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
@@ -543,11 +543,16 @@ fun CallVpnScreen(
                         .padding(8.dp)
                 ) {
                     for (line in logLines) {
+                        val lineColor = when {
+                            line.contains("level=ERROR") || line.startsWith("ERROR:") -> Color(0xFFEF5350)
+                            line.contains("level=WARN") -> Color(0xFFFFC107)
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
                         Text(
                             text = line,
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = lineColor
                         )
                     }
                 }
