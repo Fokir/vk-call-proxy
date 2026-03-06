@@ -121,7 +121,17 @@ class CallVpnService : VpnService() {
             try {
                 t.start(config)
             } catch (e: Exception) {
+                // Read any Go-side logs that were emitted before the error.
+                val goLogs = try { t.readLogs() } catch (_: Exception) { "" }
                 tunnel = null
+                val errorMsg = e.message ?: e.toString()
+                val fullLog = if (goLogs.isNullOrEmpty()) "ERROR: $errorMsg"
+                    else "$goLogs\nERROR: $errorMsg"
+                val logIntent = Intent(ACTION_LOG).apply {
+                    putExtra(EXTRA_LOG_TEXT, fullLog)
+                }
+                LocalBroadcastManager.getInstance(this@CallVpnService)
+                    .sendBroadcast(logIntent)
                 broadcastState("disconnected")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 return@Thread

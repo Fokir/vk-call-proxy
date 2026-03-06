@@ -74,9 +74,11 @@ class MainActivity : ComponentActivity() {
                 else -> VpnState.Disconnected
             }
             if (state == "disconnected") {
-                logLines.value = emptyList()
                 activeConns.value = 0
                 totalConns.value = 0
+            }
+            if (state == "connecting") {
+                logLines.value = emptyList()
             }
         }
     }
@@ -502,26 +504,39 @@ fun CallVpnScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
-        // Log window
-        if (logLines.isNotEmpty()) {
-            Text(
-                text = "Лог",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(150.dp)
-                    .clickable {
+        // Log window (always visible)
+        Text(
+            text = "Лог",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(150.dp)
+                .clickable {
+                    if (logLines.isNotEmpty()) {
                         clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
                         Toast.makeText(context, "Логи скопированы", Toast.LENGTH_SHORT).show()
-                    },
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                shape = MaterialTheme.shapes.small
-            ) {
+                    }
+                },
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = MaterialTheme.shapes.small
+        ) {
+            if (logLines.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Нет записей",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    )
+                }
+            } else {
                 Column(
                     modifier = Modifier
                         .verticalScroll(logScrollState)
