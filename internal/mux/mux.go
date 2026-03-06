@@ -3,6 +3,7 @@ package mux
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,10 +16,31 @@ import (
 // ErrMuxClosed is returned when the mux has been closed.
 var ErrMuxClosed = errors.New("mux closed")
 
+// pingPayloadSize is the size of the Ping/Pong payload: 8 bytes timestamp + 4 bytes connIdx.
+const pingPayloadSize = 12
+
+// encodePingPayload encodes a timestamp and connection index into a Ping payload.
+func encodePingPayload(ts time.Time, connIdx int) []byte {
+	buf := make([]byte, pingPayloadSize)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(ts.UnixNano()))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(connIdx))
+	return buf
+}
+
+// decodePingPayload decodes the timestamp and connection index from a Ping/Pong payload.
+func decodePingPayload(p []byte) (ts int64, connIdx int, ok bool) {
+	if len(p) < pingPayloadSize {
+		return 0, 0, false
+	}
+	ts = int64(binary.BigEndian.Uint64(p[0:8]))
+	connIdx = int(binary.BigEndian.Uint32(p[8:12]))
+	return ts, connIdx, true
+}
+
 // StartPingLoop sends periodic ping frames on EVERY underlying connection
-// to keep TURN allocations alive. Sending on all connections prevents idle
-// connections from timing out (TURN allocations have a 5-minute TTL,
-// server idle timeout is typically 2 min). Call in a goroutine.
+// to keep TURN allocations alive and measure per-connection latency.
+// Each Ping carries a timestamp + connection index in its payload;
+// the peer echoes it back in Pong, allowing RTT measurement.
 func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -26,24 +48,37 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			f := &Frame{StreamID: 0, Type: FramePing, Sequence: m.NextSeq()}
-			data, err := f.MarshalBinary()
-			if err != nil {
-				continue
-			}
 			m.mu.Lock()
 			conns := make([]*muxConn, len(m.conns))
 			copy(conns, m.conns)
 			m.mu.Unlock()
 
-			for _, mc := range conns {
+			now := time.Now()
+			var wg sync.WaitGroup
+			for i, mc := range conns {
 				if mc == nil {
 					continue
 				}
-				mc.mu.Lock()
-				mc.conn.Write(data)
-				mc.mu.Unlock()
+				f := &Frame{
+					StreamID: 0,
+					Type:     FramePing,
+					Sequence: m.NextSeq(),
+					Payload:  encodePingPayload(now, i),
+				}
+				f.Length = uint32(len(f.Payload))
+				data, err := f.MarshalBinary()
+				if err != nil {
+					continue
+				}
+				wg.Add(1)
+				go func(mc *muxConn, data []byte) {
+					defer wg.Done()
+					mc.mu.Lock()
+					mc.conn.Write(data)
+					mc.mu.Unlock()
+				}(mc, data)
 			}
+			wg.Wait()
 		case <-ctx.Done():
 			return
 		}
@@ -161,6 +196,7 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 			m.logger.Warn("read error on connection", "index", idx, "err", err)
 			return
 		}
+		f.connIdx = idx
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
 		select {
 		case m.inFrames <- f:
@@ -576,13 +612,35 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// Handle Ping/Pong keepalive.
+			// Handle Ping/Pong keepalive with per-connection latency tracking.
 			if f.Type == FramePing {
-				_ = m.SendFrame(&Frame{StreamID: 0, Type: FramePong, Sequence: m.NextSeq()})
+				// Echo the payload back so the sender can measure RTT.
+				pong := &Frame{
+					StreamID: 0,
+					Type:     FramePong,
+					Sequence: m.NextSeq(),
+					Payload:  f.Payload,
+					Length:   uint32(len(f.Payload)),
+				}
+				// Respond on the same connection that received the Ping.
+				m.mu.Lock()
+				var mc *muxConn
+				if f.connIdx >= 0 && f.connIdx < len(m.conns) {
+					mc = m.conns[f.connIdx]
+				}
+				m.mu.Unlock()
+				_ = m.sendFrameOn(mc, pong)
 				continue
 			}
 			if f.Type == FramePong {
 				m.lastPongAt.Store(time.Now().UnixNano())
+				// Decode embedded timestamp + connIdx to measure per-connection RTT.
+				if ts, connIdx, ok := decodePingPayload(f.Payload); ok {
+					rtt := time.Since(time.Unix(0, ts))
+					if rtt > 0 && rtt < 30*time.Second {
+						m.UpdateLatency(connIdx, rtt)
+					}
+				}
 				continue
 			}
 			// Route raw IP packets to dedicated channel.

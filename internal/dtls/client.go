@@ -58,7 +58,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		}
 	}()
 
-	// pipe -> relay: read from pipe, write to TURN relay (paced)
+	// pipe -> relay: read from pipe, write to TURN relay (adaptive pacing)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -73,11 +73,14 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 			if err != nil {
 				return
 			}
+			start := time.Now()
 			_, err = relayConn.WriteTo(buf[:n], serverAddr)
 			if err != nil {
 				return
 			}
-			time.Sleep(bridgeWritePace)
+			if elapsed := time.Since(start); elapsed < bridgeSlowWrite {
+				time.Sleep(bridgeMinPace)
+			}
 		}
 	}()
 

@@ -35,6 +35,8 @@ type Frame struct {
 	Sequence uint32
 	Length   uint32
 	Payload  []byte
+
+	connIdx int // local-only; set by readLoop, not serialized
 }
 
 // MarshalBinary encodes the frame into wire format.

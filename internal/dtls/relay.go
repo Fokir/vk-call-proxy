@@ -26,12 +26,17 @@ func isPunch(buf []byte, n int) bool {
 // the TURN relay bridge. Without a limit, burst writes fill the pipe faster
 // than the bridge can drain to the TURN relay, causing the inter-server
 // UDP relay to overflow and drop packets.
-const bridgePipeBufferSize = 64 * 1024
+const bridgePipeBufferSize = 512 * 1024
 
-// bridgeWritePace is the minimum delay between consecutive writes from
-// the pipe to the TURN relay. VK TURN relays drop packets when burst
-// traffic exceeds their internal forwarding capacity (~200 pkts burst).
-const bridgeWritePace = 5 * time.Millisecond
+// Adaptive pacing constants for the pipe→relay bridge.
+// When WriteTo completes quickly (buffer has space), we add a small minimum
+// sleep to avoid overwhelming the TURN relay's internal forwarding.
+// When WriteTo blocks (TCP backpressure from filled 16KB write buffer),
+// no extra sleep is needed — the network is already rate-limiting us.
+const (
+	bridgeMinPace      = 1 * time.Millisecond          // minimum pace when writes are instant
+	bridgeSlowWrite    = 500 * time.Microsecond         // if write took this long, skip extra sleep
+)
 
 // AcceptOverTURN establishes a server-side DTLS connection through a TURN
 // relay PacketConn. Mirrors DialOverTURN but uses dtls.Server() instead
@@ -74,7 +79,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		}
 	}()
 
-	// pipe -> relay (paced to avoid overwhelming TURN relay)
+	// pipe -> relay (adaptive pacing)
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
@@ -89,11 +94,17 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 			if err != nil {
 				return
 			}
+			start := time.Now()
 			_, err = relayConn.WriteTo(buf[:n], clientRelayAddr)
 			if err != nil {
 				return
 			}
-			time.Sleep(bridgeWritePace)
+			// Adaptive: if write was fast (buffer not full), pace to avoid
+			// overwhelming the relay. If write blocked (TCP backpressure),
+			// no extra sleep needed.
+			if elapsed := time.Since(start); elapsed < bridgeSlowWrite {
+				time.Sleep(bridgeMinPace)
+			}
 		}
 	}()
 
