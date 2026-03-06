@@ -77,9 +77,6 @@ class MainActivity : ComponentActivity() {
                 activeConns.value = 0
                 totalConns.value = 0
             }
-            if (state == "connecting") {
-                logLines.value = emptyList()
-            }
         }
     }
 
