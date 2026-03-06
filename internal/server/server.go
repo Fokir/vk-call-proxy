@@ -346,10 +346,10 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		cleanup context.CancelFunc
 		err     error
 	}
-	results := make(chan dtlsResult, pairCount)
+	results := make(chan dtlsResult, len(allocs))
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
-	for i := 0; i < pairCount; i++ {
+	for i := 0; i < len(allocs); i++ {
 		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
 		if err != nil {
 			s.cfg.Logger.Warn("resolve client relay addr", "index", i, "addr", clientAddrs[i], "err", err)
@@ -580,7 +580,7 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 	}
 	target := string(addrBuf[:n])
 
-	logger.Debug("connecting to target", "stream_id", stream.ID, "target", target)
+	logger.Info("stream opened", "stream_id", stream.ID, "target", target)
 
 	dialer := net.Dialer{}
 	outConn, err := dialer.DialContext(ctx, "tcp", target)
@@ -595,16 +595,21 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// stream → outConn (upload: client sends to target)
 	go func() {
 		defer wg.Done()
-		io.CopyBuffer(outConn, stream, buf)
+		n, err := io.CopyBuffer(outConn, stream, buf)
+		logger.Info("stream→target done", "stream_id", stream.ID, "target", target, "bytes", n, "err", err)
 	}()
 
+	// outConn → stream (download: target sends to client)
 	go func() {
 		defer wg.Done()
 		buf2 := make([]byte, mux.MaxFramePayload)
-		io.CopyBuffer(stream, outConn, buf2)
+		n, err := io.CopyBuffer(stream, outConn, buf2)
+		logger.Info("target→stream done", "stream_id", stream.ID, "target", target, "bytes", n, "err", err)
 	}()
 
 	wg.Wait()
+	logger.Info("stream relay ended", "stream_id", stream.ID, "target", target)
 }
