@@ -522,42 +522,138 @@ func (t *Tunnel) reconnectLoop() {
 	}
 }
 
-// reconnectConns monitors ConnDied and reconnects individual dead connections
-// via VK signaling.
+// reconnectConns monitors ConnDied and maintains target connection count.
+// Serialized to avoid ackCh mix-up. Two modes:
+//   - Normal: active >= minActive AND healthy — try 5 attempts, then wait for next tick.
+//   - Critical: active < minActive OR unhealthy (no pong for 15s) — retry indefinitely with exp backoff (1s→30s).
+//
+// minActive = max(2, targetConns/2).
 func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.Client,
 	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID) {
 
 	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
 	defer unsub()
 
+	t.mu.Lock()
+	targetConns := t.cfg.NumConns
+	t.mu.Unlock()
+
+	minActive := targetConns / 2
+	if minActive < 2 {
+		minActive = 2
+	}
+
+	const healthTimeout = 15 * time.Second
+
+	// Wakeup signal: triggered on connection death for fast response.
+	wakeup := make(chan struct{}, 1)
+	triggerWakeup := func() {
+		select {
+		case wakeup <- struct{}{}:
+		default:
+		}
+	}
+
+	// Drain ConnDied and trigger wakeup.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				t.logger.Info("connection died", "index", idx)
+				m.RemoveConn(idx)
+				triggerWakeup()
+			}
+		}
+	}()
+
+	const (
+		normalMaxAttempts = 5
+		maxBackoff        = 30 * time.Second
+	)
+
+	// Unified loop: check every 2s or on wakeup.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case idx, ok := <-m.ConnDied():
-			if !ok {
-				return
-			}
-			t.logger.Info("connection died, reconnecting", "index", idx)
-			m.RemoveConn(idx)
-			m.BeginReconnect()
+		case <-ticker.C:
+		case <-wakeup:
+		}
 
-			go func(deadIdx int) {
-				defer m.EndReconnect()
-				for attempt := 1; attempt <= 3; attempt++ {
-					err := t.reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID)
-					if err == nil {
-						t.logger.Info("reconnected", "dead_index", deadIdx, "attempt", attempt)
-						return
-					}
-					t.logger.Warn("reconnect failed", "dead_index", deadIdx, "attempt", attempt, "err", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(time.Duration(attempt*2) * time.Second):
-					}
+		active := m.ActiveConns()
+		healthy := m.IsHealthy(healthTimeout)
+		if active >= targetConns && healthy {
+			continue
+		}
+
+		critical := active < minActive || !healthy
+		needed := targetConns - active
+		if needed <= 0 {
+			// All conns alive but unhealthy — probe and force reconnect.
+			m.ProbeConnections(3 * time.Second)
+			t.logger.Warn("tunnel unhealthy, no pong received",
+				"active", active, "healthy", healthy)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(4 * time.Second):
+			}
+			active = m.ActiveConns()
+			needed = targetConns - active
+			if needed <= 0 {
+				continue
+			}
+		}
+		t.logger.Info("connections below target, reconnecting",
+			"active", active, "target", targetConns, "needed", needed,
+			"min_active", minActive, "critical", critical, "healthy", healthy)
+
+		for i := 0; i < needed; i++ {
+			m.BeginReconnect()
+			var err error
+			backoff := time.Second
+			for attempt := 1; ; attempt++ {
+				err = t.reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID)
+				if err == nil {
+					t.logger.Info("reconnected", "conn", i+1, "of", needed, "attempt", attempt)
+					break
 				}
-			}(idx)
+
+				if !critical && attempt >= normalMaxAttempts {
+					t.logger.Warn("reconnect failed, will retry next cycle",
+						"attempts", attempt, "err", err)
+					break
+				}
+
+				t.logger.Warn("reconnect attempt failed",
+					"attempt", attempt, "err", err, "critical", critical,
+					"next_backoff", backoff)
+				select {
+				case <-ctx.Done():
+					m.EndReconnect()
+					return
+				case <-time.After(backoff):
+				}
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+
+				// Re-check if still critical.
+				critical = m.ActiveConns() < minActive || !m.IsHealthy(healthTimeout)
+			}
+			m.EndReconnect()
+			if err != nil && !critical {
+				break // normal mode: stop, wait for next tick
+			}
 		}
 	}
 }

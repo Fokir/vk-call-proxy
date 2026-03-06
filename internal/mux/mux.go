@@ -84,6 +84,8 @@ type Mux struct {
 
 	connDied     chan int        // index of dead connection, buffered
 	reconnecting atomic.Int32   // active reconnect count; prevents premature allDead close
+
+	lastPongAt atomic.Int64 // unix nano of last received Pong on any connection
 }
 
 type muxConn struct {
@@ -397,6 +399,18 @@ func (m *Mux) ConnDied() <-chan int {
 	return m.connDied
 }
 
+// IsHealthy reports whether at least one Pong was received within the
+// given timeout. If no Pong has ever been received, the mux creation time
+// is used as baseline so the check doesn't fire during initial handshake.
+func (m *Mux) IsHealthy(timeout time.Duration) bool {
+	last := m.lastPongAt.Load()
+	if last == 0 {
+		// No pong yet — healthy as long as connections exist.
+		return m.activeReaders.Load() > 0
+	}
+	return time.Since(time.Unix(0, last)) < timeout
+}
+
 // ActiveConns returns the number of readLoop goroutines still running.
 func (m *Mux) ActiveConns() int {
 	return int(m.activeReaders.Load())
@@ -568,6 +582,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 				continue
 			}
 			if f.Type == FramePong {
+				m.lastPongAt.Store(time.Now().UnixNano())
 				continue
 			}
 			// Route raw IP packets to dedicated channel.

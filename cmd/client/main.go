@@ -340,12 +340,25 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 // initially missing connections and runtime deaths. Serialization prevents the
 // ackCh mix-up bug where parallel reconnects receive each other's server
 // responses, causing relay address mismatches and DTLS cookie failures.
+//
+// Two modes:
+//   - Normal: active >= minActive AND healthy — try 5 attempts per conn, then wait for next tick.
+//   - Critical: active < minActive OR unhealthy (no pong for 15s) — retry indefinitely with exp backoff (1s→30s).
+//
+// minActive = max(2, targetConns/2).
 func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string,
 	targetConns int, logger *slog.Logger) {
 
 	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
 	defer unsub()
+
+	minActive := targetConns / 2
+	if minActive < 2 {
+		minActive = 2
+	}
+
+	const healthTimeout = 15 * time.Second
 
 	// Wakeup signal: triggered on connection death for fast response.
 	wakeup := make(chan struct{}, 1)
@@ -379,9 +392,14 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 		}
 	}()
 
-	// Unified loop: check every 5s or on wakeup, maintain target connection count.
-	ticker := time.NewTicker(5 * time.Second)
+	// Unified loop: check every 2s or on wakeup, maintain target connection count.
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	const (
+		normalMaxAttempts  = 5
+		maxBackoff         = 30 * time.Second
+	)
 
 	for {
 		select {
@@ -392,34 +410,71 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 		}
 
 		active := m.ActiveConns()
-		if active >= targetConns {
+		healthy := m.IsHealthy(healthTimeout)
+		if active >= targetConns && healthy {
 			continue
 		}
 
+		critical := active < minActive || !healthy
 		needed := targetConns - active
+		if needed <= 0 {
+			// All conns alive but unhealthy — probe and force reconnect of 1.
+			needed = 1
+			m.ProbeConnections(3 * time.Second)
+			logger.Warn("tunnel unhealthy, no pong received",
+				"active", active, "healthy", healthy)
+			// Wait for probe to detect dead connections.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(4 * time.Second):
+			}
+			active = m.ActiveConns()
+			needed = targetConns - active
+			if needed <= 0 {
+				continue
+			}
+		}
 		logger.Info("connections below target, reconnecting",
-			"active", active, "target", targetConns, "needed", needed)
+			"active", active, "target", targetConns, "needed", needed,
+			"min_active", minActive, "critical", critical, "healthy", healthy)
 
 		for i := 0; i < needed; i++ {
 			m.BeginReconnect()
 			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
+			backoff := time.Second
+			for attempt := 1; ; attempt++ {
 				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
 				if err == nil {
 					break
 				}
-				logger.Warn("reconnect attempt failed", "attempt", attempt, "err", err)
+
+				if !critical && attempt >= normalMaxAttempts {
+					logger.Warn("reconnect failed, will retry next cycle",
+						"attempts", attempt, "err", err)
+					break
+				}
+
+				logger.Warn("reconnect attempt failed",
+					"attempt", attempt, "err", err, "critical", critical,
+					"next_backoff", backoff)
 				select {
 				case <-ctx.Done():
 					m.EndReconnect()
 					return
-				case <-time.After(time.Duration(attempt) * time.Second):
+				case <-time.After(backoff):
 				}
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+
+				// Re-check if still critical (other reconnects may have succeeded).
+				critical = m.ActiveConns() < minActive || !m.IsHealthy(healthTimeout)
 			}
 			m.EndReconnect()
-			if err != nil {
-				logger.Error("reconnect failed after 3 attempts", "err", err)
-				break // don't spam on persistent failure
+			if err != nil && !critical {
+				break // normal mode: stop, wait for next tick
 			}
 		}
 	}
