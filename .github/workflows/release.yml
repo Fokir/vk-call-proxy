@@ -261,3 +261,53 @@ jobs:
             artifacts/app-release.apk
           fail_on_unmatched_files: false
           make_latest: true
+
+  notify-discord:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+          BODY="## What's Changed"$'\n'
+          while IFS= read -r line; do
+            hash=$(echo "$line" | cut -d' ' -f1)
+            msg=$(echo "$line" | cut -d' ' -f2-)
+            BODY+="* ${msg} (${hash})"$'\n'
+          done < <(git log --oneline "$RANGE" -- . ':!.github')
+          if [ -n "$PREV_TAG" ]; then
+            BODY+=$'\n'"**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          fi
+          echo "$BODY" > release_notes.txt
+
+      - name: Send to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          BODY=$(python3 -c "
+          import sys, json
+          text = open('release_notes.txt').read()[:4096]
+          print(json.dumps(text))
+          ")
+
+          curl -sf -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"🚀 ${{ github.ref_name }}\",
+                \"description\": $BODY,
+                \"color\": 3066993,
+                \"url\": \"https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}\"
+              }]
+            }"
