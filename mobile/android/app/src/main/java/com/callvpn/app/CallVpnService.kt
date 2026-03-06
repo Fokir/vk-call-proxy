@@ -295,9 +295,10 @@ class CallVpnService : VpnService() {
             override fun onLost(network: Network) {
                 tunnel?.onNetworkChanged()
             }
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                tunnel?.onNetworkChanged()
-            }
+            // Note: onCapabilitiesChanged intentionally omitted — it fires
+            // too frequently (signal strength changes, etc.) and the Go side
+            // debounces onAvailable/onLost which are sufficient for detecting
+            // real network switches (WiFi↔cellular).
         }
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)

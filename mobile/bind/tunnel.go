@@ -108,6 +108,10 @@ type Tunnel struct {
 	connectedAt time.Time          // when the current MUX was established
 	sigClient      *internalsignal.Client // kept alive in relay mode for per-conn reconnects
 	sessionID      uuid.UUID              // current session ID
+
+	// network change debouncing
+	networkDebounce *time.Timer    // coalesces rapid network change events
+	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
 }
 
 // TunnelConfig holds configuration for starting the tunnel.
@@ -155,6 +159,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	t.cfg = cfg
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
+	t.networkForce = make(chan struct{}, 1)
 	t.running = true
 	t.mu.Unlock()
 
@@ -458,11 +463,9 @@ func (t *Tunnel) teardownMux() {
 	}
 }
 
-// reconnectLoop watches the current mux for death and re-establishes
-// the tunnel with exponential backoff (1s → 60s).
-// Network changes are handled separately by OnNetworkChanged which
-// probes connections — dead ones trigger ConnDied → reconnectConns,
-// and if all die, Dead() fires and this loop handles full reconnect.
+// reconnectLoop watches the current mux for death (or network change signal)
+// and re-establishes the tunnel with exponential backoff (1s → 60s).
+// Network changes trigger immediate full teardown+reconnect via networkForce.
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 30 * time.Second
@@ -471,25 +474,37 @@ func (t *Tunnel) reconnectLoop() {
 	for {
 		t.mu.Lock()
 		m := t.m
+		force := t.networkForce
 		t.mu.Unlock()
 
 		if m == nil {
+			// No mux — wait for backoff or network force or stop.
 			select {
 			case <-t.rootCtx.Done():
 				return
+			case <-force:
+				// Network changed while no mux — try immediately.
 			case <-time.After(backoff):
-				continue
+			}
+		} else {
+			// Wait for mux death, network force, or stop.
+			select {
+			case <-m.Dead():
+				t.logger.Info("all connections dead, starting reconnect")
+				t.teardownMux()
+			case <-force:
+				t.logger.Info("network change forced reconnect")
+				// teardownMux already called by OnNetworkChanged debounce
+			case <-t.rootCtx.Done():
+				return
 			}
 		}
 
+		// Drain any pending force signal so it doesn't trigger again.
 		select {
-		case <-m.Dead():
-			t.logger.Info("all connections dead, starting reconnect")
-		case <-t.rootCtx.Done():
-			return
+		case <-force:
+		default:
 		}
-
-		t.teardownMux()
 
 		for {
 			select {
@@ -511,6 +526,13 @@ func (t *Tunnel) reconnectLoop() {
 			if err != nil {
 				t.logger.Warn("reconnect attempt failed", "err", err, "backoff", backoff)
 				backoff = min(backoff*2, maxBackoff)
+				// Check if network changed again while we were trying.
+				select {
+				case <-force:
+					t.logger.Info("network changed during reconnect, resetting backoff")
+					backoff = time.Second
+				default:
+				}
 				continue
 			}
 
@@ -879,6 +901,10 @@ func (t *Tunnel) Stop() {
 	}
 	t.running = false
 	rootCancel := t.rootCancel
+	if t.networkDebounce != nil {
+		t.networkDebounce.Stop()
+		t.networkDebounce = nil
+	}
 	t.mu.Unlock()
 
 	if rootCancel != nil {
@@ -889,43 +915,48 @@ func (t *Tunnel) Stop() {
 }
 
 // OnNetworkChanged should be called by the mobile platform when the network
-// connectivity changes (e.g. WiFi→cellular, 4G→H+). It triggers an immediate
-// reconnect attempt without waiting for the idle timeout to expire.
+// connectivity changes (e.g. WiFi→cellular, 4G→H+). It coalesces rapid
+// events (Android fires 2-3 callbacks per switch) and triggers a full
+// teardown+reconnect, since old TURN/signaling connections are stale.
 // Safe to call from any goroutine; no-op if the tunnel is not running.
 func (t *Tunnel) OnNetworkChanged() {
+	const debounceDelay = 2 * time.Second
+
 	t.mu.Lock()
 	running := t.running
-	m := t.m
 	connAge := time.Since(t.connectedAt)
-	t.mu.Unlock()
+
 	if !running {
+		t.mu.Unlock()
 		return
 	}
+
 	// Ignore network change events shortly after connection:
 	// Android fires onAvailable callbacks for existing networks when
 	// registerNetworkCallback is called right after VPN interface creation.
 	if connAge < 5*time.Second {
+		t.mu.Unlock()
 		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
 	}
-	if m == nil {
-		t.logger.Info("ignoring network change, no active mux")
-		return
-	}
-	// Probe existing connections: if alive, pong arrives within 3s.
-	// If dead, readLoop exits after 3s → ConnDied fires.
-	// After probing, check if all connections died and force teardown
-	// so reconnectLoop can do a full reconnect immediately.
-	t.logger.Info("network change detected, probing connections")
-	m.ProbeConnections(3 * time.Second)
 
-	go func() {
-		time.Sleep(4 * time.Second)
-		if m.ActiveConns() == 0 {
-			t.logger.Info("all connections dead after network change, forcing teardown")
-			t.teardownMux()
+	// Debounce: reset timer on each call so only the last event in a burst fires.
+	if t.networkDebounce != nil {
+		t.networkDebounce.Stop()
+	}
+	force := t.networkForce
+	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
+		t.logger.Info("network change debounce fired, forcing full reconnect")
+		t.teardownMux()
+		// Wake up reconnectLoop immediately.
+		select {
+		case force <- struct{}{}:
+		default:
 		}
-	}()
+	})
+	t.mu.Unlock()
+
+	t.logger.Info("network change detected, debouncing")
 }
 
 // IsRunning returns whether the tunnel is active.
