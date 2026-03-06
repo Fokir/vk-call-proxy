@@ -11,6 +11,9 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/call-vpn/call-vpn/internal/bypass"
 )
 
 // DialFunc establishes a connection to the target through the mux tunnel.
@@ -20,6 +23,7 @@ type DialFunc func(ctx context.Context, network, addr string) (io.ReadWriteClose
 type Server struct {
 	Addr     string
 	Dial     DialFunc
+	Bypass   *bypass.Matcher
 	Logger   *slog.Logger
 	listener net.Listener
 	streamID atomic.Uint32
@@ -76,12 +80,25 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// 3. Connect through tunnel
-	remote, err := s.Dial(ctx, "tcp", target)
-	if err != nil {
-		s.Logger.Warn("tunnel dial failed", "target", target, "err", err)
-		s.sendReply(conn, 0x05) // Connection refused
-		return
+	// 3. Connect (bypass VPN for matched domains, tunnel otherwise)
+	var remote io.ReadWriteCloser
+	if s.Bypass != nil && s.Bypass.Match(target) {
+		s.Logger.Debug("bypass tunnel", "target", target)
+		c, err := net.DialTimeout("tcp", target, 10*time.Second)
+		if err != nil {
+			s.Logger.Warn("bypass dial failed", "target", target, "err", err)
+			s.sendReply(conn, 0x05)
+			return
+		}
+		remote = c
+	} else {
+		c, err := s.Dial(ctx, "tcp", target)
+		if err != nil {
+			s.Logger.Warn("tunnel dial failed", "target", target, "err", err)
+			s.sendReply(conn, 0x05)
+			return
+		}
+		remote = c
 	}
 	defer remote.Close()
 

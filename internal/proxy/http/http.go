@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/call-vpn/call-vpn/internal/bypass"
 )
 
 // DialFunc establishes a connection to the target through the mux tunnel.
@@ -19,6 +21,7 @@ type DialFunc func(ctx context.Context, network, addr string) (io.ReadWriteClose
 type Server struct {
 	Addr   string
 	Dial   DialFunc
+	Bypass *bypass.Matcher
 	Logger *slog.Logger
 	server *http.Server
 }
@@ -64,9 +67,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) dial(ctx context.Context, addr string) (io.ReadWriteCloser, error) {
+	if s.Bypass != nil && s.Bypass.Match(addr) {
+		s.Logger.Debug("bypass tunnel", "addr", addr)
+		return net.DialTimeout("tcp", addr, 10*time.Second)
+	}
+	return s.Dial(ctx, "tcp", addr)
+}
+
 // handleConnect implements the HTTP CONNECT method for HTTPS tunneling.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	remote, err := s.Dial(r.Context(), "tcp", r.Host)
+	remote, err := s.dial(r.Context(), r.Host)
 	if err != nil {
 		s.Logger.Warn("CONNECT dial failed", "host", r.Host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -125,7 +136,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		host = net.JoinHostPort(host, "80")
 	}
 
-	remote, err := s.Dial(r.Context(), "tcp", host)
+	remote, err := s.dial(r.Context(), host)
 	if err != nil {
 		s.Logger.Warn("HTTP dial failed", "host", host, "err", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)

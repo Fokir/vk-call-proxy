@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/call-vpn/call-vpn/internal/bypass"
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
@@ -32,6 +33,7 @@ func main() {
 	serverAddr := flag.String("server", "", "VPN server address (host:port), empty = relay-to-relay mode")
 	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
 	authToken := flag.String("token", "", "auth token for server")
+	noBypass := flag.Bool("no-bypass", false, "disable built-in bypass for Russian services (VK, Yandex, Gosuslugi, etc.)")
 
 	flag.Parse()
 
@@ -45,6 +47,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	siren := monitoring.New(logger)
 
+	var bypassMatcher *bypass.Matcher
+	if !*noBypass {
+		bypassMatcher = bypass.New(bypass.DefaultRussianServices())
+		logger.Info("bypass enabled for Russian services (VK, Yandex, Gosuslugi, etc.)")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -57,15 +65,16 @@ func main() {
 	}()
 
 	if *serverAddr != "" {
-		runDirect(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken)
+		runDirect(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	} else {
-		runRelayToRelay(ctx, logger, siren, *callLink, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken)
+		runRelayToRelay(ctx, logger, siren, *callLink, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	}
 }
 
 // runDirect connects through TURN to a server listening on a direct UDP address.
 func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string) {
+	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
+	bypassMatcher *bypass.Matcher) {
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
@@ -143,13 +152,14 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	go m.StartPingLoop(ctx, 10*time.Second)
 
 	// 4. Start proxies.
-	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
+	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
 // runRelayToRelay connects through VK TURN relays to a server that also
 // joins the same VK call. Relay addresses are exchanged via VK WebSocket signaling.
 func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string) {
+	callLink string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
+	bypassMatcher *bypass.Matcher) {
 
 	logger.Info("starting relay-to-relay mode", "link", callLink, "conns", numConns)
 
@@ -333,7 +343,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	}()
 
 	// 11. Start proxies.
-	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
+	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
 // reconnectManager is a unified, serialized reconnect loop. It handles both
@@ -557,7 +567,8 @@ func reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
 
 // startProxies starts SOCKS5 and HTTP proxies over the given Mux.
 func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	m *mux.Mux, activeConns, totalConns, socks5Port, httpPort int, bindAddr string) {
+	m *mux.Mux, activeConns, totalConns, socks5Port, httpPort int, bindAddr string,
+	bypassMatcher *bypass.Matcher) {
 
 	var nextStreamID atomic.Uint32
 
@@ -578,6 +589,7 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	socks5Srv := &socks5.Server{
 		Addr:   socks5Addr,
 		Dial:   dialTunnel,
+		Bypass: bypassMatcher,
 		Logger: logger.With("proxy", "socks5"),
 	}
 
@@ -585,6 +597,7 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	httpSrv := &httpproxy.Server{
 		Addr:   httpAddr,
 		Dial:   dialTunnel,
+		Bypass: bypassMatcher,
 		Logger: logger.With("proxy", "http"),
 	}
 

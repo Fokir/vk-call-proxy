@@ -158,11 +158,12 @@ class CallVpnService : VpnService() {
                 .setMtu(1280)
                 .setBlocking(true)
 
-            // Exclude our own app from VPN routing so the Go tunnel's
-            // TURN/DTLS connections are never captured by the TUN interface.
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) { /* API 21+ */ }
+            // Exclude our own app and Russian services from VPN routing.
+            for (pkg in BYPASSED_PACKAGES) {
+                try {
+                    builder.addDisallowedApplication(pkg)
+                } catch (_: Exception) { /* package not installed, skip */ }
+            }
 
             val vpn = builder.establish()
             if (vpn == null) {
@@ -315,6 +316,86 @@ class CallVpnService : VpnService() {
     }
 
     companion object {
+        // Apps excluded from VPN (traffic goes directly, not through tunnel).
+        private val BYPASSED_PACKAGES = listOf(
+            // CallVPN itself (prevent routing loop)
+            "com.callvpn.app",
+
+            // VK
+            "com.vkontakte.android",
+            "com.vk.im",                   // VK Messenger
+            "com.vk.admin",                // VK Admin
+            "ru.vk.store",                 // RuStore
+
+            // VK Video
+            "com.vk.video",
+
+            // Yandex
+            "com.yandex.browser",
+            "com.yandex.browser.lite",
+            "ru.yandex.searchplugin",      // Yandex Search / Alice
+            "ru.yandex.yandexmaps",        // Yandex Maps
+            "ru.yandex.taxi",              // Yandex Go (taxi/delivery/food)
+            "com.yandex.music",            // Yandex Music
+            "com.yandex.disk",             // Yandex Disk
+            "ru.yandex.mail",              // Yandex Mail
+            "com.yandex.marketplace",      // Yandex Market
+            "ru.yandex.weatherplugin",     // Yandex Weather
+            "ru.yandex.translate",         // Yandex Translate
+            "com.yandex.lavka",            // Yandex Lavka
+            "ru.kinopoisk",               // Kinopoisk (Yandex)
+            "ru.kinopoisk.plus",           // Kinopoisk HD
+            "com.yandex.mobile.drive",     // Yandex Drive (carsharing)
+
+            // Mobile operators
+            "ru.mts.mymts",               // MTS
+            "ru.megafon.mlk",             // Megafon
+            "ru.beeline.services",        // Beeline
+            "ru.tele2.mytele2",           // Tele2
+            "ru.rt.lk",                   // Rostelecom
+            "ru.yota.android",            // Yota
+
+            // Rutube
+            "ru.rutube.app",
+
+            // Okko
+            "ru.more.play",
+
+            // Ivi
+            "ru.ivi.client",
+
+            // Pochta Rossii
+            "ru.russianpost.postapp",
+
+            // GIS ZhKH
+            "ru.minstroyrf.giszhkh",
+
+            // Gosuslugi
+            "ru.rostel.gosuslugi",
+
+            // Banks
+            "ru.sberbankmobile",           // Sberbank
+            "ru.sberbank.sberbankid",      // Sber ID
+            "ru.sberbank.spasibo",         // Sber Spasibo
+            "com.idamob.tinkoff.android",  // Tinkoff
+            "ru.tinkoff.investing",        // Tinkoff Investments
+            "ru.tinkoff.insurance",        // Tinkoff Insurance
+            "ru.vtb24.mobilebanking.android", // VTB
+            "ru.alfabank.mobile.android",  // Alfa-Bank
+            "ru.raiffeisennews",           // Raiffeisenbank
+            "com.openbank",               // Otkritie
+            "ru.sovcomcard.halva",         // Sovcombank / Halva
+            "ru.rosbank.android",          // Rosbank
+            "ru.psbank.online",            // PSB (Promsvyazbank)
+            "ru.bpc.mobilebank.android",   // Gazprombank
+            "ru.rshb.mbank",              // Rosselhozbank
+            "ru.mw",                       // Pochta Bank
+            "com.unicredit.mob",           // UniCredit
+            "ru.letobank.Prometheus",      // MTS Bank
+            "ru.yoomoney.android",         // YooMoney (ex-Yandex.Money)
+            "ru.homecredit.mycredit",      // Home Credit Bank
+        )
+
         const val ACTION_START = "com.callvpn.START"
         const val ACTION_STOP = "com.callvpn.STOP"
         const val ACTION_STATE_CHANGED = "com.callvpn.STATE_CHANGED"
