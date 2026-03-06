@@ -28,7 +28,7 @@
     min-height: 100vh;
     display: flex;
     justify-content: center;
-    padding: 40px 20px;
+    padding: 40px 20px 100px;
   }
 
   .app {
@@ -43,8 +43,58 @@
     letter-spacing: -0.02em;
   }
 
-  .field {
+  .instance-card {
+    position: relative;
+    margin-bottom: 20px;
+    padding: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+
+  .instance-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     margin-bottom: 16px;
+  }
+
+  .instance-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-dim);
+  }
+
+  .btn-remove {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    transition: all 0.15s;
+  }
+
+  .btn-remove:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+
+  .btn-remove:disabled {
+    opacity: 0.2;
+    cursor: not-allowed;
+    border-color: transparent;
+    color: var(--text-dim);
+  }
+
+  .field {
+    margin-bottom: 14px;
   }
 
   .field label {
@@ -58,7 +108,7 @@
   .field input {
     width: 100%;
     padding: 10px 14px;
-    background: var(--surface);
+    background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     color: var(--text);
@@ -93,7 +143,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--surface);
+    background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     color: var(--text-dim);
@@ -134,7 +184,7 @@
     display: flex;
     align-items: center;
     gap: 14px;
-    margin-bottom: 24px;
+    margin-bottom: 14px;
   }
 
   .btn {
@@ -188,9 +238,9 @@
   .status-dot.on { background: var(--success); }
 
   .conn-info {
-    margin-top: 8px;
+    margin-bottom: 14px;
     padding: 8px 14px;
-    background: var(--surface);
+    background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     font-size: 13px;
@@ -228,14 +278,14 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 14px;
-    background: var(--surface);
+    background: var(--bg);
     cursor: pointer;
     user-select: none;
     transition: background 0.15s;
   }
 
   .logs-header:hover {
-    background: #1f2233;
+    background: #0c0d14;
   }
 
   .logs-header-left {
@@ -275,7 +325,7 @@
 
   .logs-body {
     display: none;
-    max-height: 400px;
+    max-height: 300px;
     overflow-y: auto;
     background: #0c0d12;
     cursor: pointer;
@@ -317,95 +367,165 @@
     font-size: 12px;
     color: var(--text-dim);
   }
+
+  .fab {
+    position: fixed;
+    bottom: 32px;
+    right: 32px;
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: white;
+    border: none;
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.4);
+    transition: all 0.2s;
+  }
+
+  .fab:hover {
+    background: var(--accent-hover);
+    transform: scale(1.08);
+  }
+
+  .fab:active {
+    transform: scale(0.96);
+  }
 </style>
 </head>
 <body>
 <div class="app">
   <h1>Call VPN Server</h1>
-
-  <div class="field">
-    <label for="link">VK Call Link</label>
-    <input type="text" id="link" placeholder="https://vk.com/call/join/... or call ID" autocomplete="off" spellcheck="false">
-    <div class="parsed-id" id="parsed"></div>
-  </div>
-
-  <div class="field">
-    <label for="token">Auth Token</label>
-    <div class="input-row">
-      <input type="password" id="token" placeholder="Token (or set VPN_TOKEN env var)" autocomplete="off" spellcheck="false">
-      <button class="btn-icon" id="genTokenBtn" title="Generate token & copy" onclick="generateToken()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
-        </svg>
-      </button>
-    </div>
-    <div class="token-toast" id="tokenToast"></div>
-  </div>
-
-  <div class="controls">
-    <button class="btn btn-connect" id="connectBtn" onclick="toggleConnection()">Connect</button>
-    <span class="status" id="status">
-      <span class="status-dot off" id="statusDot"></span>
-      <span id="statusText">Disconnected</span>
-    </span>
-  </div>
-
-  <div class="conn-info" id="connInfo">
-    <span id="connText">Connections: —</span>
-    <div class="conn-bar">
-      <div class="conn-bar-fill" id="connBarFill" style="width: 0%"></div>
-    </div>
-  </div>
-
-  <div class="logs-section">
-    <div class="logs-header" onclick="toggleLogs()">
-      <div class="logs-header-left">
-        <span class="arrow" id="logsArrow">&#9654;</span>
-        <span>Logs</span>
-        <span class="log-count" id="logCount"></span>
-      </div>
-      <span class="copy-hint" id="copyHint">click logs to copy</span>
-      <span class="copy-toast" id="copyToast">Copied!</span>
-    </div>
-    <div class="logs-body" id="logsBody" onclick="copyLogs()">
-      <div class="logs-empty" id="logsEmpty">No logs yet</div>
-    </div>
-  </div>
+  <div id="instances"></div>
 </div>
+
+<button class="fab" onclick="addInstance()" title="Add server instance">+</button>
 
 <script>
 const linkRe = /vk\.com\/call\/join\/([A-Za-z0-9_-]+)/;
-let connected = false;
-let logsOpen = false;
-let logLines = [];
-let evtSource = null;
 
-const $ = id => document.getElementById(id);
+// Per-instance state.
+const state = [];
 
 function parseLink(input) {
   const m = input.match(linkRe);
   return m ? m[1] : input.trim();
 }
 
-$('link').addEventListener('input', e => {
-  const id = parseLink(e.target.value);
-  const parsed = $('parsed');
-  if (id && id !== e.target.value.trim()) {
-    parsed.textContent = 'ID: ' + id;
-  } else {
-    parsed.textContent = '';
+function el(id, idx) {
+  return document.getElementById(id + '_' + idx);
+}
+
+function createInstanceHTML(idx) {
+  return `
+    <div class="instance-card" id="card_${idx}">
+      <div class="instance-header">
+        <span class="instance-title">Server #${idx + 1}</span>
+        <button class="btn-remove" id="removeBtn_${idx}" onclick="removeInstance(${idx})" title="Remove instance">&times;</button>
+      </div>
+      <div class="field">
+        <label>VK Call Link</label>
+        <input type="text" id="link_${idx}" placeholder="https://vk.com/call/join/... or call ID" autocomplete="off" spellcheck="false">
+        <div class="parsed-id" id="parsed_${idx}"></div>
+      </div>
+      <div class="field">
+        <label>Auth Token</label>
+        <div class="input-row">
+          <input type="password" id="token_${idx}" placeholder="Token (or set VPN_TOKEN env var)" autocomplete="off" spellcheck="false">
+          <button class="btn-icon" id="genTokenBtn_${idx}" onclick="generateToken(${idx})" title="Generate token & copy">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+            </svg>
+          </button>
+        </div>
+        <div class="token-toast" id="tokenToast_${idx}"></div>
+      </div>
+      <div class="controls">
+        <button class="btn btn-connect" id="connectBtn_${idx}" onclick="toggleConnection(${idx})">Connect</button>
+        <span class="status">
+          <span class="status-dot off" id="statusDot_${idx}"></span>
+          <span id="statusText_${idx}">Disconnected</span>
+        </span>
+      </div>
+      <div class="conn-info" id="connInfo_${idx}">
+        <span id="connText_${idx}">Connections: —</span>
+        <div class="conn-bar">
+          <div class="conn-bar-fill" id="connBarFill_${idx}" style="width: 0%"></div>
+        </div>
+      </div>
+      <div class="logs-section">
+        <div class="logs-header" onclick="toggleLogs(${idx})">
+          <div class="logs-header-left">
+            <span class="arrow" id="logsArrow_${idx}">&#9654;</span>
+            <span>Logs</span>
+            <span class="log-count" id="logCount_${idx}"></span>
+          </div>
+          <span class="copy-hint" id="copyHint_${idx}">click logs to copy</span>
+          <span class="copy-toast" id="copyToast_${idx}">Copied!</span>
+        </div>
+        <div class="logs-body" id="logsBody_${idx}" onclick="copyLogs(${idx})">
+          <div class="logs-empty" id="logsEmpty_${idx}">No logs yet</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function initInstanceState(idx) {
+  if (!state[idx]) {
+    state[idx] = { connected: false, logsOpen: false, logLines: [], evtSource: null, statusInterval: null };
   }
-});
+}
 
-function setStatus(on, text) {
-  connected = on;
-  $('statusDot').className = 'status-dot ' + (on ? 'on' : 'off');
-  $('statusText').textContent = text;
-  $('link').disabled = on;
-  $('token').disabled = on;
-  $('genTokenBtn').disabled = on;
+function renderInstances(configs) {
+  const container = document.getElementById('instances');
+  container.innerHTML = '';
+  state.length = 0;
 
-  const btn = $('connectBtn');
+  configs.forEach((cfg, idx) => {
+    initInstanceState(idx);
+    container.insertAdjacentHTML('beforeend', createInstanceHTML(idx));
+
+    if (cfg.call_link) el('link', idx).value = cfg.call_link;
+    if (cfg.auth_token) el('token', idx).value = cfg.auth_token;
+
+    el('link', idx).addEventListener('input', e => {
+      const id = parseLink(e.target.value);
+      const parsed = el('parsed', idx);
+      if (id && id !== e.target.value.trim()) {
+        parsed.textContent = 'ID: ' + id;
+      } else {
+        parsed.textContent = '';
+      }
+    });
+    el('link', idx).dispatchEvent(new Event('input'));
+  });
+
+  updateRemoveButtons();
+}
+
+function updateRemoveButtons() {
+  const total = state.length;
+  state.forEach((s, idx) => {
+    const btn = el('removeBtn', idx);
+    if (btn) btn.disabled = total <= 1 || s.connected;
+  });
+}
+
+function setStatus(idx, on, text) {
+  const s = state[idx];
+  s.connected = on;
+  el('statusDot', idx).className = 'status-dot ' + (on ? 'on' : 'off');
+  el('statusText', idx).textContent = text;
+  el('link', idx).disabled = on;
+  el('token', idx).disabled = on;
+  el('genTokenBtn', idx).disabled = on;
+
+  const btn = el('connectBtn', idx);
   if (on) {
     btn.textContent = 'Disconnect';
     btn.className = 'btn btn-disconnect';
@@ -414,79 +534,87 @@ function setStatus(on, text) {
     btn.className = 'btn btn-connect';
   }
   btn.disabled = false;
+  updateRemoveButtons();
 }
 
-async function toggleConnection() {
-  const btn = $('connectBtn');
+async function toggleConnection(idx) {
+  const s = state[idx];
+  const btn = el('connectBtn', idx);
   btn.disabled = true;
 
-  if (connected) {
-    setStatus(true, 'Disconnecting...');
+  if (s.connected) {
+    setStatus(idx, true, 'Disconnecting...');
     try {
-      await fetch('/api/disconnect', { method: 'POST' });
+      await fetch('/api/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: idx })
+      });
     } catch(e) {}
-    setStatus(false, 'Disconnected');
-    stopStatusPolling();
+    setStatus(idx, false, 'Disconnected');
+    stopStatusPolling(idx);
   } else {
-    const link = $('link').value.trim();
+    const link = el('link', idx).value.trim();
     if (!link) {
       btn.disabled = false;
       return;
     }
-    setStatus(false, 'Connecting...');
+    setStatus(idx, false, 'Connecting...');
     btn.disabled = true;
     try {
       const res = await fetch('/api/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ link, token: $('token').value })
+        body: JSON.stringify({ id: idx, link, token: el('token', idx).value })
       });
       if (res.ok) {
-        setStatus(true, 'Connected');
-        connectSSE();
-        startStatusPolling();
+        setStatus(idx, true, 'Connected');
+        connectSSE(idx);
+        startStatusPolling(idx);
       } else {
         const data = await res.json().catch(() => ({}));
-        setStatus(false, data.error || 'Connection failed');
+        setStatus(idx, false, data.error || 'Connection failed');
       }
     } catch(e) {
-      setStatus(false, 'Connection failed');
+      setStatus(idx, false, 'Connection failed');
     }
   }
 }
 
-function toggleLogs() {
-  logsOpen = !logsOpen;
-  $('logsBody').className = 'logs-body' + (logsOpen ? ' open' : '');
-  $('logsArrow').className = 'arrow' + (logsOpen ? ' open' : '');
-  if (logsOpen) {
-    $('logsBody').scrollTop = $('logsBody').scrollHeight;
+function toggleLogs(idx) {
+  const s = state[idx];
+  s.logsOpen = !s.logsOpen;
+  el('logsBody', idx).className = 'logs-body' + (s.logsOpen ? ' open' : '');
+  el('logsArrow', idx).className = 'arrow' + (s.logsOpen ? ' open' : '');
+  if (s.logsOpen) {
+    el('logsBody', idx).scrollTop = el('logsBody', idx).scrollHeight;
   }
 }
 
-function addLogLine(text) {
-  logLines.push(text);
-  const body = $('logsBody');
-  $('logsEmpty').style.display = 'none';
+function addLogLine(idx, text) {
+  const s = state[idx];
+  s.logLines.push(text);
+  const body = el('logsBody', idx);
+  el('logsEmpty', idx).style.display = 'none';
 
   const div = document.createElement('div');
   div.className = 'log-line';
   div.textContent = text;
   body.appendChild(div);
 
-  $('logCount').textContent = '(' + logLines.length + ')';
+  el('logCount', idx).textContent = '(' + s.logLines.length + ')';
 
-  // Auto-scroll if near bottom.
   if (body.scrollHeight - body.scrollTop - body.clientHeight < 80) {
     body.scrollTop = body.scrollHeight;
   }
 }
 
-function copyLogs() {
-  if (logLines.length === 0) return;
-  navigator.clipboard.writeText(logLines.join('\n')).then(() => {
-    const toast = $('copyToast');
-    const hint = $('copyHint');
+function copyLogs(idx) {
+  const s = state[idx];
+  if (s.logLines.length === 0) return;
+  navigator.clipboard.writeText(s.logLines.join('\n')).then(() => {
+    const toast = el('copyToast', idx);
+    const hint = el('copyHint', idx);
     hint.style.display = 'none';
     toast.style.display = 'inline';
     setTimeout(() => {
@@ -496,28 +624,26 @@ function copyLogs() {
   });
 }
 
-function generateToken() {
+function generateToken(idx) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const arr = new Uint8Array(40);
   crypto.getRandomValues(arr);
   const token = Array.from(arr, b => chars[b % chars.length]).join('');
-  $('token').value = token;
-  $('token').type = 'text';
+  el('token', idx).value = token;
+  el('token', idx).type = 'text';
   navigator.clipboard.writeText(token).then(() => {
-    $('tokenToast').textContent = 'Token generated & copied to clipboard';
+    el('tokenToast', idx).textContent = 'Token generated & copied to clipboard';
     setTimeout(() => {
-      $('tokenToast').textContent = '';
-      $('token').type = 'password';
+      el('tokenToast', idx).textContent = '';
+      el('token', idx).type = 'password';
     }, 3000);
   });
 }
 
-let statusInterval = null;
-
-function updateConnInfo(sessions) {
-  const info = $('connInfo');
-  const text = $('connText');
-  const bar = $('connBarFill');
+function updateConnInfo(idx, sessions) {
+  const info = el('connInfo', idx);
+  const text = el('connText', idx);
+  const bar = el('connBarFill', idx);
 
   if (!sessions || sessions.length === 0) {
     info.className = 'conn-info';
@@ -539,67 +665,142 @@ function updateConnInfo(sessions) {
   bar.className = 'conn-bar-fill' + (pct < 30 ? ' critical' : pct < 70 ? ' degraded' : '');
 }
 
-function startStatusPolling() {
-  if (statusInterval) return;
-  statusInterval = setInterval(async () => {
+function startStatusPolling(idx) {
+  const s = state[idx];
+  if (s.statusInterval) return;
+  s.statusInterval = setInterval(async () => {
     try {
-      const st = await fetch('/api/status').then(r => r.json());
-      if (st.sessions) updateConnInfo(st.sessions);
-      if (!st.connected && connected) {
-        setStatus(false, 'Disconnected (server stopped)');
-        stopStatusPolling();
+      const data = await fetch('/api/status').then(r => r.json());
+      if (data.instances && data.instances[idx]) {
+        const ist = data.instances[idx];
+        if (ist.sessions) updateConnInfo(idx, ist.sessions);
+        if (!ist.connected && s.connected) {
+          setStatus(idx, false, 'Disconnected (server stopped)');
+          stopStatusPolling(idx);
+        }
       }
     } catch(e) {}
   }, 3000);
 }
 
-function stopStatusPolling() {
-  if (statusInterval) {
-    clearInterval(statusInterval);
-    statusInterval = null;
+function stopStatusPolling(idx) {
+  const s = state[idx];
+  if (s.statusInterval) {
+    clearInterval(s.statusInterval);
+    s.statusInterval = null;
   }
-  $('connInfo').className = 'conn-info';
+  el('connInfo', idx).className = 'conn-info';
 }
 
-function connectSSE() {
-  if (evtSource) evtSource.close();
-  logLines = [];
-  $('logsBody').querySelectorAll('.log-line').forEach(el => el.remove());
-  $('logsEmpty').style.display = '';
-  $('logCount').textContent = '';
+function connectSSE(idx) {
+  const s = state[idx];
+  if (s.evtSource) s.evtSource.close();
+  s.logLines = [];
+  el('logsBody', idx).querySelectorAll('.log-line').forEach(e => e.remove());
+  el('logsEmpty', idx).style.display = '';
+  el('logCount', idx).textContent = '';
 
-  evtSource = new EventSource('/api/logs');
-  evtSource.onmessage = e => addLogLine(e.data);
-  evtSource.onerror = () => {
-    // Check if server disconnected.
+  s.evtSource = new EventSource('/api/logs?id=' + idx);
+  s.evtSource.onmessage = e => addLogLine(idx, e.data);
+  s.evtSource.onerror = () => {
     fetch('/api/status').then(r => r.json()).then(data => {
-      if (!data.connected && connected) {
-        setStatus(false, 'Disconnected (server stopped)');
+      if (data.instances && data.instances[idx] && !data.instances[idx].connected && s.connected) {
+        setStatus(idx, false, 'Disconnected (server stopped)');
       }
     }).catch(() => {});
   };
 }
 
+async function addInstance() {
+  try {
+    const res = await fetch('/api/instances/add', { method: 'POST' });
+    const data = await res.json();
+    const idx = data.id;
+    initInstanceState(idx);
+    const container = document.getElementById('instances');
+    container.insertAdjacentHTML('beforeend', createInstanceHTML(idx));
+
+    el('link', idx).addEventListener('input', e => {
+      const id = parseLink(e.target.value);
+      const parsed = el('parsed', idx);
+      if (id && id !== e.target.value.trim()) {
+        parsed.textContent = 'ID: ' + id;
+      } else {
+        parsed.textContent = '';
+      }
+    });
+
+    updateRemoveButtons();
+    el('card', idx).scrollIntoView({ behavior: 'smooth', block: 'end' });
+  } catch(e) {}
+}
+
+async function removeInstance(idx) {
+  const s = state[idx];
+  if (s.connected) return;
+
+  if (!confirm('Remove Server #' + (idx + 1) + '?')) return;
+
+  try {
+    const res = await fetch('/api/instances/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: idx })
+    });
+    if (!res.ok) return;
+  } catch(e) { return; }
+
+  // Close SSE if any.
+  if (s.evtSource) s.evtSource.close();
+  if (s.statusInterval) clearInterval(s.statusInterval);
+
+  // Re-render everything from current config.
+  const cfg = await fetch('/api/config').then(r => r.json());
+  renderInstances(cfg.instances || [{}]);
+
+  // Restore connected states from server.
+  try {
+    const st = await fetch('/api/status').then(r => r.json());
+    if (st.instances) {
+      st.instances.forEach((ist, i) => {
+        if (ist.connected) {
+          setStatus(i, true, 'Connected');
+          connectSSE(i);
+          startStatusPolling(i);
+          if (ist.sessions) updateConnInfo(i, ist.sessions);
+          if (!state[i].logsOpen) toggleLogs(i);
+        }
+      });
+    }
+  } catch(e) {}
+}
+
 // Initialize.
 (async () => {
-  // Load saved config.
+  // Load config.
+  let configs = [{}];
   try {
     const cfg = await fetch('/api/config').then(r => r.json());
-    if (cfg.call_link) $('link').value = cfg.call_link;
-    if (cfg.auth_token) $('token').value = cfg.auth_token;
-    $('link').dispatchEvent(new Event('input'));
+    if (cfg.instances && cfg.instances.length > 0) {
+      configs = cfg.instances;
+    }
   } catch(e) {}
+
+  renderInstances(configs);
 
   // Check current status.
   try {
     const st = await fetch('/api/status').then(r => r.json());
-    if (st.connected) {
-      setStatus(true, 'Connected');
-      connectSSE();
-      startStatusPolling();
-      if (st.sessions) updateConnInfo(st.sessions);
-      // Open logs automatically if connected.
-      if (!logsOpen) toggleLogs();
+    if (st.instances) {
+      st.instances.forEach((ist, idx) => {
+        if (ist.connected && state[idx]) {
+          setStatus(idx, true, 'Connected');
+          connectSSE(idx);
+          startStatusPolling(idx);
+          if (ist.sessions) updateConnInfo(idx, ist.sessions);
+          if (!state[idx].logsOpen) toggleLogs(idx);
+        }
+      });
     }
   } catch(e) {}
 })();

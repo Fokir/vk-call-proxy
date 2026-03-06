@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	_"embed"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,8 +90,19 @@ func (w *logWriter) allLines() []string {
 	return out
 }
 
+// instanceConfig is per-instance persistent config.
+type instanceConfig struct {
+	CallLink  string `json:"call_link"`
+	AuthToken string `json:"auth_token"`
+}
+
 // appConfig persists between restarts.
 type appConfig struct {
+	Instances []instanceConfig `json:"instances"`
+}
+
+// legacyConfig is the old single-instance format.
+type legacyConfig struct {
 	CallLink  string `json:"call_link"`
 	AuthToken string `json:"auth_token"`
 }
@@ -101,13 +113,30 @@ func configPath() string {
 }
 
 func loadConfig() appConfig {
-	var cfg appConfig
 	data, err := os.ReadFile(configPath())
 	if err != nil {
+		return appConfig{Instances: []instanceConfig{{}}}
+	}
+
+	// Try new format first.
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err == nil && len(cfg.Instances) > 0 {
 		return cfg
 	}
-	json.Unmarshal(data, &cfg)
-	return cfg
+
+	// Migrate from legacy single-instance format.
+	var legacy legacyConfig
+	if err := json.Unmarshal(data, &legacy); err == nil && (legacy.CallLink != "" || legacy.AuthToken != "") {
+		cfg = appConfig{
+			Instances: []instanceConfig{
+				{CallLink: legacy.CallLink, AuthToken: legacy.AuthToken},
+			},
+		}
+		saveConfig(cfg)
+		return cfg
+	}
+
+	return appConfig{Instances: []instanceConfig{{}}}
 }
 
 func saveConfig(cfg appConfig) {
@@ -117,12 +146,65 @@ func saveConfig(cfg appConfig) {
 	os.WriteFile(path, data, 0o644)
 }
 
-type appState struct {
+// instance holds per-instance runtime state.
+type instance struct {
 	mu        sync.Mutex
 	srv       *server.Server
 	cancel    context.CancelFunc
 	connected bool
 	logs      *logWriter
+}
+
+type appState struct {
+	mu        sync.Mutex
+	instances []*instance
+}
+
+func newAppState(n int) *appState {
+	s := &appState{}
+	for i := 0; i < n; i++ {
+		s.instances = append(s.instances, &instance{logs: newLogWriter()})
+	}
+	return s
+}
+
+func (s *appState) getInstance(id int) *instance {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id < 0 || id >= len(s.instances) {
+		return nil
+	}
+	return s.instances[id]
+}
+
+func (s *appState) addInstance() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.instances = append(s.instances, &instance{logs: newLogWriter()})
+	return len(s.instances) - 1
+}
+
+func (s *appState) removeInstance(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id < 0 || id >= len(s.instances) || len(s.instances) <= 1 {
+		return false
+	}
+	inst := s.instances[id]
+	inst.mu.Lock()
+	if inst.connected {
+		inst.mu.Unlock()
+		return false
+	}
+	inst.mu.Unlock()
+	s.instances = append(s.instances[:id], s.instances[id+1:]...)
+	return true
+}
+
+func (s *appState) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.instances)
 }
 
 func (s *appState) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +217,9 @@ func (s *appState) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var cfg appConfig
 		json.NewDecoder(r.Body).Decode(&cfg)
+		if len(cfg.Instances) == 0 {
+			cfg.Instances = []instanceConfig{{}}
+		}
 		saveConfig(cfg)
 		json.NewEncoder(w).Encode(cfg)
 		return
@@ -143,19 +228,35 @@ func (s *appState) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *appState) handleStatus(w http.ResponseWriter, r *http.Request) {
+	type instanceStatus struct {
+		ID        int    `json:"id"`
+		Connected bool   `json:"connected"`
+		Sessions  []any  `json:"sessions,omitempty"`
+	}
+
 	s.mu.Lock()
-	connected := s.connected
-	srv := s.srv
+	n := len(s.instances)
+	instances := make([]*instance, n)
+	copy(instances, s.instances)
 	s.mu.Unlock()
 
-	resp := map[string]any{"connected": connected}
-	if connected && srv != nil {
-		sessions := srv.GetSessionsInfo()
-		resp["sessions"] = sessions
+	statuses := make([]instanceStatus, n)
+	for i, inst := range instances {
+		inst.mu.Lock()
+		st := instanceStatus{ID: i, Connected: inst.connected}
+		if inst.connected && inst.srv != nil {
+			sessions := inst.srv.GetSessionsInfo()
+			st.Sessions = make([]any, len(sessions))
+			for j, sess := range sessions {
+				st.Sessions[j] = sess
+			}
+		}
+		inst.mu.Unlock()
+		statuses[i] = st
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]any{"instances": statuses})
 }
 
 func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +266,7 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
+		ID    int    `json:"id"`
 		Link  string `json:"link"`
 		Token string `json:"token"`
 	}
@@ -176,25 +278,36 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	if s.connected {
-		s.mu.Unlock()
+	inst := s.getInstance(req.ID)
+	if inst == nil {
+		http.Error(w, `{"error":"invalid instance id"}`, http.StatusBadRequest)
+		return
+	}
+
+	inst.mu.Lock()
+	if inst.connected {
+		inst.mu.Unlock()
 		http.Error(w, `{"error":"already connected"}`, http.StatusConflict)
 		return
 	}
-	s.mu.Unlock()
+	inst.mu.Unlock()
 
-	// Save config.
-	saveConfig(appConfig{CallLink: req.Link, AuthToken: req.Token})
+	// Save config for all instances.
+	cfg := loadConfig()
+	for len(cfg.Instances) <= req.ID {
+		cfg.Instances = append(cfg.Instances, instanceConfig{})
+	}
+	cfg.Instances[req.ID] = instanceConfig{CallLink: req.Link, AuthToken: req.Token}
+	saveConfig(cfg)
 
-	logger := slog.New(slog.NewTextHandler(s.logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(inst.logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	authToken := req.Token
 	if authToken == "" {
 		authToken = os.Getenv("VPN_TOKEN")
 	}
 
-	cfg := server.Config{
+	srvCfg := server.Config{
 		CallLink:  link,
 		AuthToken: authToken,
 		UseTCP:    true,
@@ -202,25 +315,25 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	srv := server.New(cfg)
+	srv := server.New(srvCfg)
 	srv.Start(ctx)
 
-	s.mu.Lock()
-	s.srv = srv
-	s.cancel = cancel
-	s.connected = true
-	s.mu.Unlock()
+	inst.mu.Lock()
+	inst.srv = srv
+	inst.cancel = cancel
+	inst.connected = true
+	inst.mu.Unlock()
 
 	// Watch for unexpected server stop.
 	go func() {
 		<-srv.Done()
-		s.mu.Lock()
-		if s.srv == srv {
-			s.connected = false
-			s.srv = nil
-			s.cancel = nil
+		inst.mu.Lock()
+		if inst.srv == srv {
+			inst.connected = false
+			inst.srv = nil
+			inst.cancel = nil
 		}
-		s.mu.Unlock()
+		inst.mu.Unlock()
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -233,13 +346,24 @@ func (s *appState) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	cancel := s.cancel
-	srv := s.srv
-	s.connected = false
-	s.srv = nil
-	s.cancel = nil
-	s.mu.Unlock()
+	var req struct {
+		ID int `json:"id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	inst := s.getInstance(req.ID)
+	if inst == nil {
+		http.Error(w, `{"error":"invalid instance id"}`, http.StatusBadRequest)
+		return
+	}
+
+	inst.mu.Lock()
+	cancel := inst.cancel
+	srv := inst.srv
+	inst.connected = false
+	inst.srv = nil
+	inst.cancel = nil
+	inst.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -259,18 +383,27 @@ func (s *appState) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idStr := r.URL.Query().Get("id")
+	id, _ := strconv.Atoi(idStr)
+
+	inst := s.getInstance(id)
+	if inst == nil {
+		http.Error(w, "invalid instance id", http.StatusBadRequest)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
 	// Send existing logs.
-	for _, line := range s.logs.allLines() {
+	for _, line := range inst.logs.allLines() {
 		fmt.Fprintf(w, "data: %s\n\n", line)
 	}
 	flusher.Flush()
 
 	// Stream new logs.
-	ch, unsub := s.logs.subscribe()
+	ch, unsub := inst.logs.subscribe()
 	defer unsub()
 
 	for {
@@ -287,6 +420,51 @@ func (s *appState) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *appState) handleAddInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := s.addInstance()
+
+	// Extend config.
+	cfg := loadConfig()
+	for len(cfg.Instances) <= id {
+		cfg.Instances = append(cfg.Instances, instanceConfig{})
+	}
+	saveConfig(cfg)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"id": id})
+}
+
+func (s *appState) handleRemoveInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID int `json:"id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if !s.removeInstance(req.ID) {
+		http.Error(w, `{"error":"cannot remove instance"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Shrink config.
+	cfg := loadConfig()
+	if req.ID < len(cfg.Instances) {
+		cfg.Instances = append(cfg.Instances[:req.ID], cfg.Instances[req.ID+1:]...)
+	}
+	saveConfig(cfg)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
 func openBrowser(url string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -301,7 +479,8 @@ func openBrowser(url string) {
 }
 
 func main() {
-	state := &appState{logs: newLogWriter()}
+	cfg := loadConfig()
+	state := newAppState(len(cfg.Instances))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex)
@@ -310,6 +489,8 @@ func main() {
 	mux.HandleFunc("/api/connect", state.handleConnect)
 	mux.HandleFunc("/api/disconnect", state.handleDisconnect)
 	mux.HandleFunc("/api/logs", state.handleLogs)
+	mux.HandleFunc("/api/instances/add", state.handleAddInstance)
+	mux.HandleFunc("/api/instances/remove", state.handleRemoveInstance)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -328,11 +509,15 @@ func main() {
 		<-sigCh
 		fmt.Println("\nshutting down...")
 		state.mu.Lock()
-		if state.cancel != nil {
-			state.cancel()
-		}
-		if state.srv != nil {
-			<-state.srv.Done()
+		for _, inst := range state.instances {
+			inst.mu.Lock()
+			if inst.cancel != nil {
+				inst.cancel()
+			}
+			if inst.srv != nil {
+				<-inst.srv.Done()
+			}
+			inst.mu.Unlock()
 		}
 		state.mu.Unlock()
 		os.Exit(0)
