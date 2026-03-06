@@ -212,18 +212,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate release body
+      - name: Generate release body from commits
         id: notes
-        uses: actions/github-script@v7
-        with:
-          result-encoding: string
-          script: |
-            const { data } = await github.rest.repos.generateReleaseNotes({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: context.ref.replace('refs/tags/', ''),
-            });
-            return data.body;
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+
+          BODY="## What's Changed"$'\n'
+          while IFS= read -r line; do
+            hash=$(echo "$line" | cut -d' ' -f1)
+            msg=$(echo "$line" | cut -d' ' -f2-)
+            BODY+="* ${msg} (${hash})"$'\n'
+          done < <(git log --oneline "$RANGE" -- . ':!.github')
+
+          if [ -n "$PREV_TAG" ]; then
+            BODY+=$'\n'"**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          fi
+
+          # Write to file to preserve multiline content
+          echo "$BODY" > release_notes.md
 
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -237,7 +250,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body: ${{ steps.notes.outputs.result }}
+          body_path: release_notes.md
           files: |
             artifacts/client-windows-amd64.exe
             artifacts/client-darwin-amd64
