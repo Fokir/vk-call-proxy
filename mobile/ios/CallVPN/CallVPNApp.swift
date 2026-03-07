@@ -7,6 +7,7 @@ struct CallVPNApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .preferredColorScheme(.dark)
         }
     }
 }
@@ -27,24 +28,24 @@ enum VpnState {
     var statusColor: Color {
         switch self {
         case .disconnected: return .gray
-        case .connecting: return .yellow
-        case .connected: return .green
+        case .connecting: return Color(red: 1.0, green: 0.76, blue: 0.03) // #FFC107
+        case .connected: return Color(red: 0.30, green: 0.69, blue: 0.31) // #4CAF50
         }
     }
 
     var buttonText: String {
         switch self {
         case .disconnected: return "Подключиться"
-        case .connecting: return "Подключение..."
+        case .connecting: return "Отмена"
         case .connected: return "Отключиться"
         }
     }
 
     var buttonColor: Color {
         switch self {
-        case .disconnected: return .green
-        case .connecting: return .yellow
-        case .connected: return .red
+        case .disconnected: return Color(red: 0.30, green: 0.69, blue: 0.31) // #4CAF50
+        case .connecting: return Color(red: 1.0, green: 0.76, blue: 0.03) // #FFC107
+        case .connected: return Color(red: 0.96, green: 0.26, blue: 0.21) // #F44336
         }
     }
 }
@@ -59,15 +60,24 @@ struct ContentView: View {
     @AppStorage("serverAddr") private var serverAddr = ""
     @AppStorage("token") private var token = ""
     @AppStorage("connectionMode") private var connectionModeRaw = "relay"
+    @AppStorage("numConns") private var numConnsStored = "4"
+    @AppStorage("recentIds") private var recentIdsRaw = ""
+
     @State private var vpnState: VpnState = .disconnected
     @State private var manager: NETunnelProviderManager?
-    @State private var showChangeAlert = false
-    @State private var pendingChange: (() -> Void)?
+    @State private var activeConns = 0
+    @State private var totalConns = 0
+    @State private var logLines: [String] = []
+    @State private var pollTimer: Timer?
+    @State private var copiedToast = false
+
+    // Editing fields (separate from stored to allow editing before connect)
     @State private var editingCallLink = ""
     @State private var editingServerAddr = ""
     @State private var editingToken = ""
-    @State private var logLines: [String] = []
-    @State private var logPollTimer: Timer?
+    @State private var editingNumConns = "4"
+
+    private let sharedDefaults = UserDefaults(suiteName: "group.com.callvpn.app")
 
     private var currentMode: ConnectionMode {
         ConnectionMode(rawValue: connectionModeRaw) ?? .relay
@@ -79,6 +89,10 @@ struct ContentView: View {
 
     private var hasFullLink: Bool {
         editingCallLink.contains("vk.com/call/join/")
+    }
+
+    private var recentIds: [String] {
+        recentIdsRaw.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
     }
 
     private var canConnect: Bool {
@@ -104,6 +118,13 @@ struct ContentView: View {
                     .font(.system(size: 16, weight: .medium))
                     .foregroundColor(vpnState.statusColor)
 
+                // Connection count
+                if vpnState != .disconnected && totalConns > 0 {
+                    Text("Подключения: \(activeConns) / \(totalConns)")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(activeConns == totalConns ? .secondary : Color(red: 1.0, green: 0.76, blue: 0.03))
+                }
+
                 // Mode picker
                 Picker("Mode", selection: $connectionModeRaw) {
                     Text("Relay-to-Relay").tag("relay")
@@ -124,7 +145,6 @@ struct ContentView: View {
                         .background(vpnState.buttonColor)
                         .clipShape(Circle())
                 }
-                .disabled(vpnState == .connecting)
 
                 // App version
                 Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
@@ -143,11 +163,6 @@ struct ContentView: View {
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                         .disabled(vpnState != .disconnected)
-                        .onChange(of: editingCallLink) { newValue in
-                            handleFieldChange(saved: callLink, new: newValue) {
-                                editingCallLink = newValue
-                            }
-                        }
 
                     if hasFullLink && !parsedId.isEmpty {
                         Text("ID: \(parsedId)")
@@ -156,6 +171,31 @@ struct ContentView: View {
                     }
                 }
                 .padding(.horizontal)
+
+                // Recent call IDs
+                if !recentIds.isEmpty && vpnState == .disconnected {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Недавние")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        ForEach(recentIds, id: \.self) { id in
+                            Button {
+                                editingCallLink = id
+                            } label: {
+                                Text(id)
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(Color(.systemGray5))
+                                    .cornerRadius(6)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
 
                 // Server address input (only in Direct mode)
                 if currentMode == .direct {
@@ -168,11 +208,6 @@ struct ContentView: View {
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
                             .disabled(vpnState != .disconnected)
-                            .onChange(of: editingServerAddr) { newValue in
-                                handleFieldChange(saved: serverAddr, new: newValue) {
-                                    editingServerAddr = newValue
-                                }
-                            }
                     }
                     .padding(.horizontal)
                 }
@@ -188,87 +223,149 @@ struct ContentView: View {
                 }
                 .padding(.horizontal)
 
-                // Log window
-                if !logLines.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Лог")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.secondary)
+                // Connections count input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Подключения (1-16)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("4", text: $editingNumConns)
+                        .textFieldStyle(.roundedBorder)
+                        .keyboardType(.numberPad)
+                        .disabled(vpnState != .disconnected)
+                }
+                .padding(.horizontal)
 
-                        ScrollViewReader { proxy in
-                            ScrollView {
-                                LazyVStack(alignment: .leading, spacing: 2) {
-                                    ForEach(Array(logLines.enumerated()), id: \.offset) { index, line in
-                                        Text(line)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                            .id(index)
+                // Log window (always visible)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Лог")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.secondary)
+
+                    ZStack {
+                        if logLines.isEmpty {
+                            Text("Нет записей")
+                                .font(.caption)
+                                .foregroundColor(.secondary.opacity(0.5))
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            ScrollViewReader { proxy in
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 2) {
+                                        ForEach(Array(logLines.enumerated()), id: \.offset) { index, line in
+                                            Text(line)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundColor(logLineColor(line))
+                                                .id(index)
+                                        }
                                     }
+                                    .padding(8)
                                 }
-                                .padding(8)
-                            }
-                            .frame(height: 150)
-                            .background(Color(.systemGray6))
-                            .cornerRadius(8)
-                            .onTapGesture {
-                                UIPasteboard.general.string = logLines.joined(separator: "\n")
-                            }
-                            .onChange(of: logLines.count) { _ in
-                                if let last = logLines.indices.last {
-                                    proxy.scrollTo(last, anchor: .bottom)
+                                .onChange(of: logLines.count) { _ in
+                                    if let last = logLines.indices.last {
+                                        withAnimation {
+                                            proxy.scrollTo(last, anchor: .bottom)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    .padding(.horizontal)
+                    .frame(height: 300)
+                    .frame(maxWidth: .infinity)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(8)
+                    .onTapGesture {
+                        if !logLines.isEmpty {
+                            UIPasteboard.general.string = logLines.joined(separator: "\n")
+                            withAnimation {
+                                copiedToast = true
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                withAnimation {
+                                    copiedToast = false
+                                }
+                            }
+                        }
+                    }
+                    .overlay(alignment: .bottom) {
+                        if copiedToast {
+                            Text("Логи скопированы")
+                                .font(.caption)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.black.opacity(0.7))
+                                .cornerRadius(8)
+                                .padding(.bottom, 8)
+                                .transition(.opacity)
+                        }
+                    }
                 }
+                .padding(.horizontal)
 
                 Spacer()
             }
             .padding()
         }
-        .alert("Изменить значение?", isPresented: $showChangeAlert) {
-            Button("Изменить") {
-                pendingChange?()
-                pendingChange = nil
-            }
-            Button("Отмена", role: .cancel) {
-                pendingChange = nil
-            }
-        } message: {
-            Text("Сохранённое значение будет заменено.")
-        }
         .onAppear {
             editingCallLink = callLink
             editingServerAddr = serverAddr
             editingToken = token
+            editingNumConns = numConnsStored
             loadManager()
             observeVPNStatus()
-            startLogPolling()
+            startPolling()
         }
         .onDisappear {
-            stopLogPolling()
+            stopPolling()
         }
     }
 
-    private func handleFieldChange(saved: String, new: String, apply: @escaping () -> Void) {
-        // Show confirmation only if there's a saved non-empty value being changed
+    // MARK: - Log line coloring
+
+    private func logLineColor(_ line: String) -> Color {
+        if line.contains("level=ERROR") || line.hasPrefix("ERROR:") {
+            return Color(red: 0.94, green: 0.33, blue: 0.31) // #EF5350
+        }
+        if line.contains("level=WARN") {
+            return Color(red: 1.0, green: 0.76, blue: 0.03) // #FFC107
+        }
+        return .secondary
     }
+
+    // MARK: - Button action
 
     private func handleButtonTap() {
         switch vpnState {
         case .disconnected:
             guard canConnect else { return }
+            let conns = max(1, min(16, Int(editingNumConns) ?? 4))
+            // Save settings
             callLink = editingCallLink
             serverAddr = editingServerAddr
             token = editingToken
-            startVPN()
+            numConnsStored = String(conns)
+            editingNumConns = String(conns)
+            // Save to recent IDs
+            saveRecentId(parsedId)
+            startVPN(numConns: conns)
+        case .connecting:
+            stopVPN()
         case .connected:
             stopVPN()
-        case .connecting:
-            break
         }
     }
+
+    // MARK: - Recent IDs
+
+    private func saveRecentId(_ id: String) {
+        var ids = recentIds.filter { $0 != id }
+        ids.insert(id, at: 0)
+        let capped = Array(ids.prefix(5))
+        recentIdsRaw = capped.joined(separator: "\n")
+    }
+
+    // MARK: - VPN management
 
     private func loadManager() {
         NETunnelProviderManager.loadAllFromPreferences { managers, error in
@@ -292,8 +389,8 @@ struct ContentView: View {
                 vpnState = .connecting
             case .disconnected, .invalid:
                 vpnState = .disconnected
-                logLines = []
-                stopLogPolling()
+                activeConns = 0
+                totalConns = 0
             case .disconnecting:
                 vpnState = .connecting
             @unknown default:
@@ -302,26 +399,51 @@ struct ContentView: View {
         }
     }
 
-    private func startLogPolling() {
-        stopLogPolling()
-        let defaults = UserDefaults(suiteName: "group.com.callvpn.app")
-        logPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
-            guard let logs = defaults?.string(forKey: "vpn_logs"), !logs.isEmpty else { return }
-            let newLines = logs.split(separator: "\n").map(String.init)
-            DispatchQueue.main.async {
-                logLines = (logLines + newLines).suffix(20)
+    // MARK: - Polling (logs + connection state)
+
+    private func startPolling() {
+        stopPolling()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            // Poll logs
+            if let logs = sharedDefaults?.string(forKey: "vpn_logs"), !logs.isEmpty {
+                let newLines = logs.split(separator: "\n").map(String.init)
+                DispatchQueue.main.async {
+                    logLines = Array((logLines + newLines).suffix(500))
+                }
+                sharedDefaults?.removeObject(forKey: "vpn_logs")
             }
-            defaults?.removeObject(forKey: "vpn_logs")
+
+            // Poll connection state
+            let isConnected = sharedDefaults?.bool(forKey: "vpn_is_connected") ?? false
+            let active = sharedDefaults?.integer(forKey: "vpn_active_conns") ?? 0
+            let total = sharedDefaults?.integer(forKey: "vpn_total_conns") ?? 0
+
+            DispatchQueue.main.async {
+                activeConns = active
+                totalConns = total
+
+                // Sync connection state from tunnel (handles reconnecting)
+                if vpnState == .connected && !isConnected {
+                    vpnState = .connecting
+                } else if vpnState == .connecting && isConnected {
+                    // Only upgrade to connected if NEVPNStatus also says connected
+                    if let mgr = manager,
+                       mgr.connection.status == .connected {
+                        vpnState = .connected
+                    }
+                }
+            }
         }
     }
 
-    private func stopLogPolling() {
-        logPollTimer?.invalidate()
-        logPollTimer = nil
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 
-    private func startVPN() {
+    private func startVPN(numConns: Int) {
         vpnState = .connecting
+        logLines = []
 
         let effectiveServerAddr = currentMode == .relay ? "" : editingServerAddr
         let displayAddr = currentMode == .relay ? "relay.vk.com" : editingServerAddr
@@ -333,7 +455,7 @@ struct ContentView: View {
             proto.providerConfiguration = [
                 "callLink": parsedId,
                 "serverAddr": effectiveServerAddr,
-                "numConns": 4,
+                "numConns": numConns,
                 "token": editingToken
             ]
             mgr.protocolConfiguration = proto
@@ -357,7 +479,6 @@ struct ContentView: View {
                     do {
                         try (mgr.connection as? NETunnelProviderSession)?.startTunnel()
                         self.manager = mgr
-                        startLogPolling()
                     } catch {
                         NSLog("CallVPN: start error: \(error)")
                         vpnState = .disconnected

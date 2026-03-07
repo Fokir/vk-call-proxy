@@ -875,6 +875,18 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 	}
 }
 
+// ReadPacketData reads a raw IP packet and returns it as a new byte slice.
+// This is the iOS-friendly variant of ReadPacket — gomobile converts []byte
+// return values to NSData, whereas []byte parameters are immutable copies.
+func (t *Tunnel) ReadPacketData() ([]byte, error) {
+	buf := make([]byte, TunMTU)
+	n, err := t.ReadPacket(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
 // IsConnected reports whether the tunnel currently has an active mux.
 // Returns false during reconnection.
 func (t *Tunnel) IsConnected() bool {
