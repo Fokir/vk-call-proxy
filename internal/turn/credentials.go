@@ -75,7 +75,12 @@ func FetchVKCredentials(ctx context.Context, callLink string) (*Credentials, err
 // returns the complete join response including TURN credentials, WebSocket
 // endpoint, and conversation info needed for relay-to-relay signaling.
 func FetchJoinResponse(ctx context.Context, callLink string) (*JoinResponse, error) {
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{
+		Timeout: httpTimeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
 
 	// Step 1: Get anonymous token
 	token1, err := vkAnonToken(ctx, client)
