@@ -26,6 +26,7 @@ type Config struct {
 	AuthToken  string             // Client authentication token
 	Service    provider.Service   // Call service (VK, MAX, etc.) for relay-to-relay mode; nil = direct only
 	UseTCP     bool               // Use TCP for TURN connections
+	NumConns   int                // Number of parallel connections (Telemost mode)
 	Logger     *slog.Logger
 	Siren      *monitoring.Siren
 }
@@ -276,15 +277,19 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 
 func (s *Server) runTelemostMode(ctx context.Context) {
 	tmSvc := s.cfg.Service.(*telemost.Service)
-	s.cfg.Logger.Info("starting Telemost WebRTC mode", "service", tmSvc.Name())
+	n := s.cfg.NumConns
+	if n < 1 {
+		n = 1
+	}
+	s.cfg.Logger.Info("starting Telemost WebRTC mode", "service", tmSvc.Name(), "conns", n)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		s.cfg.Logger.Info("waiting for client session (Telemost)...")
-		err := s.runOneTelemostSession(ctx, tmSvc)
+		s.cfg.Logger.Info("waiting for client session (Telemost)...", "conns", n)
+		err := s.runTelemostSession(ctx, tmSvc, n)
 		if ctx.Err() != nil {
 			return
 		}
@@ -302,72 +307,132 @@ func (s *Server) runTelemostMode(ctx context.Context) {
 	}
 }
 
-func (s *Server) runOneTelemostSession(ctx context.Context, svc *telemost.Service) error {
-	conn, cleanup, err := svc.Connect(ctx, s.cfg.Logger.With("component", "telemost"))
-	if err != nil {
-		return fmt.Errorf("telemost connect: %w", err)
+// runTelemostSession joins the conference with N participants and groups
+// them into a single MUX session via session UUID (same as VK relay mode).
+func (s *Server) runTelemostSession(ctx context.Context, svc *telemost.Service, n int) error {
+	type connResult struct {
+		conn    io.ReadWriteCloser
+		cleanup func()
+		err     error
 	}
-	defer cleanup()
-
-	s.cfg.Logger.Info("Telemost WebRTC connection established")
-
-	// Validate auth token before creating MUX.
-	if s.cfg.AuthToken != "" {
-		if err := mux.ValidateAuthToken(conn, s.cfg.AuthToken); err != nil {
-			return fmt.Errorf("telemost auth: %w", err)
-		}
-		s.cfg.Logger.Info("Telemost client authenticated")
-	}
-
-	m := mux.New(s.cfg.Logger, conn)
-	defer m.Close()
-
-	m.EnableRawPackets(256)
-	m.EnableStreamAccept(64)
-	m.SetIdleTimeout(90 * time.Second)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	go m.DispatchLoop(sessCtx)
-	go m.StartPingLoop(sessCtx, 10*time.Second)
+	// Derive deterministic display names from auth token.
+	serverNames, clientNames := provider.DeriveDisplayNames(s.cfg.AuthToken, n)
 
-	ns := netstack.New(s.cfg.Logger, m)
-	if ns != nil {
-		ns.Start(sessCtx)
-		defer ns.Close()
+	// Phase 1: Setup all N participants in parallel (non-blocking).
+	type setupResult struct {
+		pc  *telemost.PendingConn
+		err error
 	}
+	setupResults := make([]setupResult, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			pc, err := svc.SetupNamedIndexed(sessCtx, s.cfg.Logger.With("component", "telemost", "index", idx), serverNames[idx], idx)
+			setupResults[idx] = setupResult{pc: pc, err: err}
+		}(i)
+	}
+	wg.Wait()
 
-	// Drain dead connections.
-	go func() {
-		for {
-			select {
-			case idx, ok := <-m.ConnDied():
-				if !ok {
-					return
-				}
-				m.RemoveConn(idx)
-			case <-sessCtx.Done():
+	// Phase 2: Wait for client peers by name (via upsertDescription), pin, and connect.
+	results := make([]connResult, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sr := setupResults[idx]
+			if sr.err != nil {
+				results[idx] = connResult{err: sr.err}
 				return
 			}
+			conn, cleanup, err := sr.pc.WaitPinReady(sessCtx, s.cfg.Logger.With("component", "telemost", "index", idx), clientNames[idx])
+			results[idx] = connResult{conn: conn, cleanup: cleanup, err: err}
+		}(i)
+	}
+	wg.Wait()
+
+	// Collect successful connections.
+	var conns []io.ReadWriteCloser
+	var cleanups []func()
+	for i, r := range results {
+		if r.err != nil {
+			s.cfg.Logger.Warn("Telemost connect failed", "index", i, "err", r.err)
+			continue
+		}
+		conns = append(conns, r.conn)
+		cleanups = append(cleanups, r.cleanup)
+		s.cfg.Logger.Info("Telemost WebRTC connection established", "index", i)
+	}
+	defer func() {
+		for _, c := range cleanups {
+			c()
 		}
 	}()
 
-	s.cfg.Logger.Info("Telemost server ready, accepting streams")
-
-	for {
-		select {
-		case stream, ok := <-m.AcceptedStreams():
-			if !ok {
-				return nil
-			}
-			go handleStream(sessCtx, s.cfg.Logger, stream)
-		case <-m.Dead():
-			return nil
-		case <-sessCtx.Done():
-			return nil
-		}
+	if len(conns) == 0 {
+		return fmt.Errorf("no Telemost connections established")
 	}
+
+	// For each connection: validate auth token, read session UUID, group into session.
+	var firstSessionID [16]byte
+	var sess *session
+	var added atomic.Int32
+
+	for i, conn := range conns {
+		if s.cfg.AuthToken != "" {
+			if err := mux.ValidateAuthToken(conn, s.cfg.AuthToken); err != nil {
+				s.cfg.Logger.Warn("Telemost auth failed", "index", i, "err", err)
+				conn.Close()
+				continue
+			}
+		}
+
+		sessionID, err := mux.ReadSessionID(conn)
+		if err != nil {
+			s.cfg.Logger.Warn("read session ID failed (telemost)", "index", i, "err", err)
+			conn.Close()
+			continue
+		}
+
+		if sess == nil {
+			firstSessionID = sessionID
+			sess = s.getOrCreateSession(sessCtx, sessionID)
+		} else if sessionID != firstSessionID {
+			s.cfg.Logger.Warn("session ID mismatch (telemost)", "index", i,
+				"expected", fmt.Sprintf("%x", firstSessionID),
+				"got", fmt.Sprintf("%x", sessionID))
+			conn.Close()
+			continue
+		}
+
+		sess.mu.Lock()
+		sess.m.AddConn(conn)
+		sess.conns++
+		count := sess.conns
+		sess.mu.Unlock()
+
+		added.Add(1)
+		s.cfg.Logger.Info("Telemost connection added to session",
+			"index", i,
+			"session_id", fmt.Sprintf("%x", firstSessionID),
+			"total_conns", count,
+		)
+	}
+
+	if added.Load() == 0 {
+		return fmt.Errorf("no Telemost connections passed handshake")
+	}
+
+	s.cfg.Logger.Info("Telemost server ready", "active_conns", sess.m.ActiveConns())
+
+	// Wait for session to end (getOrCreateSession manages stream accept loop).
+	<-sess.m.Dead()
+	return nil
 }
 
 // --- Relay mode ---

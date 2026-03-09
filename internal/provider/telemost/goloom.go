@@ -6,13 +6,29 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 )
+
+// Participant holds metadata about a conference participant.
+type Participant struct {
+	ID             string
+	Name           string
+	Description    string
+	SendVideo      bool
+	DisconnectedAt int64
+}
+
+// IsLive returns true if the participant is connected and sending video.
+func (p Participant) IsLive() bool {
+	return p.DisconnectedAt == 0 && p.SendVideo
+}
 
 // GoloomClient manages the WebSocket connection to the Goloom media server
 // and handles the signaling protocol for WebRTC session establishment.
@@ -28,6 +44,15 @@ type GoloomClient struct {
 	subOffer   chan string // subscriberSdpOffer (may receive multiple)
 	serverICE  chan iceCandidate
 	serverHelloData *serverHello
+
+	// Participant tracking from updateDescription + upsertDescription.
+	peerUpdates   chan []Participant // all participant updates (initial + incremental)
+	upsertUpdates chan []Participant // only incremental upserts (new joiners)
+
+	// New peer discovery from slotsConfig (for server-side pairing).
+	knownPeers       sync.Map     // map[string]bool — IDs we've already seen
+	newPeerCh        chan string   // newly discovered participant IDs
+	discoveryEnabled atomic.Bool   // gate: parseSlotsConfig ignores peers until enabled
 
 	pubOfferUID string // UID of the last publisherSdpOffer sent
 
@@ -58,13 +83,16 @@ func ConnectGoloom(ctx context.Context, conf *conferenceInfo, logger *slog.Logge
 	}
 
 	gc := &GoloomClient{
-		conn:      conn,
-		logger:    logger,
-		pubAnswer: make(chan string, 1),
-		pubError:  make(chan string, 1),
-		subOffer:  make(chan string, 4),
-		serverICE: make(chan iceCandidate, 32),
-		closeCh:   make(chan struct{}),
+		conn:        conn,
+		logger:      logger,
+		pubAnswer:   make(chan string, 1),
+		pubError:    make(chan string, 1),
+		subOffer:    make(chan string, 4),
+		serverICE:   make(chan iceCandidate, 32),
+		peerUpdates:   make(chan []Participant, 8),
+		upsertUpdates: make(chan []Participant, 8),
+		newPeerCh:     make(chan string, 16),
+		closeCh:     make(chan struct{}),
 	}
 
 	// Send hello.
@@ -234,8 +262,9 @@ func (gc *GoloomClient) SendPublisherTrackDescription(sendAudio, sendVideo bool)
 
 // SendSetSlots tells the SFU what video slots we want to receive.
 func (gc *GoloomClient) SendSetSlots() error {
-	// Request enough slots to cover all participants (including stale ones).
-	slots := make([]map[string]interface{}, 12)
+	// Use enough slots to cover ghost participants from previous sessions
+	// plus live participants. SFU only forwards video for active slots.
+	slots := make([]map[string]interface{}, 8)
 	for i := range slots {
 		slots[i] = map[string]interface{}{
 			"width":  640,
@@ -246,8 +275,8 @@ func (gc *GoloomClient) SendSetSlots() error {
 		"uid": uuid.New().String(),
 		"setSlots": map[string]interface{}{
 			"slots":              slots,
-			"audioSlotsCount":    8,
-			"withSelfView":      false,
+			"audioSlotsCount":    1,
+			"withSelfView":       false,
 			"selfViewVisibility": "HIDDEN",
 		},
 	}
@@ -273,10 +302,346 @@ func (gc *GoloomClient) RecvICECandidate() <-chan iceCandidate {
 	return gc.serverICE
 }
 
-// Close closes the Goloom WebSocket connection.
+// parseUpdateDescription extracts participant info from an updateDescription message.
+func (gc *GoloomClient) parseUpdateDescription(raw json.RawMessage) {
+	var desc struct {
+		Description []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				SendVideo   bool   `json:"sendVideo"`
+			} `json:"meta"`
+			DisconnectedAt int64 `json:"disconnectedAt,omitempty"`
+		} `json:"description"`
+	}
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return
+	}
+	peers := make([]Participant, len(desc.Description))
+	for i, d := range desc.Description {
+		peers[i] = Participant{
+			ID:             d.ID,
+			Name:           d.Meta.Name,
+			Description:    d.Meta.Description,
+			SendVideo:      d.Meta.SendVideo,
+			DisconnectedAt: d.DisconnectedAt,
+		}
+		// Mark all participants from updateDescription as known
+		// (self, ghosts, other server peers) for slotsConfig-based discovery.
+		gc.knownPeers.Store(d.ID, true)
+	}
+	select {
+	case gc.peerUpdates <- peers:
+	default:
+		// Drop oldest, push new.
+		select {
+		case <-gc.peerUpdates:
+		default:
+		}
+		gc.peerUpdates <- peers
+	}
+}
+
+// parseUpsertDescription pushes incremental participant updates to upsertUpdates channel.
+// Only called for upsertDescription messages (not initial updateDescription).
+func (gc *GoloomClient) parseUpsertDescription(raw json.RawMessage) {
+	var desc struct {
+		Description []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				SendVideo   bool   `json:"sendVideo"`
+			} `json:"meta"`
+			DisconnectedAt int64 `json:"disconnectedAt,omitempty"`
+		} `json:"description"`
+	}
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return
+	}
+	peers := make([]Participant, len(desc.Description))
+	for i, d := range desc.Description {
+		peers[i] = Participant{
+			ID:             d.ID,
+			Name:           d.Meta.Name,
+			Description:    d.Meta.Description,
+			SendVideo:      d.Meta.SendVideo,
+			DisconnectedAt: d.DisconnectedAt,
+		}
+	}
+	select {
+	case gc.upsertUpdates <- peers:
+	default:
+		select {
+		case <-gc.upsertUpdates:
+		default:
+		}
+		gc.upsertUpdates <- peers
+	}
+}
+
+// WaitForNewPeerByName blocks until a NEWLY joined participant with the given
+// name appears via upsertDescription. Unlike WaitForPeer, this ignores
+// participants from the initial updateDescription (existing/ghost participants).
+func (gc *GoloomClient) WaitForNewPeerByName(ctx context.Context, peerName string) (string, error) {
+	for {
+		select {
+		case peers := <-gc.upsertUpdates:
+			for _, p := range peers {
+				if p.Name == peerName && p.IsLive() {
+					return p.ID, nil
+				}
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-gc.closeCh:
+			return "", fmt.Errorf("goloom closed")
+		}
+	}
+}
+
+// parseParticipantConnected handles a participantConnected event from the SFU.
+// This fires when a new participant joins the conference and is the primary
+// way existing participants learn about new joiners (updateDescription is only
+// sent once, at initial connection).
+func (gc *GoloomClient) parseParticipantConnected(raw json.RawMessage) {
+	var pc struct {
+		ID   string `json:"id"`
+		Meta struct {
+			Name      string `json:"name"`
+			SendVideo bool   `json:"sendVideo"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(raw, &pc); err != nil {
+		return
+	}
+	if pc.ID == "" {
+		return
+	}
+	peers := []Participant{{
+		ID:        pc.ID,
+		Name:      pc.Meta.Name,
+		SendVideo: pc.Meta.SendVideo,
+	}}
+	select {
+	case gc.peerUpdates <- peers:
+	default:
+		select {
+		case <-gc.peerUpdates:
+		default:
+		}
+		gc.peerUpdates <- peers
+	}
+}
+
+// AddKnownPeer marks a participant ID as known (self, ghost, or already-paired).
+// Known peers are excluded from WaitForNewPeer results.
+func (gc *GoloomClient) AddKnownPeer(id string) {
+	gc.knownPeers.Store(id, true)
+}
+
+// EnableDiscovery enables slotsConfig-based peer discovery.
+// Must be called after all known peers (own server participants) are registered.
+func (gc *GoloomClient) EnableDiscovery() {
+	gc.discoveryEnabled.Store(true)
+}
+
+// parseSlotsConfig extracts participant IDs from a slotsConfig message
+// and pushes newly discovered (unknown) IDs to the newPeerCh channel.
+func (gc *GoloomClient) parseSlotsConfig(raw json.RawMessage) {
+	if !gc.discoveryEnabled.Load() {
+		return
+	}
+	var sc struct {
+		Slots []struct {
+			Participant          *struct{ ParticipantId string `json:"participantId"` } `json:"participant,omitempty"`
+			ParticipantVideoByMid *struct{ ParticipantId string `json:"participantId"` } `json:"participantVideoByMid,omitempty"`
+		} `json:"slots"`
+	}
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		return
+	}
+	for _, slot := range sc.Slots {
+		var pid string
+		if slot.ParticipantVideoByMid != nil {
+			pid = slot.ParticipantVideoByMid.ParticipantId
+		} else if slot.Participant != nil {
+			pid = slot.Participant.ParticipantId
+		}
+		if pid == "" {
+			continue
+		}
+		if _, known := gc.knownPeers.Load(pid); known {
+			continue
+		}
+		gc.knownPeers.Store(pid, true)
+		select {
+		case gc.newPeerCh <- pid:
+		default:
+		}
+	}
+}
+
+// WaitForNewPeer blocks until a previously-unknown participant ID appears
+// in slotsConfig. Used by the server which can't see participant names
+// (updateDescription is only sent at join time, not to existing participants).
+func (gc *GoloomClient) WaitForNewPeer(ctx context.Context) (string, error) {
+	select {
+	case id := <-gc.newPeerCh:
+		return id, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-gc.closeCh:
+		return "", fmt.Errorf("goloom closed")
+	}
+}
+
+// WaitForPeer blocks until a live participant with the given name appears
+// in updateDescription. Returns the participant ID.
+func (gc *GoloomClient) WaitForPeer(ctx context.Context, peerName string) (string, error) {
+	for {
+		select {
+		case peers := <-gc.peerUpdates:
+			for _, p := range peers {
+				if p.Name == peerName && p.IsLive() {
+					return p.ID, nil
+				}
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-gc.closeCh:
+			return "", fmt.Errorf("goloom closed")
+		}
+	}
+}
+
+// FindAllPeersByName collects all live participants matching peerName from
+// the initial updateDescription batch. If a match appears in upsertUpdates
+// (fresh joiner, definitely not a ghost), it is returned immediately as the
+// sole candidate. Returns at least one candidate or an error.
+func (gc *GoloomClient) FindAllPeersByName(ctx context.Context, peerName string) ([]Participant, error) {
+	for {
+		select {
+		case peers := <-gc.peerUpdates:
+			var matches []Participant
+			for _, p := range peers {
+				if p.Name == peerName && p.IsLive() {
+					matches = append(matches, p)
+				}
+			}
+			if len(matches) > 0 {
+				return matches, nil
+			}
+		case peers := <-gc.upsertUpdates:
+			// Fresh joiner — definitely not a ghost.
+			for _, p := range peers {
+				if p.Name == peerName && p.IsLive() {
+					return []Participant{p}, nil
+				}
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-gc.closeCh:
+			return nil, fmt.Errorf("goloom closed")
+		}
+	}
+}
+
+// SendVPNReady updates our participant description to "vpn-ready:<nonce>" via updateMe.
+// The nonce is a hex-encoded random value used to derive a session-specific obfuscation
+// key, preventing ghost participants from previous sessions with the same token from
+// interfering with SSRC locking. Returns the nonce.
+func (gc *GoloomClient) SendVPNReady(name string, nonce string) error {
+	desc := "vpn-ready:" + nonce
+	msg := map[string]interface{}{
+		"uid": uuid.New().String(),
+		"updateMe": map[string]interface{}{
+			"participantMeta": map[string]interface{}{
+				"name":        name,
+				"description": desc,
+				"role":        "SPEAKER",
+				"sendAudio":   true,
+				"sendVideo":   true,
+			},
+			"participantAttributes": map[string]interface{}{
+				"name":        name,
+				"role":        "SPEAKER",
+				"description": desc,
+			},
+			"sendAudio":   true,
+			"sendVideo":   true,
+			"sendSharing": false,
+		},
+	}
+	return gc.writeJSON(msg)
+}
+
+// WaitPeerReady blocks until a participant with the given name has description
+// starting with "vpn-ready:" in an upsertDescription update. Returns the nonce.
+func (gc *GoloomClient) WaitPeerReady(ctx context.Context, peerName string) (string, error) {
+	const prefix = "vpn-ready:"
+	for {
+		select {
+		case peers := <-gc.upsertUpdates:
+			for _, p := range peers {
+				if p.Name == peerName && strings.HasPrefix(p.Description, prefix) && p.IsLive() {
+					return strings.TrimPrefix(p.Description, prefix), nil
+				}
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-gc.closeCh:
+			return "", fmt.Errorf("goloom closed")
+		}
+	}
+}
+
+// PinToPeer sends a setSlots request that pins to a specific participant,
+// ensuring the SFU only forwards that participant's video to us.
+// Uses 8 slots (matching initial SendSetSlots), with the first slot pinned
+// to the target participant and remaining slots empty for SFU auto-fill.
+func (gc *GoloomClient) PinToPeer(participantID string) error {
+	slots := make([]map[string]interface{}, 8)
+	slots[0] = map[string]interface{}{
+		"width":  640,
+		"height": 480,
+		"participant": map[string]interface{}{
+			"participantId": participantID,
+		},
+		"pinned": true,
+		"label":  "camera",
+	}
+	for i := 1; i < len(slots); i++ {
+		slots[i] = map[string]interface{}{
+			"width":  640,
+			"height": 480,
+		}
+	}
+	msg := map[string]interface{}{
+		"uid": uuid.New().String(),
+		"setSlots": map[string]interface{}{
+			"slots":              slots,
+			"audioSlotsCount":    1,
+			"withSelfView":       false,
+			"selfViewVisibility": "HIDDEN",
+		},
+	}
+	gc.logger.Info("pinning to peer", "participant_id", participantID)
+	return gc.writeJSON(msg)
+}
+
+// Close sends a leave message and closes the Goloom WebSocket connection.
+// The leave message tells the SFU to immediately remove this participant,
+// preventing ghost participants from accumulating in the conference.
 func (gc *GoloomClient) Close() error {
 	gc.once.Do(func() {
 		close(gc.closeCh)
+		// Send leave before closing so the SFU removes participant immediately.
+		_ = gc.writeJSON(map[string]interface{}{
+			"uid":   uuid.New().String(),
+			"leave": map[string]interface{}{},
+		})
 		gc.conn.Close()
 	})
 	return nil
@@ -363,6 +728,7 @@ func (gc *GoloomClient) handleMessage(msg []byte) {
 		SubscriberSdpOffer   *sdpPayload      `json:"subscriberSdpOffer,omitempty"`
 		WebrtcIceCandidate   *iceCandidate    `json:"webrtcIceCandidate,omitempty"`
 		UpdateDescription    *json.RawMessage `json:"updateDescription,omitempty"`
+		UpsertDescription    *json.RawMessage `json:"upsertDescription,omitempty"`
 		VadActivity          *json.RawMessage `json:"vadActivity,omitempty"`
 		SlotsConfig          *json.RawMessage `json:"slotsConfig,omitempty"`
 		ParticipantConnected *json.RawMessage `json:"participantConnected,omitempty"`
@@ -423,9 +789,20 @@ func (gc *GoloomClient) handleMessage(msg []byte) {
 
 	if env.SlotsConfig != nil {
 		gc.logger.Info("slotsConfig", "data", string(*env.SlotsConfig))
+		gc.parseSlotsConfig(*env.SlotsConfig)
 	}
 	if env.UpdateDescription != nil {
 		gc.logger.Info("updateDescription", "data", string(*env.UpdateDescription))
+		gc.parseUpdateDescription(*env.UpdateDescription)
+	}
+	if env.UpsertDescription != nil {
+		gc.logger.Info("upsertDescription", "data", string(*env.UpsertDescription))
+		gc.parseUpdateDescription(*env.UpsertDescription)
+		gc.parseUpsertDescription(*env.UpsertDescription)
+	}
+	if env.ParticipantConnected != nil {
+		gc.logger.Info("participantConnected", "data", string(*env.ParticipantConnected))
+		gc.parseParticipantConnected(*env.ParticipantConnected)
 	}
 }
 

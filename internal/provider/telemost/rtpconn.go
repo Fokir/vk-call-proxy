@@ -1,6 +1,7 @@
 package telemost
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -31,7 +32,7 @@ const maxVP8Data = 1100
 
 // writePace is the minimum interval between consecutive VP8 frame writes.
 // Without pacing, burst writes overwhelm the SFU's video forwarding pipeline.
-const writePace = 10 * time.Millisecond
+const writePace = 5 * time.Millisecond
 
 // nackCheckInterval is how often we check for expired NACKs to send.
 const nackCheckInterval = 15 * time.Millisecond
@@ -77,6 +78,14 @@ type RTPConn struct {
 	nextReadSeq uint16     // next expected write-sequence for ordered delivery
 	nrsMu       sync.Mutex // protects nextReadSeq for cross-goroutine reads
 	orderedCh   chan []byte
+
+	// Reset channels for switching to a new peer after pin.
+	resetReliabilityCh chan struct{} // signals reliabilityLoop to clear FEC state
+	resetReassemblyCh  chan struct{} // signals reassemblyLoop to clear buffers
+
+	// validDataCh is signaled when the first valid VP8 data is decoded after a reset.
+	// Used by ConnectPaired to probe whether a pinned candidate is the real peer.
+	validDataCh chan struct{}
 }
 
 type reassemblyBuf struct {
@@ -95,21 +104,50 @@ func DeriveObfuscationKey(passphrase string) [32]byte {
 	return sha256.Sum256([]byte(passphrase + "\x00obfuscate"))
 }
 
+// DeriveIndexedObfuscationKey derives a per-connection obfuscation key.
+// Each connection pair (server[i], client[i]) uses a unique key so that
+// VP8 data from other connections in the same conference is rejected by
+// extractVP8Data (magic mismatch after deobfuscation).
+func DeriveIndexedObfuscationKey(passphrase string, index int) [32]byte {
+	if passphrase == "" {
+		passphrase = "call-vpn-default-obfuscation"
+	}
+	return sha256.Sum256([]byte(fmt.Sprintf("%s\x00obfuscate\x00%d", passphrase, index)))
+}
+
+// DeriveSessionObfuscationKey derives a session-specific obfuscation key by mixing
+// the base key (from token+index) with a random nonce exchanged through Goloom WS.
+// This ensures ghost participants from previous sessions can't produce valid VP8 data.
+func DeriveSessionObfuscationKey(passphrase string, index int, nonce string) [32]byte {
+	if passphrase == "" {
+		passphrase = "call-vpn-default-obfuscation"
+	}
+	return sha256.Sum256([]byte(fmt.Sprintf("%s\x00obfuscate\x00%d\x00%s", passphrase, index, nonce)))
+}
+
+// SetObfKey updates the obfuscation key. Used after session nonce exchange.
+func (c *RTPConn) SetObfKey(key [32]byte) {
+	c.obfKey = key
+}
+
 // NewRTPConn creates a bidirectional connection using RTP video tracks.
 // obfKey is used to XOR-mask VP8 payload data (hiding protocol signatures).
 func NewRTPConn(pubTrack *webrtc.TrackLocalStaticSample, obfKey [32]byte) *RTPConn {
 	c := &RTPConn{
-		pubTrack:   pubTrack,
-		obfKey:     obfKey,
-		closeCh:    make(chan struct{}),
-		rawPktCh:   make(chan []byte, 256),
-		readCh:     make(chan []byte, 256),
-		reassembly: make(map[uint16]*reassemblyBuf),
-		orderedCh:  make(chan []byte, 64),
-		fecEncoder: NewFECEncoder(),
-		fecDecoder: NewFECDecoder(),
-		retxBuf:    &RetransmitBuffer{},
-		nackTrack:  NewNACKTracker(),
+		pubTrack:           pubTrack,
+		obfKey:             obfKey,
+		closeCh:            make(chan struct{}),
+		rawPktCh:           make(chan []byte, 256),
+		readCh:             make(chan []byte, 256),
+		reassembly:         make(map[uint16]*reassemblyBuf),
+		orderedCh:          make(chan []byte, 64),
+		fecEncoder:         NewFECEncoder(),
+		fecDecoder:         NewFECDecoder(),
+		retxBuf:            &RetransmitBuffer{},
+		nackTrack:          NewNACKTracker(),
+		resetReliabilityCh: make(chan struct{}, 1),
+		resetReassemblyCh:  make(chan struct{}, 1),
+		validDataCh:        make(chan struct{}, 1),
 	}
 	go c.reliabilityLoop()
 	go c.reassemblyLoop()
@@ -151,6 +189,22 @@ func (c *RTPConn) reassemblyLoop() {
 				stallTimer.Stop()
 			}
 			return
+
+		case <-c.resetReassemblyCh:
+			c.reassembly = make(map[uint16]*reassemblyBuf)
+			if stallTimer != nil {
+				stallTimer.Stop()
+				stallCh = nil
+			}
+			// Drain stale chunks from readCh.
+		drainRead:
+			for {
+				select {
+				case <-c.readCh:
+				default:
+					break drainRead
+				}
+			}
 
 		case <-stallCh:
 			// Check if the stalled sequence was recovered while we waited.
@@ -280,6 +334,17 @@ func (c *RTPConn) reliabilityLoop() {
 		select {
 		case <-c.closeCh:
 			return
+		case <-c.resetReliabilityCh:
+			c.fecDecoder = NewFECDecoder()
+			// Drain stale packets from rawPktCh.
+		drainRaw:
+			for {
+				select {
+				case <-c.rawPktCh:
+				default:
+					break drainRaw
+				}
+			}
 		case raw, ok := <-c.rawPktCh:
 			if !ok {
 				return
@@ -545,7 +610,14 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 					if c.lockedSSRC == 0 {
 						if nrs == 0 || seqClose(writeSeq, nrs) {
 							c.lockedSSRC = ssrc
-							slog.Info("rtpconn: locked to SSRC", "ssrc", ssrc, "writeSeq", writeSeq, "nextReadSeq", nrs)
+							// Sync nextReadSeq to the peer's current writeSeq so
+							// reassembly doesn't stall waiting for seq 0 after retries.
+							if nrs == 0 && writeSeq != 0 {
+								c.nrsMu.Lock()
+								c.nextReadSeq = writeSeq
+								c.nrsMu.Unlock()
+							}
+							slog.Info("rtpconn: locked to SSRC", "ssrc", ssrc, "writeSeq", writeSeq, "nextReadSeq", c.getNextReadSeq())
 						} else {
 							c.lockedMu.Unlock()
 							slog.Info("rtpconn: rejected SSRC (seq mismatch)", "ssrc", ssrc, "writeSeq", writeSeq, "nextReadSeq", nrs)
@@ -560,10 +632,27 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 				}
 			}
 
+			// Re-check: another goroutine may have locked to a different SSRC
+			// between the initial check (locked == 0) and now. Drop data if
+			// we're not the locked SSRC to prevent mixing data from multiple tracks.
+			c.lockedMu.Lock()
+			locked = c.lockedSSRC
+			c.lockedMu.Unlock()
+			if locked != 0 && locked != ssrc {
+				continue
+			}
+
 			// Copy data before sending — extractVP8Data returns a sub-slice of
 			// frameBuf which gets overwritten on the next RTP packet.
 			dataCopy := make([]byte, len(data))
 			copy(dataCopy, data)
+
+			// Signal that we received valid VP8 data (correct obfKey).
+			select {
+			case c.validDataCh <- struct{}{}:
+			default:
+			}
+
 			select {
 			case c.rawPktCh <- dataCopy:
 			case <-c.closeCh:
@@ -682,6 +771,66 @@ func (c *RTPConn) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// ResetSSRC performs a full state reset for switching to a new peer after pin.
+// Clears SSRC lock, resets all sequence counters, and signals background loops
+// to discard stale data from the previous peer.
+func (c *RTPConn) ResetSSRC() {
+	// Clear SSRC lock — allow locking to new peer's track.
+	c.lockedMu.Lock()
+	c.lockedSSRC = 0
+	c.lockedMu.Unlock()
+
+	// Reset read sequence — new peer starts from writeSeq=0.
+	c.nrsMu.Lock()
+	c.nextReadSeq = 0
+	c.nrsMu.Unlock()
+
+	// Reset write sequences — our writes should start from 0 for the new peer.
+	c.seqMu.Lock()
+	c.seqNum = 0
+	c.lastWrite = time.Time{}
+	c.seqMu.Unlock()
+
+	c.pktSeqMu.Lock()
+	c.nextPktSeq = 0
+	c.pktSeqMu.Unlock()
+
+	// Reset reliability components (thread-safe via their own mutexes).
+	c.nackTrack.Reset()
+	c.retxBuf.Reset()
+	c.fecEncoder = NewFECEncoder() // safe: Write() not called during pin
+
+	// Signal reliabilityLoop to clear FEC decoder state.
+	select {
+	case c.resetReliabilityCh <- struct{}{}:
+	default:
+	}
+	// Signal reassemblyLoop to clear reassembly buffers.
+	select {
+	case c.resetReassemblyCh <- struct{}{}:
+	default:
+	}
+	// Drain validDataCh so WaitValidData re-waits for fresh data.
+	select {
+	case <-c.validDataCh:
+	default:
+	}
+}
+
+// WaitValidData blocks until the first valid VP8 data is received after a
+// ResetSSRC, or the context expires. Used to probe whether a pinned candidate
+// is the real peer (correct obfuscation key) or a ghost.
+func (c *RTPConn) WaitValidData(ctx context.Context) error {
+	select {
+	case <-c.validDataCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closeCh:
+		return fmt.Errorf("connection closed")
+	}
 }
 
 func (c *RTPConn) Close() error {

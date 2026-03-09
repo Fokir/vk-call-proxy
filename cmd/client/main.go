@@ -95,11 +95,16 @@ func runTelemost(ctx context.Context, logger *slog.Logger, siren *monitoring.Sir
 
 	logger.Info("starting Telemost WebRTC mode", "service", svc.Name(), "conns", numConns)
 
+	// Derive deterministic display names from auth token for 1:1 pairing.
+	serverNames, clientNames := provider.DeriveDisplayNames(authToken, numConns)
+
 	var muxConns []io.ReadWriteCloser
 	var cleanups []func()
 
 	for i := 0; i < numConns; i++ {
-		conn, cleanup, err := svc.Connect(ctx, logger.With("index", i))
+		myName := clientNames[i]
+		peerName := serverNames[i]
+		conn, cleanup, err := svc.ConnectPaired(ctx, logger.With("index", i), myName, peerName, i)
 		if err != nil {
 			logger.Warn("Telemost WebRTC connection failed", "index", i, "err", err)
 			continue
@@ -120,22 +125,32 @@ func runTelemost(ctx context.Context, logger *slog.Logger, siren *monitoring.Sir
 		os.Exit(1)
 	}
 
-	// Send auth token on each connection before MUX takes over.
-	if authToken != "" {
-		var authed []io.ReadWriteCloser
-		for i, conn := range muxConns {
+	// Send auth token + session UUID on each connection before MUX takes over.
+	sessionID := uuid.New()
+	var sid [16]byte
+	copy(sid[:], sessionID[:])
+	logger.Info("session (Telemost)", "id", sessionID.String())
+
+	var ready []io.ReadWriteCloser
+	for i, conn := range muxConns {
+		if authToken != "" {
 			if err := mux.WriteAuthToken(conn, authToken); err != nil {
 				logger.Warn("write auth token failed (telemost)", "index", i, "err", err)
 				conn.Close()
 				continue
 			}
-			authed = append(authed, conn)
 		}
-		muxConns = authed
-		if len(muxConns) == 0 {
-			logger.Error("all Telemost connections failed auth handshake")
-			os.Exit(1)
+		if err := mux.WriteSessionID(conn, sid); err != nil {
+			logger.Warn("write session ID failed (telemost)", "index", i, "err", err)
+			conn.Close()
+			continue
 		}
+		ready = append(ready, conn)
+	}
+	muxConns = ready
+	if len(muxConns) == 0 {
+		logger.Error("all Telemost connections failed handshake")
+		os.Exit(1)
 	}
 
 	m := mux.New(logger, muxConns...)

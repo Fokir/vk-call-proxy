@@ -36,6 +36,13 @@ func (rb *RetransmitBuffer) Store(pktSeq uint16, chunkPayload []byte) {
 	}
 }
 
+// Reset clears all stored retransmission data for a new peer connection.
+func (rb *RetransmitBuffer) Reset() {
+	rb.mu.Lock()
+	rb.buf = [retxBufSize]retxEntry{}
+	rb.mu.Unlock()
+}
+
 // Get retrieves a stored packet. Returns nil if not found or overwritten.
 func (rb *RetransmitBuffer) Get(pktSeq uint16) []byte {
 	rb.mu.Lock()
@@ -147,6 +154,16 @@ func (nt *NACKTracker) GetNACKs() []uint16 {
 		}
 	}
 	return nacks
+}
+
+// Reset clears all tracker state for a new peer connection.
+func (nt *NACKTracker) Reset() {
+	nt.mu.Lock()
+	nt.gaps = make(map[uint16]*gapEntry)
+	nt.received = make(map[uint16]bool)
+	nt.nextExpect = 0
+	nt.initialized = false
+	nt.mu.Unlock()
 }
 
 // Prune removes gap entries older than the given minimum pktSeq.

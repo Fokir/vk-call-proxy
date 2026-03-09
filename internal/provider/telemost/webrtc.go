@@ -13,7 +13,7 @@ import (
 
 const (
 	sdpTimeout    = 15 * time.Second
-	dcOpenTimeout = 60 * time.Second
+	dcOpenTimeout = 120 * time.Second
 	// Interval for sending keepalive VP8 frames to keep the SFU forwarding active.
 	videoKeepAliveInterval = 100 * time.Millisecond
 )
@@ -40,7 +40,7 @@ type WebRTCTransport struct {
 // and returns a bidirectional RTPConn for VPN data.
 // Blocks until the subscriber receives a video track from another participant.
 func EstablishWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger, obfKey [32]byte) (*RTPConn, error) {
-	t, err := SetupWebRTC(ctx, goloom, logger, obfKey)
+	t, err := SetupWebRTC(ctx, goloom, logger, obfKey, "vpn-peer")
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +55,8 @@ func EstablishWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Log
 
 // SetupWebRTC creates WebRTC PeerConnections, sends updateMe/setSlots,
 // and starts keepalive. Returns immediately without waiting for subscriber track.
-func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger, obfKey [32]byte) (*WebRTCTransport, error) {
+// The name parameter sets the participant's display name in the conference.
+func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger, obfKey [32]byte, name string) (*WebRTCTransport, error) {
 	iceServers := goloom.ICEServers()
 
 	api := webrtc.NewAPI()
@@ -82,7 +83,7 @@ func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger,
 
 	// Tell SFU we're sending audio and video to activate media forwarding.
 	// Both updateMe and updatePublisherTrackDescription must be sent together.
-	if err := goloom.SendUpdateMe("vpn-peer", true, true); err != nil {
+	if err := goloom.SendUpdateMe(name, true, true); err != nil {
 		t.Close()
 		return nil, fmt.Errorf("send updateMe: %w", err)
 	}
@@ -127,6 +128,20 @@ func (t *WebRTCTransport) WaitReady(ctx context.Context) error {
 // RTPConn returns the RTP connection for reading/writing VPN data.
 func (t *WebRTCTransport) RTPConn() *RTPConn {
 	return t.rtpConn
+}
+
+// ResetForPin resets subscriber readiness and SSRC lock after PinToPeer.
+// This is needed when multiple participants from the same side are in the
+// conference — the subscriber may have locked to the wrong peer's SSRC
+// before pinning narrowed the SFU's video forwarding.
+func (t *WebRTCTransport) ResetForPin() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Don't reset subReady — the SFU reuses the existing VP8 track after pinning.
+	// Just clear SSRC lock so the RTPConn re-locks to the pinned peer's SSRC.
+	if t.rtpConn != nil {
+		t.rtpConn.ResetSSRC()
+	}
 }
 
 func (t *WebRTCTransport) setupPublisher(ctx context.Context, api *webrtc.API, iceServers []webrtc.ICEServer) error {

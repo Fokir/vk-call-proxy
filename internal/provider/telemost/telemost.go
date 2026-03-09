@@ -22,6 +22,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// sortedPairID creates a deterministic nonce from two participant IDs
+// by sorting them lexicographically and concatenating with a separator.
+func sortedPairID(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return a + ":" + b
+}
+
 const (
 	httpTimeout   = 20 * time.Second
 	wsReadTimeout = 15 * time.Second
@@ -35,7 +44,8 @@ const (
 // Service implements provider.Service for Yandex Telemost.
 type Service struct {
 	meetingID string
-	obfKey    [32]byte // XOR obfuscation key for VP8 payload masking
+	authToken string   // stored for per-connection key derivation
+	obfKey    [32]byte // XOR obfuscation key for VP8 payload masking (default, index=0)
 }
 
 // Compile-time check.
@@ -48,6 +58,7 @@ func NewService(meetingURL string, authToken string) *Service {
 	id := extractMeetingID(meetingURL)
 	return &Service{
 		meetingID: id,
+		authToken: authToken,
 		obfKey:    DeriveObfuscationKey(authToken),
 	}
 }
@@ -107,6 +118,10 @@ func (s *Service) ConnectSignaling(_ context.Context, _ *provider.JoinInfo, _ *s
 type PendingConn struct {
 	transport *WebRTCTransport
 	goloom    *GoloomClient
+	peerID    string // our own participant ID in the conference
+	myName    string // our display name for signaling
+	authToken string // for session-specific obfKey derivation
+	index     int    // connection index for obfKey derivation
 }
 
 // WaitReady blocks until the subscriber receives a video track from
@@ -129,10 +144,78 @@ func (pc *PendingConn) Close() {
 	pc.goloom.Close()
 }
 
+// OwnPeerID returns our participant ID in the conference.
+func (pc *PendingConn) OwnPeerID() string {
+	return pc.peerID
+}
+
+// AddKnownPeer marks a participant ID as known (excluded from WaitForNewPeer).
+func (pc *PendingConn) AddKnownPeer(id string) {
+	pc.goloom.AddKnownPeer(id)
+}
+
+// EnableDiscovery enables slotsConfig-based peer discovery on this connection.
+func (pc *PendingConn) EnableDiscovery() {
+	pc.goloom.EnableDiscovery()
+}
+
+// WaitPinReady waits for a peer with the given name to appear via
+// upsertDescription, pins to it, then waits for the subscriber track.
+// Pinning must happen BEFORE waiting for the track because when ghost
+// participants fill all SFU slots, the subscriber gets no video until
+// we explicitly pin to an active publisher.
+func (pc *PendingConn) WaitPinReady(ctx context.Context, logger *slog.Logger, peerName string) (io.ReadWriteCloser, func(), error) {
+	// Wait for the peer to join (via upsertDescription only — ignores pre-existing participants).
+	peerID, err := pc.goloom.WaitForNewPeerByName(ctx, peerName)
+	if err != nil {
+		pc.Close()
+		return nil, nil, fmt.Errorf("wait for peer %q: %w", peerName, err)
+	}
+	logger.Info("peer found by name, pinning", "peer_name", peerName, "peer_id", peerID)
+
+	// Pin first — this makes the SFU assign the active peer to our subscriber slot.
+	if err := pc.goloom.PinToPeer(peerID); err != nil {
+		pc.Close()
+		return nil, nil, fmt.Errorf("pin to peer: %w", err)
+	}
+	pc.transport.ResetForPin()
+
+	// Now wait for subscriber track — should fire quickly after pin to active publisher.
+	if err := pc.transport.WaitReady(ctx); err != nil {
+		pc.Close()
+		return nil, nil, err
+	}
+
+	// Derive session-specific obfuscation key from both participant IDs.
+	sessionKey := DeriveSessionObfuscationKey(pc.authToken, pc.index, sortedPairID(pc.peerID, peerID))
+	pc.transport.RTPConn().SetObfKey(sessionKey)
+	logger.Info("session obfKey set", "my_id", pc.peerID[:8], "peer_id", peerID[:8])
+
+	cleanup := func() {
+		pc.transport.Close()
+		pc.goloom.Close()
+	}
+	return pc.transport.RTPConn(), cleanup, nil
+}
+
 // Setup joins a Telemost meeting and sets up WebRTC PeerConnections
 // without blocking on the other peer. Returns a PendingConn that must
 // be completed with WaitReady once the other peer has joined.
 func (s *Service) Setup(ctx context.Context, logger *slog.Logger) (*PendingConn, error) {
+	return s.SetupNamed(ctx, logger, "vpn-peer")
+}
+
+// SetupNamed is like Setup but uses a custom participant name.
+// Uses the default obfuscation key (index=0).
+func (s *Service) SetupNamed(ctx context.Context, logger *slog.Logger, name string) (*PendingConn, error) {
+	return s.SetupNamedIndexed(ctx, logger, name, 0)
+}
+
+// SetupNamedIndexed is like SetupNamed but uses a per-connection obfuscation key
+// derived from the auth token and connection index. This ensures that each
+// connection pair (server[i], client[i]) uses a unique key, preventing
+// cross-talk between connections sharing the same Telemost conference.
+func (s *Service) SetupNamedIndexed(ctx context.Context, logger *slog.Logger, name string, index int) (*PendingConn, error) {
 	client := &http.Client{
 		Timeout: httpTimeout,
 		Transport: &http.Transport{
@@ -155,13 +238,14 @@ func (s *Service) Setup(ctx context.Context, logger *slog.Logger) (*PendingConn,
 		return nil, fmt.Errorf("goloom connect: %w", err)
 	}
 
-	transport, err := SetupWebRTC(ctx, goloom, logger.With("component", "webrtc"), s.obfKey)
+	obfKey := DeriveIndexedObfuscationKey(s.authToken, index)
+	transport, err := SetupWebRTC(ctx, goloom, logger.With("component", "webrtc"), obfKey, name)
 	if err != nil {
 		goloom.Close()
 		return nil, fmt.Errorf("setup webrtc: %w", err)
 	}
 
-	return &PendingConn{transport: transport, goloom: goloom}, nil
+	return &PendingConn{transport: transport, goloom: goloom, peerID: conf.PeerID, myName: name, authToken: s.authToken, index: index}, nil
 }
 
 // Connect joins a Telemost meeting and establishes a WebRTC connection
@@ -172,6 +256,85 @@ func (s *Service) Connect(ctx context.Context, logger *slog.Logger) (io.ReadWrit
 	if err != nil {
 		return nil, nil, err
 	}
+	return pc.WaitReady(ctx)
+}
+
+// ConnectPaired joins a Telemost meeting with a named participant,
+// waits for a specific peer by name, pins video to that peer,
+// then waits for the connection to be ready.
+// index is used to derive a per-connection obfuscation key.
+//
+// When ghost participants from previous sessions are in the conference with
+// the same display name, ConnectPaired probes each candidate with a short
+// VP8 data validity check (correct obfuscation key → valid magic).
+func (s *Service) ConnectPaired(ctx context.Context, logger *slog.Logger, myName, peerName string, index int) (io.ReadWriteCloser, func(), error) {
+	pc, err := s.SetupNamedIndexed(ctx, logger, myName, index)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Collect all candidates matching the peer name (may include ghosts).
+	// NOTE: Do NOT call WaitReady here — the SFU may assign ghost slots initially,
+	// and the subscriber video track only fires after pinning to an active publisher.
+	candidates, err := pc.goloom.FindAllPeersByName(ctx, peerName)
+	if err != nil {
+		pc.Close()
+		return nil, nil, fmt.Errorf("find peer %q: %w", peerName, err)
+	}
+	logger.Info("peer candidates found", "name", peerName, "count", len(candidates))
+
+	// Single candidate — pin and wait for subscriber track (old behavior).
+	if len(candidates) == 1 {
+		return s.pinAndFinish(ctx, pc, candidates[0].ID, logger)
+	}
+
+	// Multiple candidates — probe each to find the one with matching obfKey.
+	const probeTimeout = 5 * time.Second
+	for i, cand := range candidates {
+		logger.Info("probing candidate", "i", i, "id", cand.ID[:8], "name", cand.Name)
+
+		if err := pc.goloom.PinToPeer(cand.ID); err != nil {
+			logger.Warn("pin failed, skipping", "id", cand.ID[:8], "err", err)
+			continue
+		}
+		pc.transport.ResetForPin()
+
+		sessionKey := DeriveSessionObfuscationKey(pc.authToken, pc.index, sortedPairID(pc.peerID, cand.ID))
+		pc.transport.RTPConn().SetObfKey(sessionKey)
+
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		err := pc.transport.RTPConn().WaitValidData(probeCtx)
+		cancel()
+
+		if err == nil {
+			logger.Info("valid data from candidate", "id", cand.ID[:8])
+			cleanup := func() {
+				pc.transport.Close()
+				pc.goloom.Close()
+			}
+			return pc.transport.RTPConn(), cleanup, nil
+		}
+		logger.Info("candidate rejected (no valid data)", "id", cand.ID[:8], "err", err)
+	}
+
+	pc.Close()
+	return nil, nil, fmt.Errorf("no valid peer found among %d candidates for %q", len(candidates), peerName)
+}
+
+// pinAndFinish pins to a single peer candidate, waits for subscriber track, and returns.
+func (s *Service) pinAndFinish(ctx context.Context, pc *PendingConn, peerID string, logger *slog.Logger) (io.ReadWriteCloser, func(), error) {
+	logger.Info("peer found, pinning", "peer_id", peerID)
+
+	if err := pc.goloom.PinToPeer(peerID); err != nil {
+		pc.Close()
+		return nil, nil, fmt.Errorf("pin to peer: %w", err)
+	}
+	pc.transport.ResetForPin()
+
+	sessionKey := DeriveSessionObfuscationKey(pc.authToken, pc.index, sortedPairID(pc.peerID, peerID))
+	pc.transport.RTPConn().SetObfKey(sessionKey)
+	logger.Info("session obfKey set", "my_id", pc.peerID[:8], "peer_id", peerID[:8])
+
 	return pc.WaitReady(ctx)
 }
 

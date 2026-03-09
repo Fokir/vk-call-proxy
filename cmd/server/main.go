@@ -19,6 +19,7 @@ func main() {
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
 	callLink := flag.String("link", "", "call link ID for relay-to-relay mode (env: VK_CALL_LINK)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
+	numConns := flag.Int("n", 1, "number of parallel connections (Telemost mode)")
 	flag.Parse()
 
 	if *authToken == "" {
@@ -34,6 +35,7 @@ func main() {
 		ListenAddr: *listenAddr,
 		AuthToken:  *authToken,
 		UseTCP:     *useTCP,
+		NumConns:   *numConns,
 		Logger:     logger,
 	}
 
