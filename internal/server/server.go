@@ -15,6 +15,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/netstack"
 	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
@@ -94,7 +95,11 @@ func (s *Server) Start(ctx context.Context) {
 	go func() {
 		defer close(s.done)
 		if s.cfg.Service != nil {
-			s.runRelayMode(ctx)
+			if _, ok := s.cfg.Service.(*telemost.Service); ok {
+				s.runTelemostMode(ctx)
+			} else {
+				s.runRelayMode(ctx)
+			}
 		} else {
 			s.runDirectMode(ctx)
 		}
@@ -265,6 +270,96 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 	}()
 
 	return sess
+}
+
+// --- Telemost mode ---
+
+func (s *Server) runTelemostMode(ctx context.Context) {
+	tmSvc := s.cfg.Service.(*telemost.Service)
+	s.cfg.Logger.Info("starting Telemost WebRTC mode", "service", tmSvc.Name())
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.cfg.Logger.Info("waiting for client session (Telemost)...")
+		err := s.runOneTelemostSession(ctx, tmSvc)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			s.cfg.Logger.Warn("Telemost session failed", "err", err)
+		} else {
+			s.cfg.Logger.Info("Telemost session ended")
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+func (s *Server) runOneTelemostSession(ctx context.Context, svc *telemost.Service) error {
+	conn, cleanup, err := svc.Connect(ctx, s.cfg.Logger.With("component", "telemost"))
+	if err != nil {
+		return fmt.Errorf("telemost connect: %w", err)
+	}
+	defer cleanup()
+
+	s.cfg.Logger.Info("Telemost WebRTC connection established")
+
+	m := mux.New(s.cfg.Logger, conn)
+	defer m.Close()
+
+	m.EnableRawPackets(256)
+	m.EnableStreamAccept(64)
+	m.SetIdleTimeout(90 * time.Second)
+
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+
+	go m.DispatchLoop(sessCtx)
+	go m.StartPingLoop(sessCtx, 10*time.Second)
+
+	ns := netstack.New(s.cfg.Logger, m)
+	if ns != nil {
+		ns.Start(sessCtx)
+		defer ns.Close()
+	}
+
+	// Drain dead connections.
+	go func() {
+		for {
+			select {
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				m.RemoveConn(idx)
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
+
+	s.cfg.Logger.Info("Telemost server ready, accepting streams")
+
+	for {
+		select {
+		case stream, ok := <-m.AcceptedStreams():
+			if !ok {
+				return nil
+			}
+			go handleStream(sessCtx, s.cfg.Logger, stream)
+		case <-m.Dead():
+			return nil
+		case <-sessCtx.Done():
+			return nil
+		}
+	}
 }
 
 // --- Relay mode ---

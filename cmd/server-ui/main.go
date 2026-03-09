@@ -19,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
@@ -308,8 +310,15 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 		authToken = os.Getenv("VPN_TOKEN")
 	}
 
+	var svc provider.Service
+	if telemost.IsTelemostLink(link) {
+		svc = telemost.NewService(link)
+	} else {
+		svc = vk.NewService(link)
+	}
+
 	srvCfg := server.Config{
-		Service:   vk.NewService(link),
+		Service:   svc,
 		AuthToken: authToken,
 		UseTCP:    true,
 		Logger:    logger,

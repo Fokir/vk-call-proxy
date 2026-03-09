@@ -19,6 +19,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	httpproxy "github.com/call-vpn/call-vpn/internal/proxy/http"
 	"github.com/call-vpn/call-vpn/internal/proxy/socks5"
@@ -50,8 +51,13 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	siren := monitoring.New(logger)
 
-	// Create call service provider (VK by default).
-	svc := vk.NewService(*callLink)
+	// Create call service provider (auto-detect from link).
+	var svc provider.Service
+	if telemost.IsTelemostLink(*callLink) {
+		svc = telemost.NewService(*callLink)
+	} else {
+		svc = vk.NewService(*callLink)
+	}
 
 	var bypassMatcher *bypass.Matcher
 	if !*noBypass {
@@ -70,11 +76,59 @@ func main() {
 		cancel()
 	}()
 
-	if *serverAddr != "" {
+	// Telemost uses WebRTC DataChannel through SFU (no raw TURN).
+	if tmSvc, ok := svc.(*telemost.Service); ok {
+		runTelemost(ctx, logger, siren, tmSvc, *numConns, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
+	} else if *serverAddr != "" {
 		runDirect(ctx, logger, siren, svc, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	} else {
 		runRelayToRelay(ctx, logger, siren, svc, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	}
+}
+
+// runTelemost connects through Telemost's Goloom SFU via WebRTC DataChannels.
+// Both client and server join the same Telemost meeting; the SFU forwards
+// DataChannel data between participants.
+func runTelemost(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	svc *telemost.Service, numConns int, socks5Port, httpPort int, bindAddr, authToken string,
+	bypassMatcher *bypass.Matcher) {
+
+	logger.Info("starting Telemost WebRTC mode", "service", svc.Name(), "conns", numConns)
+
+	var muxConns []io.ReadWriteCloser
+	var cleanups []func()
+
+	for i := 0; i < numConns; i++ {
+		conn, cleanup, err := svc.Connect(ctx, logger.With("index", i))
+		if err != nil {
+			logger.Warn("Telemost WebRTC connection failed", "index", i, "err", err)
+			continue
+		}
+		muxConns = append(muxConns, conn)
+		cleanups = append(cleanups, cleanup)
+		logger.Info("Telemost WebRTC connection established", "index", i, "progress", fmt.Sprintf("%d/%d", len(muxConns), numConns))
+	}
+
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	if len(muxConns) == 0 {
+		logger.Error("no Telemost connections established")
+		os.Exit(1)
+	}
+
+	m := mux.New(logger, muxConns...)
+	defer m.Close()
+
+	logger.Info("MUX ready (Telemost)", "active", m.ActiveConns(), "target", numConns)
+
+	go m.DispatchLoop(ctx)
+	go m.StartPingLoop(ctx, 10*time.Second)
+
+	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
 // runDirect connects through TURN to a server listening on a direct UDP address.

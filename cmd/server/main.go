@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
+	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
@@ -38,7 +39,11 @@ func main() {
 
 	// Enable relay-to-relay mode with the appropriate service.
 	if *callLink != "" {
-		cfg.Service = vk.NewService(*callLink)
+		if telemost.IsTelemostLink(*callLink) {
+			cfg.Service = telemost.NewService(*callLink)
+		} else {
+			cfg.Service = vk.NewService(*callLink)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

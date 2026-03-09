@@ -17,6 +17,7 @@ import (
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
@@ -161,7 +162,11 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		cfg.NumConns = 16
 	}
 	t.cfg = cfg
-	t.svc = vk.NewService(cfg.CallLink)
+	if telemost.IsTelemostLink(cfg.CallLink) {
+		t.svc = telemost.NewService(cfg.CallLink)
+	} else {
+		t.svc = vk.NewService(cfg.CallLink)
+	}
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
 	t.networkForce = make(chan struct{}, 1)
