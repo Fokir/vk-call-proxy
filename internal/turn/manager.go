@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/pion/logging"
 	pionTurn "github.com/pion/turn/v4"
 )
@@ -17,7 +18,7 @@ type Allocation struct {
 	Client    *pionTurn.Client
 	RelayConn net.PacketConn
 	RelayAddr net.Addr
-	Creds     *Credentials
+	Creds     *provider.Credentials
 	CreatedAt time.Time
 	conn      net.Conn
 }
@@ -40,22 +41,23 @@ func (a *Allocation) Close() error {
 type Manager struct {
 	mu          sync.Mutex
 	allocations []*Allocation
-	callLink    string
+	creds       provider.CredentialsProvider
 	useTCP      bool
 	logger      *slog.Logger
 }
 
 // NewManager creates a TURN allocation manager.
-func NewManager(callLink string, useTCP bool, logger *slog.Logger) *Manager {
+// The creds provider is called for each allocation to obtain TURN credentials.
+func NewManager(creds provider.CredentialsProvider, useTCP bool, logger *slog.Logger) *Manager {
 	return &Manager{
-		callLink: callLink,
-		useTCP:   useTCP,
-		logger:   logger,
+		creds:  creds,
+		useTCP: useTCP,
+		logger: logger,
 	}
 }
 
 // Allocate creates n new TURN allocations, each with independently fetched
-// anonymous credentials. Returns the successfully created allocations.
+// credentials. Returns the successfully created allocations.
 func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 	var (
 		mu     sync.Mutex
@@ -100,7 +102,7 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 
 func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
 	// Each allocation gets fresh credentials (different anonymous identity)
-	creds, err := FetchCredentials(ctx, m.callLink)
+	creds, err := m.creds.FetchCredentials(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetch credentials: %w", err)
 	}

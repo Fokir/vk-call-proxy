@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
-	"github.com/call-vpn/call-vpn/internal/turn"
+	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 )
 
 type config struct {
@@ -67,18 +67,19 @@ func main() {
 		cancel()
 	}()
 
-	// fetch VK join response for signaling
-	logger.Info("fetching VK credentials...")
-	jr, err := turn.FetchJoinResponse(ctx, cfg.callLink)
+	// Create call service and fetch join info for signaling.
+	svc := vk.NewService(cfg.callLink)
+	logger.Info("fetching credentials...", "service", svc.Name())
+	jr, err := svc.FetchJoinInfo(ctx)
 	if err != nil {
-		logger.Error("fetch join response failed", "err", err)
+		logger.Error("fetch join info failed", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("VK credentials obtained", "ws_endpoint", jr.WSEndpoint[:50]+"...")
+	logger.Info("credentials obtained", "ws_endpoint", jr.WSEndpoint[:50]+"...")
 
 	// connect to signaling
-	logger.Info("connecting to VK signaling...")
-	sig, err := internalsignal.Connect(ctx, jr.WSEndpoint, logger.With("component", "signal"))
+	logger.Info("connecting to signaling...")
+	sig, err := svc.ConnectSignaling(ctx, jr, logger.With("component", "signal"))
 	if err != nil {
 		logger.Error("signaling connect failed", "err", err)
 		os.Exit(1)
@@ -116,7 +117,7 @@ func main() {
 // syncPeers exchanges a sync message with the peer to ensure both are ready.
 // After receiving peer's sync, sends extra confirmations so the peer also
 // receives at least one message from us.
-func syncPeers(ctx context.Context, sig *internalsignal.Client, tag string) error {
+func syncPeers(ctx context.Context, sig provider.SignalingClient, tag string) error {
 	syncTag := "sync:" + tag
 	myID := sig.PeerID()
 

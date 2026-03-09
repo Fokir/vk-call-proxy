@@ -9,13 +9,14 @@ import (
 	"syscall"
 
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
-	callLink := flag.String("link", "", "VK call link ID for relay-to-relay mode")
+	callLink := flag.String("link", "", "call link ID for relay-to-relay mode (env: VK_CALL_LINK)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	flag.Parse()
 
@@ -31,9 +32,13 @@ func main() {
 	cfg := server.Config{
 		ListenAddr: *listenAddr,
 		AuthToken:  *authToken,
-		CallLink:   *callLink,
 		UseTCP:     *useTCP,
 		Logger:     logger,
+	}
+
+	// Enable relay-to-relay mode with the appropriate service.
+	if *callLink != "" {
+		cfg.Service = vk.NewService(*callLink)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

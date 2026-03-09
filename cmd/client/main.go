@@ -18,6 +18,8 @@ import (
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
+	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	httpproxy "github.com/call-vpn/call-vpn/internal/proxy/http"
 	"github.com/call-vpn/call-vpn/internal/proxy/socks5"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
@@ -28,7 +30,7 @@ import (
 func main() {
 	socks5Port := flag.Int("socks5-port", 1080, "SOCKS5 proxy listen port")
 	httpPort := flag.Int("http-port", 8080, "HTTP/HTTPS proxy listen port")
-	callLink := flag.String("link", "", "VK call link ID (e.g. abcd1234)")
+	callLink := flag.String("link", "", "call link ID (e.g. abcd1234)")
 	numConns := flag.Int("n", 16, "Number of parallel TURN+DTLS connections")
 	useTCP := flag.Bool("tcp", true, "Use TCP for TURN connections")
 	serverAddr := flag.String("server", "", "VPN server address (host:port), empty = relay-to-relay mode")
@@ -40,13 +42,16 @@ func main() {
 
 	if *callLink == "" {
 		fmt.Fprintln(os.Stderr, "Error: --link is required")
-		fmt.Fprintln(os.Stderr, "Usage: client --link=<vk-call-link> [--server=<host:port>] [options]")
+		fmt.Fprintln(os.Stderr, "Usage: client --link=<call-link> [--server=<host:port>] [options]")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	siren := monitoring.New(logger)
+
+	// Create call service provider (VK by default).
+	svc := vk.NewService(*callLink)
 
 	var bypassMatcher *bypass.Matcher
 	if !*noBypass {
@@ -66,15 +71,15 @@ func main() {
 	}()
 
 	if *serverAddr != "" {
-		runDirect(ctx, logger, siren, *callLink, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
+		runDirect(ctx, logger, siren, svc, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	} else {
-		runRelayToRelay(ctx, logger, siren, *callLink, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
+		runRelayToRelay(ctx, logger, siren, svc, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	}
 }
 
 // runDirect connects through TURN to a server listening on a direct UDP address.
 func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
+	svc provider.Service, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
 	bypassMatcher *bypass.Matcher) {
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", server)
@@ -87,8 +92,8 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	logger.Info("session (direct mode)", "id", sessionID.String())
 
 	// 1. Create TURN allocations.
-	logger.Info("establishing TURN connections", "count", numConns, "link", callLink)
-	mgr := turn.NewManager(callLink, useTCP, logger)
+	logger.Info("establishing TURN connections", "count", numConns, "service", svc.Name())
+	mgr := turn.NewManager(svc, useTCP, logger)
 	defer mgr.CloseAll()
 
 	allocs, err := mgr.Allocate(ctx, numConns)
@@ -156,24 +161,24 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
-// runRelayToRelay connects through VK TURN relays to a server that also
-// joins the same VK call. Relay addresses are exchanged via VK WebSocket signaling.
+// runRelayToRelay connects through TURN relays to a server that also
+// joins the same call. Relay addresses are exchanged via signaling.
 func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	callLink string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
+	svc provider.Service, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
 	bypassMatcher *bypass.Matcher) {
 
-	logger.Info("starting relay-to-relay mode", "link", callLink, "conns", numConns)
+	logger.Info("starting relay-to-relay mode", "service", svc.Name(), "conns", numConns)
 
-	// 1. Join VK conference to get TURN creds and WS endpoint.
-	jr, err := turn.FetchJoinResponse(ctx, callLink)
+	// 1. Join conference to get TURN creds and signaling endpoint.
+	jr, err := svc.FetchJoinInfo(ctx)
 	if err != nil {
-		logger.Error("failed to join VK conference", "err", err)
+		logger.Error("failed to join conference", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("joined VK conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+	logger.Info("joined conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
-	// 2. Connect to VK WebSocket signaling.
-	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, logger.With("component", "signaling"))
+	// 2. Connect to signaling.
+	sigClient, err := svc.ConnectSignaling(ctx, jr, logger.With("component", "signaling"))
 	if err != nil {
 		logger.Error("signaling connect failed", "err", err)
 		os.Exit(1)
@@ -189,7 +194,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	_ = sigClient.SendDisconnect(ctx)
 
 	// 3. Create TURN allocations.
-	mgr := turn.NewManager(callLink, useTCP, logger)
+	mgr := turn.NewManager(svc, useTCP, logger)
 	defer mgr.CloseAll()
 
 	allocs, err := mgr.Allocate(ctx, numConns)
@@ -207,7 +212,6 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	}
 
 	// 4. Exchange relay addresses with retry.
-	// Send our addresses periodically until the peer receives them.
 	sendDone := make(chan struct{})
 	sendCtx, sendCancel := context.WithCancel(ctx)
 	go func() {
@@ -331,13 +335,13 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	go m.StartPingLoop(ctx, 10*time.Second)
 	go mgr.StartKeepalive(ctx, 10*time.Second)
 
-	// 9. Start unified reconnect manager (serialized to avoid ackCh mix-up).
+	// 9. Start unified reconnect manager.
 	go reconnectManager(ctx, sigClient, mgr, m, sessionID, authToken, numConns, logger)
 
 	// 10. Monitor signaling for session end.
 	go func() {
 		reason := sigClient.WaitForSessionEnd(ctx)
-		if reason == internalsignal.SessionEndHungup {
+		if reason == provider.SessionEndHungup {
 			logger.Info("signaling hungup (server left call)")
 			sigClient.DrainAndRoute(ctx)
 		}
@@ -347,17 +351,8 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
-// reconnectManager is a unified, serialized reconnect loop. It handles both
-// initially missing connections and runtime deaths. Serialization prevents the
-// ackCh mix-up bug where parallel reconnects receive each other's server
-// responses, causing relay address mismatches and DTLS cookie failures.
-//
-// Two modes:
-//   - Normal: active >= minActive AND healthy — try 5 attempts per conn, then wait for next tick.
-//   - Critical: active < minActive OR unhealthy (no pong for 10s) — retry indefinitely with exp backoff (1s→30s).
-//
-// minActive = max(2, targetConns/2).
-func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
+// reconnectManager is a unified, serialized reconnect loop.
+func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string,
 	targetConns int, logger *slog.Logger) {
 
@@ -408,8 +403,8 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 	defer ticker.Stop()
 
 	const (
-		normalMaxAttempts  = 5
-		maxBackoff         = 30 * time.Second
+		normalMaxAttempts = 5
+		maxBackoff        = 30 * time.Second
 	)
 
 	for {
@@ -491,10 +486,7 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 	}
 }
 
-// reconnectOne allocates a new TURN relay, sends its address to the server
-// via signaling, waits for the server's relay address, then establishes
-// a new DTLS connection and adds it to the MUX.
-func reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
+func reconnectOne(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, ackCh <-chan []byte,
 	sessionID uuid.UUID, authToken string, logger *slog.Logger) error {
 
@@ -640,7 +632,6 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	}()
 
 	// Wait for both proxies or context cancellation.
-	// A single proxy bind failure should not kill the client.
 	remaining := 2
 	for remaining > 0 {
 		select {

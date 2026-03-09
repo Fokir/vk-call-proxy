@@ -13,11 +13,12 @@ import (
 
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/mux"
-	"github.com/call-vpn/call-vpn/internal/signal"
+	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
 
-func benchRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig *signal.Client, isSender bool) ([]BenchResult, error) {
+func benchRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig provider.SignalingClient, isSender bool) ([]BenchResult, error) {
 	var results []BenchResult
 	for run := 0; run < cfg.runs; run++ {
 		logger.Info("raw-dtls run", "run", run+1, "of", cfg.runs)
@@ -37,11 +38,12 @@ func benchRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig *si
 	return results, nil
 }
 
-func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig *signal.Client, isSender bool, run int) (BenchResult, error) {
+func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig provider.SignalingClient, isSender bool, run int) (BenchResult, error) {
 	setupStart := time.Now()
 
 	// allocate TURN
-	mgr := turn.NewManager(cfg.callLink, cfg.useTCP, logger)
+	svc := vk.NewService(cfg.callLink)
+	mgr := turn.NewManager(svc, cfg.useTCP, logger)
 	allocs, err := mgr.Allocate(ctx, cfg.numConns)
 	if err != nil {
 		return BenchResult{}, fmt.Errorf("allocate: %w", err)
@@ -238,15 +240,8 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig *s
 			sent += int64(n)
 
 			// Throttle to prevent pion/turn readCh overflow (1024 buffer).
-			// Receiver processes ~224 frames/s; >this rate causes
-			// HandleInbound to silently drop packets.
-			// 5ms per 1200-byte frame ≈ 1.9 Mbps max write rate.
 			time.Sleep(5 * time.Millisecond)
 		}
-		// Do NOT call stream.Close() here — FrameClose is sent on the fastest
-		// connection and arrives at receiver before data frames still in transit
-		// on other connections, causing premature EOF and data loss.
-		// Instead, receiver counts bytes and we sync via signaling ack.
 		result.BytesSent = sent
 		logger.Info("sender: data written, waiting for receiver ack...", "bytes", sent)
 
@@ -273,9 +268,6 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig *s
 		start := time.Now()
 		var received atomic.Int64
 
-		// Read in a goroutine — exit when we have all expected bytes.
-		// We do NOT rely on EOF because FrameClose arrives before pending
-		// data on other MUX connections, causing premature EOF + data loss.
 		readDone := make(chan error, 1)
 		go func() {
 			var lastLog int64

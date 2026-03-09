@@ -14,16 +14,17 @@ import (
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/netstack"
+	"github.com/call-vpn/call-vpn/internal/provider"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
 
 // Config holds server configuration.
 type Config struct {
-	ListenAddr string // DTLS/UDP listen address for direct mode
-	AuthToken  string // Client authentication token
-	CallLink   string // VK call link ID for relay-to-relay mode
-	UseTCP     bool   // Use TCP for TURN connections
+	ListenAddr string             // DTLS/UDP listen address for direct mode
+	AuthToken  string             // Client authentication token
+	Service    provider.Service   // Call service (VK, MAX, etc.) for relay-to-relay mode; nil = direct only
+	UseTCP     bool               // Use TCP for TURN connections
 	Logger     *slog.Logger
 	Siren      *monitoring.Siren
 }
@@ -92,7 +93,7 @@ func (s *Server) Start(ctx context.Context) {
 	ctx, s.cancel = context.WithCancel(ctx)
 	go func() {
 		defer close(s.done)
-		if s.cfg.CallLink != "" {
+		if s.cfg.Service != nil {
 			s.runRelayMode(ctx)
 		} else {
 			s.runDirectMode(ctx)
@@ -269,7 +270,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 // --- Relay mode ---
 
 func (s *Server) runRelayMode(ctx context.Context) {
-	s.cfg.Logger.Info("starting relay-to-relay mode", "link", s.cfg.CallLink)
+	s.cfg.Logger.Info("starting relay-to-relay mode", "service", s.cfg.Service.Name())
 
 	for {
 		if ctx.Err() != nil {
@@ -296,13 +297,15 @@ func (s *Server) runRelayMode(ctx context.Context) {
 }
 
 func (s *Server) runOneRelaySession(ctx context.Context) error {
-	jr, err := turn.FetchJoinResponse(ctx, s.cfg.CallLink)
-	if err != nil {
-		return fmt.Errorf("join VK conference: %w", err)
-	}
-	s.cfg.Logger.Info("joined VK conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+	svc := s.cfg.Service
 
-	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, s.cfg.Logger.With("component", "signaling"))
+	jr, err := svc.FetchJoinInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("join conference: %w", err)
+	}
+	s.cfg.Logger.Info("joined conference", "service", svc.Name(), "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+
+	sigClient, err := svc.ConnectSignaling(ctx, jr, s.cfg.Logger.With("component", "signaling"))
 	if err != nil {
 		return fmt.Errorf("signaling connect: %w", err)
 	}
@@ -312,7 +315,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		return fmt.Errorf("set signaling key: %w", err)
 	}
 
-	mgr := turn.NewManager(s.cfg.CallLink, s.cfg.UseTCP, s.cfg.Logger)
+	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	defer mgr.CloseAll()
 
 	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
@@ -469,8 +472,6 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	)
 
 	// Drain dead connections so their MUX slots are reused by AddConn.
-	// Without this, dead muxConns stay non-nil, AddConn always appends,
-	// and the MUX grows unbounded on per-connection reconnects.
 	go func() {
 		for {
 			select {
@@ -491,10 +492,10 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	go func() {
 		reason := sigClient.WaitForSessionEnd(sessCtx)
 		switch reason {
-		case internalsignal.SessionEndDisconnect:
+		case provider.SessionEndDisconnect:
 			s.cfg.Logger.Info("client sent disconnect signal, cancelling session")
 			sessCancel()
-		case internalsignal.SessionEndHungup:
+		case provider.SessionEndHungup:
 			s.cfg.Logger.Info("signaling hungup, stopping pings and reducing idle timeout")
 			pingCancel()
 			m.SetIdleTimeout(15 * time.Second)
@@ -525,7 +526,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	}
 }
 
-func (s *Server) handleReconnections(ctx context.Context, sigClient *internalsignal.Client,
+func (s *Server) handleReconnections(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux) {
 
 	ch, unsub := sigClient.Subscribe(internalsignal.WireConnNew, 8)
@@ -549,7 +550,7 @@ func (s *Server) handleReconnections(ctx context.Context, sigClient *internalsig
 	}
 }
 
-func (s *Server) handleOneReconnect(ctx context.Context, sigClient *internalsignal.Client,
+func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, clientAddr string) error {
 
 	clientUDP, err := net.ResolveUDPAddr("udp", clientAddr)

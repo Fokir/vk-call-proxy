@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/gorilla/websocket"
 )
 
@@ -35,14 +36,17 @@ const (
 	WireConnOk  = "av-conn-ok"  // server → client: reply relay addr
 )
 
-// SessionEndReason indicates why WaitForSessionEnd returned.
-type SessionEndReason int
+// SessionEndReason is an alias for provider.SessionEndReason.
+type SessionEndReason = provider.SessionEndReason
 
 const (
-	SessionEndHungup     SessionEndReason = iota // VK "hungup" notification
-	SessionEndDisconnect                         // peer sent explicit disconnect
-	SessionEndClosed                             // connection closed or context cancelled
+	SessionEndHungup     = provider.SessionEndHungup
+	SessionEndDisconnect = provider.SessionEndDisconnect
+	SessionEndClosed     = provider.SessionEndClosed
 )
+
+// Compile-time check: Client implements provider.SignalingClient.
+var _ provider.SignalingClient = (*Client)(nil)
 
 // Client manages a VK signaling WebSocket connection.
 type Client struct {

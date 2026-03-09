@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
@@ -308,7 +309,7 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srvCfg := server.Config{
-		CallLink:  link,
+		Service:   vk.NewService(link),
 		AuthToken: authToken,
 		UseTCP:    true,
 		Logger:    logger,

@@ -16,6 +16,8 @@ import (
 
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/mux"
+	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
@@ -83,10 +85,10 @@ func (lb *LogBuffer) ReadAndClear() string {
 type tunnelState struct {
 	mgr       *turn.Manager
 	m         *mux.Mux
-	conns     []io.ReadWriteCloser   // connections to add after idle timeout is set
+	conns     []io.ReadWriteCloser       // connections to add after idle timeout is set
 	cleanups  []context.CancelFunc
-	sigClient *internalsignal.Client // non-nil in relay mode; kept alive for reconnect signaling
-	sessionID uuid.UUID              // session UUID for reconnect auth
+	sigClient provider.SignalingClient    // non-nil in relay mode; kept alive for reconnect signaling
+	sessionID uuid.UUID                  // session UUID for reconnect auth
 }
 
 // Tunnel is the main gomobile-exported type for mobile platforms.
@@ -101,14 +103,15 @@ type Tunnel struct {
 	running    bool
 
 	// reconnect infrastructure
-	cfg            *TunnelConfig
-	rootCtx        context.Context
-	rootCancel     context.CancelFunc
-	muxReady    chan struct{}       // closed when mux is available; recreated on teardown
-	muxCancel   context.CancelFunc // cancels DispatchLoop/PingLoop for current mux
-	connectedAt time.Time          // when the current MUX was established
-	sigClient      *internalsignal.Client // kept alive in relay mode for per-conn reconnects
-	sessionID      uuid.UUID              // current session ID
+	cfg        *TunnelConfig
+	svc        provider.Service
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	muxReady   chan struct{}           // closed when mux is available; recreated on teardown
+	muxCancel  context.CancelFunc     // cancels DispatchLoop/PingLoop for current mux
+	connectedAt time.Time             // when the current MUX was established
+	sigClient  provider.SignalingClient // kept alive in relay mode for per-conn reconnects
+	sessionID  uuid.UUID              // current session ID
 
 	// network change debouncing
 	networkDebounce *time.Timer    // coalesces rapid network change events
@@ -117,7 +120,7 @@ type Tunnel struct {
 
 // TunnelConfig holds configuration for starting the tunnel.
 type TunnelConfig struct {
-	CallLink   string // VK call-link ID
+	CallLink   string // call-link ID
 	ServerAddr string // VPN server address (host:port), empty = relay-to-relay mode
 	NumConns   int    // parallel TURN+DTLS connections
 	UseTCP     bool   // TCP vs UDP for TURN
@@ -145,7 +148,7 @@ func (t *Tunnel) ClearLogs() {
 }
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
-// If ServerAddr is empty, uses relay-to-relay mode via VK signaling.
+// If ServerAddr is empty, uses relay-to-relay mode via signaling.
 // A background reconnect loop monitors connection health and re-establishes
 // the tunnel automatically when all DTLS connections die.
 func (t *Tunnel) Start(cfg *TunnelConfig) error {
@@ -158,6 +161,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		cfg.NumConns = 16
 	}
 	t.cfg = cfg
+	t.svc = vk.NewService(cfg.CallLink)
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
 	t.networkForce = make(chan struct{}, 1)
@@ -194,7 +198,11 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 
 	sessionID := uuid.New()
 
-	mgr := turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
+	t.mu.Lock()
+	svc := t.svc
+	t.mu.Unlock()
+
+	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
 	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 	if err != nil {
 		mgr.CloseAll()
@@ -245,17 +253,21 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
 }
 
-// connectRelay creates TURN allocations, exchanges relay addresses via VK
+// connectRelay creates TURN allocations, exchanges relay addresses via
 // signaling, and establishes DTLS connections to the server's relay addresses.
 // Returns a tunnelState without mutating t.
 func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
-	jr, err := turn.FetchJoinResponse(ctx, cfg.CallLink)
-	if err != nil {
-		return nil, fmt.Errorf("join VK conference: %w", err)
-	}
-	t.logger.Info("joined VK conference", "conv_id", jr.ConvID)
+	t.mu.Lock()
+	svc := t.svc
+	t.mu.Unlock()
 
-	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, t.logger.With("component", "signaling"))
+	jr, err := svc.FetchJoinInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("join conference: %w", err)
+	}
+	t.logger.Info("joined conference", "conv_id", jr.ConvID)
+
+	sigClient, err := svc.ConnectSignaling(ctx, jr, t.logger.With("component", "signaling"))
 	if err != nil {
 		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
@@ -265,10 +277,9 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}
 
 	// Tell server to kill any existing session so it's ready for us.
-	// Fire-and-forget: harmlessly ignored if no old session exists.
 	_ = sigClient.SendDisconnect(ctx)
 
-	mgr := turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
+	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
 	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 	if err != nil {
 		sigClient.Close()
@@ -395,8 +406,6 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 
 // applyState installs a new tunnelState into the tunnel, starting
 // DispatchLoop and PingLoop, and signals muxReady.
-// Raw packet mode is enabled so DispatchLoop routes StreamID=0 FrameData
-// to a dedicated channel consumed by ReadPacket.
 func (t *Tunnel) applyState(state *tunnelState) {
 	t.mu.Lock()
 	t.m = state.m
@@ -416,8 +425,6 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	go state.m.StartPingLoop(muxCtx, 5*time.Second)
 
 	// Add connections AFTER idle timeout and DispatchLoop are set up.
-	// This prevents a race where readLoops (started by AddConn) set
-	// the 15s deadline before DispatchLoop is ready to process pongs.
 	for _, conn := range state.conns {
 		state.m.AddConn(conn)
 	}
@@ -427,7 +434,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 		go t.reconnectConns(muxCtx, state.sigClient, state.mgr, state.m, state.sessionID)
 		go func() {
 			reason := state.sigClient.WaitForSessionEnd(muxCtx)
-			if reason == internalsignal.SessionEndHungup {
+			if reason == provider.SessionEndHungup {
 				state.sigClient.DrainAndRoute(muxCtx)
 			}
 		}()
@@ -473,7 +480,6 @@ func (t *Tunnel) teardownMux() {
 
 // reconnectLoop watches the current mux for death (or network change signal)
 // and re-establishes the tunnel with exponential backoff (1s → 60s).
-// Network changes trigger immediate full teardown+reconnect via networkForce.
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 30 * time.Second
@@ -486,16 +492,13 @@ func (t *Tunnel) reconnectLoop() {
 		t.mu.Unlock()
 
 		if m == nil {
-			// No mux — wait for backoff or network force or stop.
 			select {
 			case <-t.rootCtx.Done():
 				return
 			case <-force:
-				// Network changed while no mux — try immediately.
 			case <-time.After(backoff):
 			}
 		} else {
-			// Wait for mux death, network force, or stop.
 			select {
 			case <-m.Dead():
 				t.logger.Info("all connections dead, starting reconnect")
@@ -534,7 +537,6 @@ func (t *Tunnel) reconnectLoop() {
 			if err != nil {
 				t.logger.Warn("reconnect attempt failed", "err", err, "backoff", backoff)
 				backoff = min(backoff*2, maxBackoff)
-				// Check if network changed again while we were trying.
 				select {
 				case <-force:
 					t.logger.Info("network changed during reconnect, resetting backoff")
@@ -547,8 +549,6 @@ func (t *Tunnel) reconnectLoop() {
 			t.applyState(state)
 			t.logger.Info("reconnected successfully")
 			backoff = time.Second
-			// Drain any force signal that arrived during connectRelay/connectDirect
-			// to prevent immediately tearing down the fresh connection.
 			select {
 			case <-force:
 			default:
@@ -559,12 +559,7 @@ func (t *Tunnel) reconnectLoop() {
 }
 
 // reconnectConns monitors ConnDied and maintains target connection count.
-// Serialized to avoid ackCh mix-up. Two modes:
-//   - Normal: active >= minActive AND healthy — try 5 attempts, then wait for next tick.
-//   - Critical: active < minActive OR unhealthy (no pong for 15s) — retry indefinitely with exp backoff (1s→30s).
-//
-// minActive = max(2, targetConns/2).
-func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.Client,
+func (t *Tunnel) reconnectConns(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID) {
 
 	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
@@ -581,7 +576,6 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 
 	const healthTimeout = 10 * time.Second
 
-	// Wakeup signal: triggered on connection death for fast response.
 	wakeup := make(chan struct{}, 1)
 	triggerWakeup := func() {
 		select {
@@ -590,7 +584,6 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 		}
 	}
 
-	// Drain ConnDied and trigger wakeup.
 	go func() {
 		for {
 			select {
@@ -612,7 +605,6 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 		maxBackoff        = 30 * time.Second
 	)
 
-	// Unified loop: check every 2s or on wakeup.
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -633,7 +625,6 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 		critical := active < minActive || !healthy
 		needed := targetConns - active
 		if needed <= 0 {
-			// All conns alive but unhealthy — probe and force reconnect.
 			m.ProbeConnections(3 * time.Second)
 			t.logger.Warn("tunnel unhealthy, no pong received",
 				"active", active, "healthy", healthy)
@@ -683,18 +674,17 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 					backoff = maxBackoff
 				}
 
-				// Re-check if still critical.
 				critical = m.ActiveConns() < minActive || !m.IsHealthy(healthTimeout)
 			}
 			m.EndReconnect()
 			if err != nil && !critical {
-				break // normal mode: stop, wait for next tick
+				break
 			}
 		}
 	}
 }
 
-func (t *Tunnel) reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
+func (t *Tunnel) reconnectOne(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, ackCh <-chan []byte, sessionID uuid.UUID) error {
 
 	allocs, err := mgr.Allocate(ctx, 1)
@@ -787,7 +777,6 @@ func (t *Tunnel) getMux() (*mux.Mux, error) {
 }
 
 // DialStream opens a new mux stream to the given target address (host:port).
-// Blocks during reconnect until the mux is available.
 func (t *Tunnel) DialStream(addr string) (io.ReadWriteCloser, error) {
 	m, err := t.getMux()
 	if err != nil {
@@ -807,12 +796,9 @@ func (t *Tunnel) DialStream(addr string) (io.ReadWriteCloser, error) {
 }
 
 // TunMTU is the recommended MTU for the native TUN device.
-// Keeps raw IP packets + MUX header + DTLS overhead within TURN relay limits.
 const TunMTU = 1280
 
-// WritePacket sends a raw IP packet through the tunnel (for VpnService / NEPacketTunnelProvider).
-// Returns error immediately during reconnect (packets are dropped; native code retries).
-// Packets larger than TunMTU are silently dropped (like an oversized datagram on a real interface).
+// WritePacket sends a raw IP packet through the tunnel.
 func (t *Tunnel) WritePacket(data []byte) error {
 	t.mu.Lock()
 	m := t.m
@@ -836,9 +822,6 @@ func (t *Tunnel) WritePacket(data []byte) error {
 }
 
 // ReadPacket reads a raw IP packet from the tunnel.
-// Blocks during reconnect until the mux is re-established.
-// Only receives FrameData with StreamID=0 (raw IP packets) via the
-// dedicated RawPackets channel, avoiding contention with DispatchLoop.
 func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 	for {
 		m, err := t.getMux()
@@ -854,9 +837,6 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 		select {
 		case frame, ok := <-ch:
 			if !ok {
-				// Channel closed — mux died. Wait briefly for reconnect loop
-				// to call teardownMux (sets t.m=nil), then loop back —
-				// getMux will block on the new muxReady channel.
 				select {
 				case <-t.rootCtx.Done():
 					return 0, fmt.Errorf("tunnel stopped")
@@ -876,8 +856,6 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 }
 
 // ReadPacketData reads a raw IP packet and returns it as a new byte slice.
-// This is the iOS-friendly variant of ReadPacket — gomobile converts []byte
-// return values to NSData, whereas []byte parameters are immutable copies.
 func (t *Tunnel) ReadPacketData() ([]byte, error) {
 	buf := make([]byte, TunMTU)
 	n, err := t.ReadPacket(buf)
@@ -888,7 +866,6 @@ func (t *Tunnel) ReadPacketData() ([]byte, error) {
 }
 
 // IsConnected reports whether the tunnel currently has an active mux.
-// Returns false during reconnection.
 func (t *Tunnel) IsConnected() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -896,7 +873,6 @@ func (t *Tunnel) IsConnected() bool {
 }
 
 // ActiveConns returns the number of active DTLS connections in the mux.
-// Returns 0 if the tunnel is not connected.
 func (t *Tunnel) ActiveConns() int {
 	t.mu.Lock()
 	m := t.m
@@ -908,7 +884,6 @@ func (t *Tunnel) ActiveConns() int {
 }
 
 // TotalConns returns the target number of connections (from config).
-// Returns 0 if the tunnel is not running.
 func (t *Tunnel) TotalConns() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -941,10 +916,7 @@ func (t *Tunnel) Stop() {
 }
 
 // OnNetworkChanged should be called by the mobile platform when the network
-// connectivity changes (e.g. WiFi→cellular, 4G→H+). It coalesces rapid
-// events (Android fires 2-3 callbacks per switch) and triggers a full
-// teardown+reconnect, since old TURN/signaling connections are stale.
-// Safe to call from any goroutine; no-op if the tunnel is not running.
+// connectivity changes (e.g. WiFi→cellular).
 func (t *Tunnel) OnNetworkChanged() {
 	const debounceDelay = 2 * time.Second
 
@@ -957,16 +929,12 @@ func (t *Tunnel) OnNetworkChanged() {
 		return
 	}
 
-	// Ignore network change events shortly after connection:
-	// Android fires onAvailable callbacks for existing networks when
-	// registerNetworkCallback is called right after VPN interface creation.
 	if connAge < 5*time.Second {
 		t.mu.Unlock()
 		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
 	}
 
-	// Debounce: reset timer on each call so only the last event in a burst fires.
 	if t.networkDebounce != nil {
 		t.networkDebounce.Stop()
 	}
@@ -974,7 +942,6 @@ func (t *Tunnel) OnNetworkChanged() {
 	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
 		t.logger.Info("network change debounce fired, forcing full reconnect")
 		t.teardownMux()
-		// Wake up reconnectLoop immediately.
 		select {
 		case force <- struct{}{}:
 		default:
