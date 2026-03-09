@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -30,9 +31,18 @@ import (
 // minus VP8 header (16 bytes) minus reliability header (3 bytes) minus chunk header (4 bytes).
 const maxVP8Data = 1100
 
-// writePace is the minimum interval between consecutive VP8 frame writes.
-// Without pacing, burst writes overwhelm the SFU's video forwarding pipeline.
-const writePace = 5 * time.Millisecond
+// Adaptive pacing constants (AIMD). The write pace between consecutive VP8
+// frames is dynamically adjusted based on the rate of incoming NACKs from
+// the remote peer — a high NACK rate signals SFU congestion.
+const (
+	defaultPace         = 5 * time.Millisecond   // initial pace
+	minPace             = 2 * time.Millisecond   // fastest (~500 fps, ~110 KB/s)
+	maxPace             = 10 * time.Millisecond  // slowest (~100 fps, ~22 KB/s)
+	paceAdjustInterval  = 500 * time.Millisecond // how often we re-evaluate
+	paceDecrease        = 500 * time.Microsecond // additive increase (decrease pace)
+	paceMultiplier      = 1.5                    // multiplicative decrease (increase pace)
+	nackRateThreshold   = 3                      // NACKs per window to trigger back-off
+)
 
 // nackCheckInterval is how often we check for expired NACKs to send.
 const nackCheckInterval = 15 * time.Millisecond
@@ -86,6 +96,11 @@ type RTPConn struct {
 	// validDataCh is signaled when the first valid VP8 data is decoded after a reset.
 	// Used by ConnectPaired to probe whether a pinned candidate is the real peer.
 	validDataCh chan struct{}
+
+	// Adaptive pacing state.
+	currentPace atomic.Int64 // current write pace in nanoseconds
+	nackRecv    atomic.Int64 // NACKs received from peer in current window
+	writeCount  atomic.Int64 // VP8 frames written in current window
 }
 
 type reassemblyBuf struct {
@@ -149,9 +164,11 @@ func NewRTPConn(pubTrack *webrtc.TrackLocalStaticSample, obfKey [32]byte) *RTPCo
 		resetReassemblyCh:  make(chan struct{}, 1),
 		validDataCh:        make(chan struct{}, 1),
 	}
+	c.currentPace.Store(int64(defaultPace))
 	go c.reliabilityLoop()
 	go c.reassemblyLoop()
 	go c.nackLoop()
+	go c.paceAdjustLoop()
 	return c
 }
 
@@ -430,6 +447,7 @@ func (c *RTPConn) handleNACKPacket(raw []byte) {
 	if len(raw) < 2+count*2 {
 		return
 	}
+	c.nackRecv.Add(int64(count)) // count each requested seq for adaptive pacing
 
 	for i := 0; i < count; i++ {
 		off := 2 + i*2
@@ -486,14 +504,69 @@ func (c *RTPConn) nackLoop() {
 	}
 }
 
+// paceAdjustLoop implements AIMD (Additive Increase / Multiplicative Decrease)
+// for the VP8 write pacing interval. It uses the rate of incoming NACK packets
+// (peer requesting retransmissions of our frames) as a congestion signal:
+//   - Low NACK rate  → decrease pace (send faster)
+//   - High NACK rate → increase pace (back off)
+func (c *RTPConn) paceAdjustLoop() {
+	ticker := time.NewTicker(paceAdjustInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+			nacks := c.nackRecv.Swap(0)
+			writes := c.writeCount.Swap(0)
+			cur := time.Duration(c.currentPace.Load())
+
+			// No writes in this window — reset to default pace.
+			// This prevents the pace from racing to minPace during idle,
+			// which would overwhelm the SFU when data starts flowing.
+			if writes == 0 {
+				if cur != defaultPace {
+					c.currentPace.Store(int64(defaultPace))
+					slog.Debug("rtpconn: pace reset to default (idle)",
+						"prev", cur)
+				}
+				continue
+			}
+
+			var next time.Duration
+			if nacks > nackRateThreshold {
+				// Multiplicative Decrease: back off quickly on congestion.
+				next = time.Duration(float64(cur) * paceMultiplier)
+				if next > maxPace {
+					next = maxPace
+				}
+			} else {
+				// Additive Increase: cautiously speed up when channel is clear.
+				next = cur - paceDecrease
+				if next < minPace {
+					next = minPace
+				}
+			}
+
+			if next != cur {
+				c.currentPace.Store(int64(next))
+				slog.Info("rtpconn: adaptive pace",
+					"prev", cur, "next", next, "nacks", nacks, "writes", writes)
+			}
+		}
+	}
+}
+
 // sendRawVP8 wraps a reliability-layer packet in VP8 and writes to the publisher track.
 // All VP8 writes are paced to avoid overwhelming the SFU with burst frames.
 func (c *RTPConn) sendRawVP8(payload []byte) error {
+	pace := time.Duration(c.currentPace.Load())
 	c.seqMu.Lock()
 	elapsed := time.Since(c.lastWrite)
 	c.seqMu.Unlock()
-	if elapsed < writePace {
-		time.Sleep(writePace - elapsed)
+	if elapsed < pace {
+		time.Sleep(pace - elapsed)
 	}
 
 	frame := buildVP8Frame(payload, c.obfKey)
@@ -506,6 +579,7 @@ func (c *RTPConn) sendRawVP8(payload []byte) error {
 	c.lastWrite = time.Now()
 	c.seqMu.Unlock()
 
+	c.writeCount.Add(1)
 	return err
 }
 
