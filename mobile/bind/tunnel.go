@@ -177,6 +177,8 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	var err error
 	if cfg.ServerAddr != "" {
 		state, err = t.connectDirect(t.rootCtx, cfg)
+	} else if telemost.IsTelemostLink(cfg.CallLink) {
+		state, err = t.connectTelemost(t.rootCtx, cfg)
 	} else {
 		state, err = t.connectRelay(t.rootCtx, cfg)
 	}
@@ -191,6 +193,65 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	t.applyState(state)
 	go t.reconnectLoop()
 	return nil
+}
+
+// connectTelemost establishes Telemost WebRTC connections using paired display
+// names derived from the auth token. Returns a tunnelState without mutating t.
+func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
+	t.mu.Lock()
+	svc := t.svc
+	t.mu.Unlock()
+
+	tmSvc, ok := svc.(*telemost.Service)
+	if !ok {
+		return nil, fmt.Errorf("expected telemost.Service")
+	}
+
+	serverNames, clientNames := provider.DeriveDisplayNames(cfg.Token, cfg.NumConns)
+	sessionID := uuid.New()
+
+	var muxConns []io.ReadWriteCloser
+	var cleanups []context.CancelFunc
+	for i := 0; i < cfg.NumConns; i++ {
+		conn, cleanup, err := tmSvc.ConnectPaired(ctx,
+			t.logger.With("index", i), clientNames[i], serverNames[i], i)
+		if err != nil {
+			t.logger.Warn("Telemost connection failed", "index", i, "err", err)
+			continue
+		}
+
+		if cfg.Token != "" {
+			if err := mux.WriteAuthToken(conn, cfg.Token); err != nil {
+				t.logger.Warn("write auth token failed", "index", i, "err", err)
+				cleanup()
+				continue
+			}
+		}
+
+		var sid [16]byte
+		copy(sid[:], sessionID[:])
+		if err := mux.WriteSessionID(conn, sid); err != nil {
+			t.logger.Warn("write session id failed", "index", i, "err", err)
+			cleanup()
+			continue
+		}
+
+		cleanups = append(cleanups, cleanup)
+		muxConns = append(muxConns, conn)
+	}
+
+	if len(muxConns) == 0 {
+		for _, c := range cleanups {
+			c()
+		}
+		return nil, fmt.Errorf("no Telemost connections established")
+	}
+
+	m := mux.New(t.logger)
+	t.logger.Info("tunnel connected (telemost)",
+		"active", len(muxConns), "target", cfg.NumConns,
+		"session_id", sessionID.String())
+	return &tunnelState{m: m, conns: muxConns, cleanups: cleanups, sessionID: sessionID}, nil
 }
 
 // connectDirect creates TURN allocations and DTLS connections to a server
@@ -534,6 +595,8 @@ func (t *Tunnel) reconnectLoop() {
 			var err error
 			if t.cfg.ServerAddr != "" {
 				state, err = t.connectDirect(attemptCtx, t.cfg)
+			} else if telemost.IsTelemostLink(t.cfg.CallLink) {
+				state, err = t.connectTelemost(attemptCtx, t.cfg)
 			} else {
 				state, err = t.connectRelay(attemptCtx, t.cfg)
 			}

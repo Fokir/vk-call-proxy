@@ -13,11 +13,16 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,11 +38,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 enum class VpnState { Disconnected, Connecting, Connected }
-enum class ConnectionMode { Relay, Direct }
 
 class MainActivity : ComponentActivity() {
 
@@ -98,7 +103,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request notification permission on Android 13+.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
@@ -107,7 +111,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Sync initial state in case VPN was started from tile before activity.
         vpnState.value = when (CallVpnService.currentState) {
             "connecting" -> VpnState.Connecting
             "connected" -> VpnState.Connected
@@ -195,19 +198,13 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != ACTION_QUICK_CONNECT) return
         if (vpnState.value != VpnState.Disconnected) return
 
-        val prefs = getSharedPreferences("callvpn", Context.MODE_PRIVATE)
-        val rawCallLink = prefs.getString("call_link", "") ?: ""
-        if (rawCallLink.isBlank()) return
+        val profileManager = ProfileManager(this)
+        val profile = profileManager.getActiveProfile() ?: return
+        val callLink = parseCallLink(profile.callLink)
+        if (callLink.isBlank()) return
 
-        val callLink = parseCallLink(rawCallLink)
-        val token = prefs.getString("token", "") ?: ""
-        val numConns = prefs.getInt("num_conns", 4)
-        val connectionMode = prefs.getString("connection_mode", "Relay") ?: "Relay"
-        val serverAddr = if (connectionMode == "Direct") {
-            prefs.getString("server_addr", "") ?: ""
-        } else ""
-
-        requestConnect(callLink, serverAddr, token, numConns)
+        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
+        requestConnect(callLink, serverAddr, profile.token, profile.numConns)
     }
 
     companion object {
@@ -216,12 +213,18 @@ class MainActivity : ComponentActivity() {
 }
 
 private fun parseCallLink(input: String): String {
-    val regex = Regex("""vk\.com/call/join/([A-Za-z0-9_-]+)""")
-    val match = regex.find(input)
-    return match?.groupValues?.get(1) ?: input.trim()
+    val vkRegex = Regex("""vk\.com/call/join/([A-Za-z0-9_-]+)""")
+    val vkMatch = vkRegex.find(input)
+    if (vkMatch != null) return vkMatch.groupValues[1]
+
+    val telemostRegex = Regex("""telemost\.yandex\.\w+/j/(\d+)""")
+    val telemostMatch = telemostRegex.find(input)
+    if (telemostMatch != null) return telemostMatch.groupValues[1]
+
+    return input.trim()
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun CallVpnScreen(
     vpnState: VpnState,
@@ -232,36 +235,15 @@ fun CallVpnScreen(
     onDisconnect: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = remember {
-        context.getSharedPreferences("callvpn", Context.MODE_PRIVATE)
-    }
+    val profileManager = remember { ProfileManager(context) }
 
-    var callLinkInput by remember { mutableStateOf(prefs.getString("call_link", "") ?: "") }
-    var serverAddr by remember { mutableStateOf(prefs.getString("server_addr", "") ?: "") }
-    var tokenInput by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
-    var numConnsInput by remember { mutableStateOf(prefs.getInt("num_conns", 4).toString()) }
-    var connectionMode by remember {
-        val saved = prefs.getString("connection_mode", "Relay") ?: "Relay"
-        mutableStateOf(if (saved == "Direct") ConnectionMode.Direct else ConnectionMode.Relay)
-    }
+    var profiles by remember { mutableStateOf(profileManager.getProfiles()) }
+    var activeProfileId by remember { mutableStateOf(profileManager.getActiveProfileId()) }
+    var showEditor by remember { mutableStateOf(false) }
+    var editingProfile by remember { mutableStateOf<Profile?>(null) }
 
-    // Recent call IDs (up to 5, no duplicates)
-    var recentIds by remember {
-        val saved = prefs.getString("recent_ids", "") ?: ""
-        mutableStateOf(saved.split("\n").filter { it.isNotBlank() }.take(5))
-    }
-
+    val activeProfile = profiles.find { it.id == activeProfileId }
     val isConnected = vpnState != VpnState.Disconnected
-    val parsedId = remember(callLinkInput) { parseCallLink(callLinkInput) }
-    val hasFullLink = remember(callLinkInput) {
-        callLinkInput.contains("vk.com/call/join/")
-    }
-
-    // Validation
-    val canConnect = when (connectionMode) {
-        ConnectionMode.Relay -> parsedId.isNotBlank()
-        ConnectionMode.Direct -> parsedId.isNotBlank() && serverAddr.isNotBlank()
-    }
 
     // Status colors
     val statusColor = when (vpnState) {
@@ -274,10 +256,8 @@ fun CallVpnScreen(
         VpnState.Connecting -> "Подключение..."
         VpnState.Connected -> "Подключён"
     }
-
-    // Button config
     val buttonColor = when (vpnState) {
-        VpnState.Disconnected -> Color(0xFF4CAF50)
+        VpnState.Disconnected -> if (activeProfile != null) Color(0xFF4CAF50) else Color.Gray
         VpnState.Connecting -> Color(0xFFFFC107)
         VpnState.Connected -> Color(0xFFF44336)
     }
@@ -287,14 +267,19 @@ fun CallVpnScreen(
         VpnState.Connected -> "Отключиться"
     }
 
-    // Log auto-scroll state
     val logScrollState = rememberScrollState()
     LaunchedEffect(logLines.size) {
         logScrollState.animateScrollTo(logScrollState.maxValue)
     }
 
-    // Clipboard
     val clipboardManager: ClipboardManager = LocalClipboardManager.current
+
+    fun connectProfile(profile: Profile) {
+        val callLink = parseCallLink(profile.callLink)
+        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
+        val conns = profile.numConns.coerceIn(1, 16)
+        onConnect(callLink, serverAddr, profile.token, conns)
+    }
 
     Column(
         modifier = Modifier
@@ -335,29 +320,68 @@ fun CallVpnScreen(
             )
         }
 
-        // Mode selector
-        Row(
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Profile badges
+        FlowRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            FilterChip(
-                selected = connectionMode == ConnectionMode.Relay,
-                onClick = {
-                    connectionMode = ConnectionMode.Relay
-                    prefs.edit().putString("connection_mode", connectionMode.name).apply()
-                },
-                label = { Text("Relay-to-Relay") },
-                enabled = !isConnected
-            )
-            FilterChip(
-                selected = connectionMode == ConnectionMode.Direct,
-                onClick = {
-                    connectionMode = ConnectionMode.Direct
-                    prefs.edit().putString("connection_mode", connectionMode.name).apply()
-                },
-                label = { Text("Direct") },
-                enabled = !isConnected
-            )
+            for (profile in profiles) {
+                val isActive = profile.id == activeProfileId
+                ProfileBadge(
+                    profile = profile,
+                    isActive = isActive,
+                    onSelect = {
+                        if (!isActive) {
+                            // Disconnect previous if connected
+                            if (isConnected) {
+                                onDisconnect()
+                            }
+                            activeProfileId = profile.id
+                            profileManager.setActiveProfileId(profile.id)
+                            // Auto-connect
+                            connectProfile(profile)
+                        }
+                    },
+                    onEdit = {
+                        editingProfile = profile
+                        showEditor = true
+                    }
+                )
+            }
+
+            // Add profile button
+            Surface(
+                modifier = Modifier
+                    .height(40.dp)
+                    .clickable {
+                        editingProfile = null
+                        showEditor = true
+                    },
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = "Добавить",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "Добавить",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -367,22 +391,8 @@ fun CallVpnScreen(
             onClick = {
                 when (vpnState) {
                     VpnState.Disconnected -> {
-                        if (canConnect) {
-                            val conns = numConnsInput.toIntOrNull()?.coerceIn(1, 16) ?: 4
-                            prefs.edit()
-                                .putString("call_link", callLinkInput)
-                                .putString("server_addr", serverAddr)
-                                .putString("token", tokenInput)
-                                .putInt("num_conns", conns)
-                                .apply()
-                            // Save to recent IDs
-                            val updated = (listOf(parsedId) + recentIds.filter { it != parsedId }).take(5)
-                            recentIds = updated
-                            prefs.edit().putString("recent_ids", updated.joinToString("\n")).apply()
-
-                            val effectiveServerAddr = if (connectionMode == ConnectionMode.Relay) "" else serverAddr
-                            onConnect(parsedId, effectiveServerAddr, tokenInput, conns)
-                        }
+                        val profile = activeProfile ?: return@Button
+                        connectProfile(profile)
                     }
                     VpnState.Connecting -> onDisconnect()
                     VpnState.Connected -> onDisconnect()
@@ -390,7 +400,11 @@ fun CallVpnScreen(
             },
             modifier = Modifier.size(170.dp),
             shape = CircleShape,
-            colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
+            enabled = vpnState != VpnState.Disconnected || activeProfile != null,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = buttonColor,
+                disabledContainerColor = Color.Gray
+            )
         ) {
             Text(
                 text = buttonText,
@@ -409,99 +423,7 @@ fun CallVpnScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // VK link input
-        OutlinedTextField(
-            value = callLinkInput,
-            onValueChange = { callLinkInput = it },
-            label = { Text("Ссылка VK звонка") },
-            placeholder = { Text("https://vk.com/call/join/...") },
-            singleLine = true,
-            enabled = !isConnected,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        // Show parsed ID if full link was pasted
-        if (hasFullLink && parsedId.isNotBlank()) {
-            Text(
-                text = "ID: $parsedId",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        // Recent call IDs
-        if (recentIds.isNotEmpty() && !isConnected) {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    text = "Недавние",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                for (id in recentIds) {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { callLinkInput = id },
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = MaterialTheme.shapes.small
-                    ) {
-                        Text(
-                            text = id,
-                            fontSize = 13.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                        )
-                    }
-                }
-            }
-        }
-
-        // Server address input (only in Direct mode)
-        if (connectionMode == ConnectionMode.Direct) {
-            OutlinedTextField(
-                value = serverAddr,
-                onValueChange = { serverAddr = it },
-                label = { Text("Адрес сервера") },
-                placeholder = { Text("host:port") },
-                singleLine = true,
-                enabled = !isConnected,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-
-        // Token input
-        OutlinedTextField(
-            value = tokenInput,
-            onValueChange = { tokenInput = it },
-            label = { Text("Токен") },
-            placeholder = { Text("Токен авторизации") },
-            singleLine = true,
-            enabled = !isConnected,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        // Connections count input
-        OutlinedTextField(
-            value = numConnsInput,
-            onValueChange = { value ->
-                if (value.isEmpty() || value.all { it.isDigit() }) {
-                    numConnsInput = value
-                }
-            },
-            label = { Text("Подключения (1-16)") },
-            placeholder = { Text("4") },
-            singleLine = true,
-            enabled = !isConnected,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        // Log window (always visible)
+        // Log window
         Text(
             text = "Лог",
             fontSize = 14.sp,
@@ -516,7 +438,9 @@ fun CallVpnScreen(
                 .clickable {
                     if (logLines.isNotEmpty()) {
                         clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
-                        Toast.makeText(context, "Логи скопированы", Toast.LENGTH_SHORT).show()
+                        Toast
+                            .makeText(context, "Логи скопированы", Toast.LENGTH_SHORT)
+                            .show()
                     }
                 },
             color = MaterialTheme.colorScheme.surfaceVariant,
@@ -555,5 +479,296 @@ fun CallVpnScreen(
                 }
             }
         }
+    }
+
+    // Profile editor dialog
+    if (showEditor) {
+        ProfileEditorDialog(
+            profile = editingProfile,
+            onSave = { saved ->
+                profileManager.saveProfile(saved)
+                profiles = profileManager.getProfiles()
+
+                // If no active profile yet, make this one active
+                if (activeProfileId == null) {
+                    activeProfileId = saved.id
+                    profileManager.setActiveProfileId(saved.id)
+                }
+
+                // If edited profile is active and connected, reconnect
+                if (saved.id == activeProfileId && isConnected) {
+                    onDisconnect()
+                    connectProfile(saved)
+                }
+
+                showEditor = false
+                editingProfile = null
+            },
+            onDelete = if (editingProfile != null) {
+                { id ->
+                    val wasActive = id == activeProfileId
+                    if (wasActive && isConnected) {
+                        onDisconnect()
+                    }
+                    profileManager.deleteProfile(id)
+                    profiles = profileManager.getProfiles()
+                    activeProfileId = profileManager.getActiveProfileId()
+
+                    showEditor = false
+                    editingProfile = null
+                }
+            } else null,
+            onDismiss = {
+                showEditor = false
+                editingProfile = null
+            }
+        )
+    }
+}
+
+@Composable
+fun ProfileBadge(
+    profile: Profile,
+    isActive: Boolean,
+    onSelect: () -> Unit,
+    onEdit: () -> Unit
+) {
+    val bgColor = if (isActive) Color(0xFF4CAF50) else MaterialTheme.colorScheme.surface
+    val textColor = if (isActive) Color.White else MaterialTheme.colorScheme.onSurface
+    val borderColor = if (isActive) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline
+
+    Surface(
+        modifier = Modifier
+            .height(40.dp)
+            .clickable { onSelect() },
+        shape = RoundedCornerShape(20.dp),
+        color = bgColor,
+        border = BorderStroke(1.dp, borderColor)
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            // Provider icon
+            Text(
+                text = if (profile.isTelemostLink()) "Я" else "VK",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (isActive) Color.White else {
+                    if (profile.isTelemostLink()) Color(0xFFFF0000) else Color(0xFF0077FF)
+                }
+            )
+
+            // Profile name
+            Text(
+                text = profile.name.ifBlank { "Без имени" },
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = textColor
+            )
+
+            // Edit button
+            IconButton(
+                onClick = onEdit,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = "Редактировать",
+                    modifier = Modifier.size(16.dp),
+                    tint = textColor.copy(alpha = 0.7f)
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ProfileEditorDialog(
+    profile: Profile?,
+    onSave: (Profile) -> Unit,
+    onDelete: ((String) -> Unit)?,
+    onDismiss: () -> Unit
+) {
+    val isNew = profile == null
+    val base = profile ?: Profile()
+
+    var name by remember { mutableStateOf(base.name) }
+    var connectionMode by remember { mutableStateOf(base.connectionMode) }
+    var callLink by remember { mutableStateOf(base.callLink) }
+    var serverAddr by remember { mutableStateOf(base.serverAddr) }
+    var token by remember { mutableStateOf(base.token) }
+    var numConns by remember { mutableStateOf(base.numConns.toString()) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = if (isNew) "Новый профиль" else "Редактирование",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                // Profile name
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { if (it.length <= 20) name = it },
+                    label = { Text("Имя профиля") },
+                    placeholder = { Text("Мой VPN") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Connection mode
+                Text(
+                    "Тип подключения",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = connectionMode == "relay",
+                        onClick = { connectionMode = "relay" },
+                        label = { Text("Relay-to-Relay") }
+                    )
+                    FilterChip(
+                        selected = connectionMode == "direct",
+                        onClick = { connectionMode = "direct" },
+                        label = { Text("Direct") }
+                    )
+                }
+
+                // Call link
+                OutlinedTextField(
+                    value = callLink,
+                    onValueChange = { callLink = it },
+                    label = { Text("Ссылка на звонок") },
+                    placeholder = { Text("https://vk.com/call/join/...") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Server address (direct only)
+                if (connectionMode == "direct") {
+                    OutlinedTextField(
+                        value = serverAddr,
+                        onValueChange = { serverAddr = it },
+                        label = { Text("Адрес сервера") },
+                        placeholder = { Text("host:port") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                // Token
+                OutlinedTextField(
+                    value = token,
+                    onValueChange = { token = it },
+                    label = { Text("Токен") },
+                    placeholder = { Text("Токен авторизации") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Connections count
+                OutlinedTextField(
+                    value = numConns,
+                    onValueChange = { value ->
+                        if (value.isEmpty() || value.all { it.isDigit() }) {
+                            numConns = value
+                        }
+                    },
+                    label = { Text("Подключения (1-16)") },
+                    placeholder = { Text("4") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Delete button (only for existing profiles)
+                if (!isNew && onDelete != null) {
+                    TextButton(
+                        onClick = { showDeleteConfirm = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            "Удалить профиль",
+                            color = Color(0xFFF44336)
+                        )
+                    }
+                }
+
+                // Action buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text("Отмена")
+                    }
+                    Button(
+                        onClick = {
+                            val conns = numConns.toIntOrNull()?.coerceIn(1, 16) ?: 4
+                            val saved = base.copy(
+                                name = name.trim(),
+                                connectionMode = connectionMode,
+                                callLink = callLink.trim(),
+                                serverAddr = serverAddr.trim(),
+                                token = token,
+                                numConns = conns
+                            )
+                            onSave(saved)
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF4CAF50)
+                        )
+                    ) {
+                        Text("Сохранить", color = Color.White)
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete confirmation dialog
+    if (showDeleteConfirm && onDelete != null && profile != null) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Удалить профиль?") },
+            text = { Text("Профиль \"${profile.name.ifBlank { "Без имени" }}\" будет удалён.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteConfirm = false
+                        onDelete(profile.id)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                ) {
+                    Text("Удалить", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 }
