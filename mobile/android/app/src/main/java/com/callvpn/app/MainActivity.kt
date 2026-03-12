@@ -242,6 +242,20 @@ fun CallVpnScreen(
     var showEditor by remember { mutableStateOf(false) }
     var editingProfile by remember { mutableStateOf<Profile?>(null) }
 
+    // Root detection for WiFi hotspot routing
+    val rootManager = remember { RootManager(context) }
+    var rootAvailable by remember { mutableStateOf(false) }
+    var hotspotRouting by remember { mutableStateOf(rootManager.hotspotRoutingEnabled) }
+
+    LaunchedEffect(Unit) {
+        rootAvailable = rootManager.isRootAvailable()
+        // If root was lost since last session, disable the toggle
+        if (!rootAvailable && hotspotRouting) {
+            hotspotRouting = false
+            rootManager.hotspotRoutingEnabled = false
+        }
+    }
+
     val activeProfile = profiles.find { it.id == activeProfileId }
     val isConnected = vpnState != VpnState.Disconnected
 
@@ -412,6 +426,46 @@ fun CallVpnScreen(
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
+        }
+
+        // WiFi Hotspot routing toggle (only visible if root is available)
+        if (rootAvailable) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "WiFi Hotspot через VPN",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Маршрутизация раздачи + TTL 64",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = hotspotRouting,
+                    onCheckedChange = { enabled ->
+                        hotspotRouting = enabled
+                        rootManager.hotspotRoutingEnabled = enabled
+                    },
+                    enabled = vpnState == VpnState.Disconnected,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color.White,
+                        checkedTrackColor = Color(0xFF4CAF50),
+                        uncheckedThumbColor = Color.White,
+                        uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                )
+            }
         }
 
         // App version

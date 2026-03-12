@@ -24,6 +24,8 @@ class CallVpnService : VpnService() {
     private var tunnel: Tunnel? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var rootManager: RootManager? = null
+    private var tunInterfaceName: String? = null
     @Volatile
     private var running = false
     @Volatile
@@ -185,6 +187,22 @@ class CallVpnService : VpnService() {
             }
             vpnInterface = vpn
 
+            // Set up hotspot routing through VPN if enabled (requires root).
+            val tunName = detectTunName()
+            tunInterfaceName = tunName
+            val rm = RootManager(this@CallVpnService)
+            rootManager = rm
+            if (tunName != null && rm.hotspotRoutingEnabled) {
+                val ok = rm.setupHotspotRouting(tunName)
+                val logMsg = if (ok) "Hotspot routing: enabled (TTL=64)"
+                             else "Hotspot routing: FAILED to apply iptables rules"
+                val logIntent = Intent(ACTION_LOG).apply {
+                    putExtra(EXTRA_LOG_TEXT, logMsg)
+                }
+                LocalBroadcastManager.getInstance(this@CallVpnService)
+                    .sendBroadcast(logIntent)
+            }
+
             broadcastState("connected")
 
             // Register network change callback for fast reconnect.
@@ -284,11 +302,28 @@ class CallVpnService : VpnService() {
     private fun stopVpn() {
         running = false
         unregisterNetworkCallback()
+
+        // Clean up hotspot routing BEFORE closing TUN interface.
+        val tunName = tunInterfaceName
+        if (tunName != null) {
+            rootManager?.cleanupHotspotRouting(tunName)
+        }
+        tunInterfaceName = null
+        rootManager = null
+
         tunnel?.stop()
         vpnInterface?.close()
         broadcastState("disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** Detects the TUN interface name by scanning /sys/class/net/ */
+    private fun detectTunName(): String? {
+        val netDir = java.io.File("/sys/class/net/")
+        return netDir.listFiles()
+            ?.map { it.name }
+            ?.firstOrNull { it.startsWith("tun") }
     }
 
     override fun onDestroy() {
