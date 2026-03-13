@@ -738,6 +738,16 @@ func (c *Client) Done() <-chan struct{} {
 	return c.done
 }
 
+// IsAlive reports whether the signaling WebSocket connection is still active.
+func (c *Client) IsAlive() bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+		return true
+	}
+}
+
 // PeerID returns our peer ID assigned by the signaling server.
 func (c *Client) PeerID() string {
 	return c.myPeerID

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -40,6 +41,11 @@ func main() {
 	noBypass := flag.Bool("no-bypass", false, "disable built-in bypass for Russian services (VK, Yandex, Gosuslugi, etc.)")
 
 	flag.Parse()
+
+	if *numConns > 8 {
+		fmt.Fprintf(os.Stderr, "WARNING: --n=%d exceeds recommended maximum of 8. "+
+			"High connection counts may cause VK call instability and potential call blocking.\n", *numConns)
+	}
 
 	if *callLink == "" {
 		fmt.Fprintln(os.Stderr, "Error: --link is required")
@@ -248,33 +254,63 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
-// runRelayToRelay connects through TURN relays to a server that also
-// joins the same call. Relay addresses are exchanged via signaling.
-func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	svc provider.Service, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
-	bypassMatcher *bypass.Matcher) {
+// relaySession holds the state of a single relay-to-relay session.
+// Fields are protected by mu for safe replacement during full reconnect.
+type relaySession struct {
+	mu        sync.Mutex
+	sigClient provider.SignalingClient
+	mgr       *turn.Manager
+	m         *mux.Mux
+	sessionID uuid.UUID
+	cleanups  []context.CancelFunc
+}
 
-	logger.Info("starting relay-to-relay mode", "service", svc.Name(), "conns", numConns)
+// Mux returns the current MUX, safe for concurrent use.
+func (rs *relaySession) Mux() *mux.Mux {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.m
+}
+
+// Close tears down all resources of this relay session.
+func (rs *relaySession) Close() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.m != nil {
+		rs.m.Close()
+	}
+	for _, c := range rs.cleanups {
+		c()
+	}
+	if rs.mgr != nil {
+		rs.mgr.CloseAll()
+	}
+	if rs.sigClient != nil {
+		rs.sigClient.Close()
+	}
+}
+
+// connectRelaySession establishes a full relay-to-relay session:
+// join conference → signaling → TURN allocations → relay addr exchange → DTLS.
+func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	svc provider.Service, numConns int, useTCP bool, authToken string) (*relaySession, error) {
 
 	// 1. Join conference to get TURN creds and signaling endpoint.
 	jr, err := svc.FetchJoinInfo(ctx)
 	if err != nil {
-		logger.Error("failed to join conference", "err", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("join conference: %w", err)
 	}
 	logger.Info("joined conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
 	// 2. Connect to signaling.
 	sigClient, err := svc.ConnectSignaling(ctx, jr, logger.With("component", "signaling"))
 	if err != nil {
-		logger.Error("signaling connect failed", "err", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
-	defer sigClient.Close()
 
 	if err := sigClient.SetKey(authToken); err != nil {
-		logger.Error("set signaling key failed", "err", err)
-		os.Exit(1)
+		sigClient.Close()
+		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
 	// Tell server to kill any existing session so it's ready for us.
@@ -282,13 +318,13 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 
 	// 3. Create TURN allocations.
 	mgr := turn.NewManager(svc, useTCP, logger)
-	defer mgr.CloseAll()
 
 	allocs, err := mgr.Allocate(ctx, numConns)
 	if err != nil {
 		siren.AlertTURNAuthFailure(ctx, err)
-		logger.Error("failed to allocate TURN connections", "err", err)
-		os.Exit(1)
+		sigClient.Close()
+		mgr.CloseAll()
+		return nil, fmt.Errorf("allocate TURN: %w", err)
 	}
 	logger.Info("TURN allocations created", "count", len(allocs))
 
@@ -319,8 +355,9 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	if err != nil {
 		sendCancel()
 		<-sendDone
-		logger.Error("recv relay addrs failed", "err", err)
-		os.Exit(1)
+		sigClient.Close()
+		mgr.CloseAll()
+		return nil, fmt.Errorf("recv relay addrs: %w", err)
 	}
 
 	// Keep sending our addrs for a few more seconds so the peer receives them.
@@ -336,7 +373,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		pairCount = len(serverAddrs)
 	}
 
-	// 6. Punch relay and establish DTLS in parallel.
+	// 5. Punch relay and establish DTLS in parallel.
 	sessionID := uuid.New()
 	logger.Info("session (relay-to-relay mode)", "id", sessionID.String())
 
@@ -388,12 +425,6 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	}
 
 	var cleanups []context.CancelFunc
-	defer func() {
-		for _, c := range cleanups {
-			c()
-		}
-	}()
-
 	var muxConns []io.ReadWriteCloser
 	for j := 0; j < pairCount; j++ {
 		r := <-results
@@ -408,40 +439,166 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	punchCancel()
 
 	if len(muxConns) == 0 {
-		logger.Error("no relay DTLS connections established")
-		os.Exit(1)
+		sigClient.Close()
+		mgr.CloseAll()
+		for _, c := range cleanups {
+			c()
+		}
+		return nil, fmt.Errorf("no relay DTLS connections established")
 	}
 
-	// 8. Create multiplexer over relay DTLS connections.
 	m := mux.New(logger, muxConns...)
-	defer m.Close()
+	return &relaySession{
+		sigClient: sigClient,
+		mgr:       mgr,
+		m:         m,
+		sessionID: sessionID,
+		cleanups:  cleanups,
+	}, nil
+}
 
-	logger.Info("MUX ready", "active", m.ActiveConns(), "target", numConns)
+// runRelayToRelay connects through TURN relays to a server that also
+// joins the same call. Relay addresses are exchanged via signaling.
+func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	svc provider.Service, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
+	bypassMatcher *bypass.Matcher) {
 
-	go m.DispatchLoop(ctx)
-	go m.StartPingLoop(ctx, 10*time.Second)
-	go mgr.StartKeepalive(ctx, 10*time.Second)
+	logger.Info("starting relay-to-relay mode", "service", svc.Name(), "conns", numConns)
 
-	// 9. Start unified reconnect manager.
-	go reconnectManager(ctx, sigClient, mgr, m, sessionID, authToken, numConns, logger)
+	sess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken)
+	if err != nil {
+		logger.Error("failed to establish relay session", "err", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
 
-	// 10. Monitor signaling for session end.
+	logger.Info("tunnel connected (relay-to-relay)",
+		"active", sess.m.ActiveConns(), "target", numConns,
+		"session_id", sess.sessionID.String())
+
+	go sess.m.DispatchLoop(ctx)
+	go sess.m.StartPingLoop(ctx, 10*time.Second)
+	go sess.mgr.StartKeepalive(ctx, 10*time.Second)
+
+	// Start unified reconnect manager (handles per-conn reconnect + full session reconnect).
+	fullReconnect := make(chan struct{}, 1)
+
+	go reconnectManager(ctx, sess, fullReconnect, authToken, numConns, logger)
+
+	// Monitor signaling for session end — trigger full reconnect on hungup.
 	go func() {
-		reason := sigClient.WaitForSessionEnd(ctx)
+		reason := sess.sigClient.WaitForSessionEnd(ctx)
 		if reason == provider.SessionEndHungup {
-			logger.Info("signaling hungup (server left call)")
-			sigClient.DrainAndRoute(ctx)
+			logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
+			select {
+			case fullReconnect <- struct{}{}:
+			default:
+			}
 		}
 	}()
 
-	// 11. Start proxies.
-	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
+	// Full session reconnect loop: when signaling dies or VK hangs up,
+	// tear down everything and re-establish from scratch.
+	go func() {
+		const maxBackoff = 60 * time.Second
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-fullReconnect:
+			}
+
+			logger.Info("starting full session reconnect")
+
+			// Tear down old session resources (except MUX — it stays for proxy continuity
+			// until new session is ready, but we close signaling + TURN).
+			sess.sigClient.Close()
+			sess.mgr.CloseAll()
+
+			backoff := time.Second
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+
+				newSess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken)
+				if err != nil {
+					logger.Warn("full session reconnect failed", "err", err, "next_backoff", backoff)
+					backoff = backoff * 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					continue
+				}
+
+				// Replace old session atomically.
+				sess.mu.Lock()
+				oldM := sess.m
+				oldCleanups := sess.cleanups
+				sess.sigClient = newSess.sigClient
+				sess.mgr = newSess.mgr
+				sess.m = newSess.m
+				sess.sessionID = newSess.sessionID
+				sess.cleanups = newSess.cleanups
+				sess.mu.Unlock()
+
+				// Close old MUX and cancel old bridge goroutines.
+				// Note: old sigClient and mgr were already closed before the retry loop.
+				oldM.Close()
+				for _, c := range oldCleanups {
+					c()
+				}
+
+				logger.Info("full session reconnect succeeded",
+					"active", sess.m.ActiveConns(), "target", numConns,
+					"session_id", sess.sessionID.String())
+
+				go sess.m.DispatchLoop(ctx)
+				go sess.m.StartPingLoop(ctx, 10*time.Second)
+				go sess.mgr.StartKeepalive(ctx, 10*time.Second)
+
+				// Restart reconnect manager for new session.
+				go reconnectManager(ctx, sess, fullReconnect, authToken, numConns, logger)
+
+				// Restart hungup monitor for new session.
+				go func() {
+					reason := sess.sigClient.WaitForSessionEnd(ctx)
+					if reason == provider.SessionEndHungup {
+						logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
+						select {
+						case fullReconnect <- struct{}{}:
+						default:
+						}
+					}
+				}()
+				break
+			}
+		}
+	}()
+
+	// Start proxies (blocks until ctx done).
+	// dialMux returns the current MUX, following full session reconnects.
+	dialMux := func() *mux.Mux { return sess.Mux() }
+	startRelayProxies(ctx, logger, siren, dialMux, numConns, socks5Port, httpPort, bindAddr, bypassMatcher)
 }
 
 // reconnectManager is a unified, serialized reconnect loop.
-func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
-	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string,
-	targetConns int, logger *slog.Logger) {
+// It handles per-connection reconnects when signaling is alive,
+// and triggers a full session reconnect when signaling is dead.
+func reconnectManager(ctx context.Context, sess *relaySession, fullReconnect chan struct{},
+	authToken string, targetConns int, logger *slog.Logger) {
+
+	sigClient := sess.sigClient
+	mgr := sess.mgr
+	m := sess.m
+	sessionID := sess.sessionID
+
+	// Local context: cancelled when this reconnectManager returns,
+	// so the ConnDied drain goroutine doesn't leak after full session reconnect.
+	localCtx, localCancel := context.WithCancel(ctx)
+	defer localCancel()
 
 	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
 	defer unsub()
@@ -449,6 +606,9 @@ func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
 	minActive := targetConns / 2
 	if minActive < 2 {
 		minActive = 2
+	}
+	if minActive > targetConns {
+		minActive = targetConns
 	}
 
 	const healthTimeout = 10 * time.Second
@@ -466,7 +626,7 @@ func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-localCtx.Done():
 				return
 			case idx, ok := <-m.ConnDied():
 				if !ok {
@@ -500,6 +660,16 @@ func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
 			return
 		case <-ticker.C:
 		case <-wakeup:
+		}
+
+		// If signaling is dead, per-conn reconnect is impossible — trigger full session reconnect.
+		if !sigClient.IsAlive() {
+			logger.Warn("signaling connection dead, triggering full session reconnect")
+			select {
+			case fullReconnect <- struct{}{}:
+			default:
+			}
+			return // this reconnectManager instance exits; a new one starts after full reconnect
 		}
 
 		active := m.ActiveConns()
@@ -537,6 +707,17 @@ func reconnectManager(ctx context.Context, sigClient provider.SignalingClient,
 			var err error
 			backoff := time.Second
 			for attempt := 1; ; attempt++ {
+				// Re-check signaling before each attempt.
+				if !sigClient.IsAlive() {
+					logger.Warn("signaling died during reconnect, triggering full session reconnect")
+					m.EndReconnect()
+					select {
+					case fullReconnect <- struct{}{}:
+					default:
+					}
+					return
+				}
+
 				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
 				if err == nil {
 					break
@@ -719,6 +900,111 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	}()
 
 	// Wait for both proxies or context cancellation.
+	remaining := 2
+	for remaining > 0 {
+		select {
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				logger.Warn("proxy error", "err", err)
+			}
+		case <-ctx.Done():
+			remaining = 0
+		}
+	}
+
+	socks5Srv.Close()
+	httpSrv.Close()
+	logger.Info("client stopped")
+}
+
+// startRelayProxies is like startProxies but resolves the MUX dynamically
+// via getMux, so that full session reconnects transparently switch the MUX
+// underneath active proxy listeners.
+func startRelayProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	getMux func() *mux.Mux, totalConns, socks5Port, httpPort int, bindAddr string,
+	bypassMatcher *bypass.Matcher) {
+
+	var nextStreamID atomic.Uint32
+
+	dialTunnel := func(ctx context.Context, network, addr string) (io.ReadWriteCloser, error) {
+		m := getMux()
+		if m == nil {
+			return nil, fmt.Errorf("tunnel not available")
+		}
+		id := nextStreamID.Add(1)
+		stream, err := m.OpenStream(id)
+		if err != nil {
+			return nil, fmt.Errorf("open stream: %w", err)
+		}
+		if _, err := stream.Write([]byte(addr)); err != nil {
+			stream.Close()
+			return nil, fmt.Errorf("send target: %w", err)
+		}
+		return stream, nil
+	}
+
+	socks5Addr := fmt.Sprintf("%s:%d", bindAddr, socks5Port)
+	socks5Srv := &socks5.Server{
+		Addr:   socks5Addr,
+		Dial:   dialTunnel,
+		Bypass: bypassMatcher,
+		Logger: logger.With("proxy", "socks5"),
+	}
+
+	httpAddr := fmt.Sprintf("%s:%d", bindAddr, httpPort)
+	httpSrv := &httpproxy.Server{
+		Addr:   httpAddr,
+		Dial:   dialTunnel,
+		Bypass: bypassMatcher,
+		Logger: logger.With("proxy", "http"),
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- socks5Srv.ListenAndServe(ctx)
+	}()
+
+	go func() {
+		errCh <- httpSrv.ListenAndServe(ctx)
+	}()
+
+	m := getMux()
+	activeConns := 0
+	if m != nil {
+		activeConns = m.ActiveConns()
+	}
+	logger.Info("proxies started", "socks5", socks5Addr, "http", httpAddr,
+		"active_conns", activeConns, "target_conns", totalConns)
+
+	go func() {
+		if activeConns < totalConns {
+			siren.AlertTunnelDegradation(ctx, activeConns, totalConns)
+		}
+	}()
+
+	// Periodically log connection status.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m := getMux()
+				if m != nil {
+					logger.Info("connection status",
+						"active", m.ActiveConns(),
+						"total", m.TotalConns(),
+						"target", totalConns,
+					)
+				}
+			}
+		}
+	}()
+
 	remaining := 2
 	for remaining > 0 {
 		select {

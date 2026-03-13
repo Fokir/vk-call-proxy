@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -21,6 +22,11 @@ func main() {
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	numConns := flag.Int("n", 1, "number of parallel connections (Telemost mode)")
 	flag.Parse()
+
+	if *numConns > 8 {
+		fmt.Fprintf(os.Stderr, "WARNING: --n=%d exceeds recommended maximum of 8. "+
+			"High connection counts may cause VK call instability and potential call blocking.\n", *numConns)
+	}
 
 	if *authToken == "" {
 		*authToken = os.Getenv("VPN_TOKEN")

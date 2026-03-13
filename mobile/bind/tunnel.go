@@ -119,6 +119,11 @@ type Tunnel struct {
 	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
 }
 
+// MaxRecommendedConns is the maximum number of parallel connections
+// recommended for stable operation. Exceeding this may cause VK call
+// instability and potential call blocking.
+const MaxRecommendedConns = 8
+
 // TunnelConfig holds configuration for starting the tunnel.
 type TunnelConfig struct {
 	CallLink   string // call-link ID
@@ -126,6 +131,17 @@ type TunnelConfig struct {
 	NumConns   int    // parallel TURN+DTLS connections
 	UseTCP     bool   // TCP vs UDP for TURN
 	Token      string // auth token for server (empty = no auth)
+}
+
+// ValidateNumConns returns a warning message if NumConns exceeds the
+// recommended maximum, or an empty string if the value is safe.
+// Mobile apps should call this and display the warning under the input field.
+func ValidateNumConns(n int) string {
+	if n > MaxRecommendedConns {
+		return fmt.Sprintf("Warning: %d connections exceeds the recommended maximum of %d. "+
+			"This may cause call instability and potential VK call blocking.", n, MaxRecommendedConns)
+	}
+	return ""
 }
 
 // NewTunnel creates a new tunnel instance.
@@ -160,6 +176,9 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	}
 	if cfg.NumConns <= 0 {
 		cfg.NumConns = 16
+	}
+	if warn := ValidateNumConns(cfg.NumConns); warn != "" {
+		t.logger.Warn(warn)
 	}
 	t.cfg = cfg
 	if telemost.IsTelemostLink(cfg.CallLink) {
@@ -501,7 +520,8 @@ func (t *Tunnel) applyState(state *tunnelState) {
 		go func() {
 			reason := state.sigClient.WaitForSessionEnd(muxCtx)
 			if reason == provider.SessionEndHungup {
-				state.sigClient.DrainAndRoute(muxCtx)
+				t.logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
+				t.teardownMux()
 			}
 		}()
 	}
@@ -641,6 +661,9 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient provider.Signalin
 	if minActive < 2 {
 		minActive = 2
 	}
+	if minActive > targetConns {
+		minActive = targetConns
+	}
 
 	const healthTimeout = 10 * time.Second
 
@@ -684,6 +707,13 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient provider.Signalin
 		case <-wakeup:
 		}
 
+		// If signaling is dead, per-conn reconnect is impossible — trigger full reconnect.
+		if !sigClient.IsAlive() {
+			t.logger.Warn("signaling connection dead, triggering full session reconnect")
+			t.teardownMux()
+			return
+		}
+
 		active := m.ActiveConns()
 		healthy := m.IsHealthy(healthTimeout)
 		if active >= targetConns && healthy {
@@ -716,6 +746,14 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient provider.Signalin
 			var err error
 			backoff := time.Second
 			for attempt := 1; ; attempt++ {
+				// Re-check signaling before each attempt.
+				if !sigClient.IsAlive() {
+					t.logger.Warn("signaling died during reconnect, triggering full session reconnect")
+					m.EndReconnect()
+					t.teardownMux()
+					return
+				}
+
 				err = t.reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID)
 				if err == nil {
 					t.logger.Info("reconnected", "conn", i+1, "of", needed, "attempt", attempt)

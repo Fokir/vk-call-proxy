@@ -60,6 +60,7 @@ type SignalingClient interface {
 	Drain()
 	DrainAndRoute(ctx context.Context)
 	Done() <-chan struct{}
+	IsAlive() bool
 	PeerID() string
 	SendHangup() error
 	Close() error
