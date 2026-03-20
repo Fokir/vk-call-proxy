@@ -204,7 +204,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 	sessLogger := s.cfg.Logger.With("session_id", fmt.Sprintf("%x", id))
 	m := mux.New(sessLogger)
 
-	m.EnableRawPackets(2048)
+	m.EnableRawPackets(4096)
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
 	m.SetMaxStreams(10000)
@@ -580,7 +580,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	m := mux.New(s.cfg.Logger)
 	defer m.Close()
 
-	m.EnableRawPackets(2048)
+	m.EnableRawPackets(4096)
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
 	m.SetMaxStreams(10000)

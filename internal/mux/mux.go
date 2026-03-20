@@ -118,6 +118,7 @@ type Mux struct {
 	idleTimeoutNs  atomic.Int64  // nanoseconds, 0 = no idle timeout
 
 	rawPackets   *RawRingBuffer // if set, StreamID=0 FrameData is routed here by DispatchLoop
+	rawEvictions atomic.Int64   // total evicted raw packets (diagnostic counter)
 
 	acceptedStreams   chan *Stream // DispatchLoop pushes FrameOpen streams here
 	closeAcceptOnce  sync.Once
@@ -306,8 +307,8 @@ func (m *Mux) SendRawPacket(f *Frame) error {
 	mc.mu.Unlock()
 
 	if err != nil {
-		// Don't fallback — just drop. Avoids cascading congestion to other connections.
-		mc.stats.errors.Add(1)
+		// Don't fallback, don't count as connection error — deadline timeouts
+		// during congestion are expected and should not degrade SWRR weight.
 		return err
 	}
 	mc.stats.bytesSent.Add(int64(len(data)))
@@ -665,10 +666,12 @@ func (m *Mux) dispatch(f *Frame) {
 		case <-s.done:
 		}
 	case FrameClose:
-		s.closed.Store(true)
+		if !s.closed.Swap(true) {
+			close(s.done)
+			m.streams.Delete(f.StreamID)
+			m.streamCount.Add(-1)
+		}
 		close(s.recv)
-		m.streams.Delete(f.StreamID)
-		m.streamCount.Add(-1)
 	}
 }
 
@@ -726,7 +729,12 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 			}
 			// Route raw IP packets to ring buffer (evicts oldest when full).
 			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
-				m.rawPackets.Push(f)
+				if evicted := m.rawPackets.Push(f); evicted > 0 {
+					m.rawEvictions.Add(1)
+					if n := m.rawEvictions.Load(); n == 1 || n%1000 == 0 {
+						m.logger.Warn("raw packet buffer full, evicting old frames", "total_evictions", n)
+					}
+				}
 				continue
 			}
 			if f.Type == FrameOpen {

@@ -854,7 +854,7 @@ func (t *Tunnel) Stop() {
 func (t *Tunnel) OnNetworkChanged() {
 	const (
 		debounceDelay = 2 * time.Second
-		gracePeriod   = 15 * time.Second // WiFi DHCP/IPv6 SLAAC can take 10-20s to settle
+		gracePeriod   = 10 * time.Second // WiFi DHCP/IPv6 SLAAC settling period
 	)
 
 	t.mu.Lock()
