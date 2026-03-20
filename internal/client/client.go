@@ -15,7 +15,6 @@ import (
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
-	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
 )
@@ -425,7 +424,19 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 	// Start unified reconnect manager (handles per-conn reconnect + full session reconnect).
 	fullReconnect := make(chan struct{}, 1)
 
-	go reconnectManager(ctx, sess, fullReconnect, cfg)
+	go NewReconnectManager(ReconnectConfig{
+		TargetConns:     cfg.NumConns,
+		AuthToken:       cfg.AuthToken,
+		Fingerprint:     cfg.Fingerprint,
+		SessionID:       sess.sessionID,
+		Logger:          logger,
+		OnFullReconnect: func() {
+			select {
+			case fullReconnect <- struct{}{}:
+			default:
+			}
+		},
+	}, sess.sigClient, sess.mgr, sess.m).Run(ctx)
 
 	// Monitor signaling for session end -- trigger full reconnect on hungup.
 	go func() {
@@ -502,7 +513,19 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 				go sess.mgr.StartKeepalive(ctx, 10*time.Second)
 
 				// Restart reconnect manager for new session.
-				go reconnectManager(ctx, sess, fullReconnect, cfg)
+				go NewReconnectManager(ReconnectConfig{
+					TargetConns:     cfg.NumConns,
+					AuthToken:       cfg.AuthToken,
+					Fingerprint:     cfg.Fingerprint,
+					SessionID:       sess.sessionID,
+					Logger:          logger,
+					OnFullReconnect: func() {
+						select {
+						case fullReconnect <- struct{}{}:
+						default:
+						}
+					},
+				}, sess.sigClient, sess.mgr, sess.m).Run(ctx)
 
 				// Restart hungup monitor for new session.
 				go func() {
@@ -526,244 +549,3 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 	startRelayProxies(ctx, logger, cfg.Siren, dialMux, cfg.NumConns, cfg.SocksPort, cfg.HTTPPort, cfg.BindAddr, cfg.BypassMatcher)
 }
 
-// reconnectManager is a unified, serialized reconnect loop.
-// It handles per-connection reconnects when signaling is alive,
-// and triggers a full session reconnect when signaling is dead.
-func reconnectManager(ctx context.Context, sess *relaySession, fullReconnect chan struct{}, cfg *Config) {
-	logger := cfg.Logger
-	sigClient := sess.sigClient
-	mgr := sess.mgr
-	m := sess.m
-	sessionID := sess.sessionID
-	targetConns := cfg.NumConns
-
-	// Local context: cancelled when this reconnectManager returns,
-	// so the ConnDied drain goroutine doesn't leak after full session reconnect.
-	localCtx, localCancel := context.WithCancel(ctx)
-	defer localCancel()
-
-	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
-	defer unsub()
-
-	minActive := targetConns / 2
-	if minActive < 2 {
-		minActive = 2
-	}
-	if minActive > targetConns {
-		minActive = targetConns
-	}
-
-	const healthTimeout = 10 * time.Second
-
-	// Wakeup signal: triggered on connection death for fast response.
-	wakeup := make(chan struct{}, 1)
-	triggerWakeup := func() {
-		select {
-		case wakeup <- struct{}{}:
-		default:
-		}
-	}
-
-	// Drain ConnDied and trigger wakeup.
-	go func() {
-		for {
-			select {
-			case <-localCtx.Done():
-				return
-			case idx, ok := <-m.ConnDied():
-				if !ok {
-					return
-				}
-				m.RemoveConn(idx)
-				// Log allocation age if available.
-				allocs := mgr.Allocations()
-				var ageStr string
-				if idx < len(allocs) && allocs[idx] != nil {
-					ageStr = time.Since(allocs[idx].CreatedAt).Round(time.Second).String()
-				}
-				logger.Info("connection died", "index", idx, "allocation_age", ageStr)
-				triggerWakeup()
-			}
-		}
-	}()
-
-	// Unified loop: check every 2s or on wakeup, maintain target connection count.
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	const (
-		normalMaxAttempts = 5
-		maxBackoff        = 30 * time.Second
-	)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		case <-wakeup:
-		}
-
-		// If signaling is dead, per-conn reconnect is impossible -- trigger full session reconnect.
-		if !sigClient.IsAlive() {
-			logger.Warn("signaling connection dead, triggering full session reconnect")
-			select {
-			case fullReconnect <- struct{}{}:
-			default:
-			}
-			return // this reconnectManager instance exits; a new one starts after full reconnect
-		}
-
-		active := m.ActiveConns()
-		healthy := m.IsHealthy(healthTimeout)
-		if active >= targetConns && healthy {
-			continue
-		}
-
-		critical := active < minActive || !healthy
-		needed := targetConns - active
-		if needed <= 0 {
-			// All conns alive but unhealthy -- probe and force reconnect of 1.
-			needed = 1
-			m.ProbeConnections(3 * time.Second)
-			logger.Warn("tunnel unhealthy, no pong received",
-				"active", active, "healthy", healthy)
-			// Wait for probe to detect dead connections.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(4 * time.Second):
-			}
-			active = m.ActiveConns()
-			needed = targetConns - active
-			if needed <= 0 {
-				continue
-			}
-		}
-		logger.Info("connections below target, reconnecting",
-			"active", active, "target", targetConns, "needed", needed,
-			"min_active", minActive, "critical", critical, "healthy", healthy)
-
-		for i := 0; i < needed; i++ {
-			m.BeginReconnect()
-			var err error
-			backoff := time.Second
-			for attempt := 1; ; attempt++ {
-				// Re-check signaling before each attempt.
-				if !sigClient.IsAlive() {
-					logger.Warn("signaling died during reconnect, triggering full session reconnect")
-					m.EndReconnect()
-					select {
-					case fullReconnect <- struct{}{}:
-					default:
-					}
-					return
-				}
-
-				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, cfg.AuthToken, cfg.Fingerprint, logger)
-				if err == nil {
-					break
-				}
-
-				if !critical && attempt >= normalMaxAttempts {
-					logger.Warn("reconnect failed, will retry next cycle",
-						"attempts", attempt, "err", err)
-					break
-				}
-
-				logger.Warn("reconnect attempt failed",
-					"attempt", attempt, "err", err, "critical", critical,
-					"next_backoff", backoff)
-				select {
-				case <-ctx.Done():
-					m.EndReconnect()
-					return
-				case <-time.After(backoff):
-				}
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-
-				// Re-check if still critical (other reconnects may have succeeded).
-				critical = m.ActiveConns() < minActive || !m.IsHealthy(healthTimeout)
-			}
-			m.EndReconnect()
-			if err != nil && !critical {
-				break // normal mode: stop, wait for next tick
-			}
-		}
-	}
-}
-
-func reconnectOne(ctx context.Context, sigClient provider.SignalingClient,
-	mgr *turn.Manager, m *mux.Mux, ackCh <-chan []byte,
-	sessionID uuid.UUID, authToken string, expectedFP []byte, logger *slog.Logger) error {
-
-	allocs, err := mgr.Allocate(ctx, 1)
-	if err != nil {
-		return fmt.Errorf("allocate TURN: %w", err)
-	}
-	alloc := allocs[0]
-	myAddr := alloc.RelayAddr.String()
-
-	// Send our new relay address to server.
-	if err := sigClient.SendPayload(ctx, internalsignal.WireConnNew, []byte(myAddr)); err != nil {
-		return fmt.Errorf("send conn-new: %w", err)
-	}
-
-	// Wait for server's relay address (timeout 15s).
-	var serverAddr string
-	select {
-	case payload, ok := <-ackCh:
-		if !ok {
-			return fmt.Errorf("ack channel closed")
-		}
-		serverAddr = string(payload)
-	case <-time.After(15 * time.Second):
-		return fmt.Errorf("timeout waiting for server relay addr")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	serverUDP, err := net.ResolveUDPAddr("udp", serverAddr)
-	if err != nil {
-		return fmt.Errorf("resolve server addr: %w", err)
-	}
-
-	// Punch and DTLS dial.
-	punchCtx, punchCancel := context.WithCancel(ctx)
-	defer punchCancel()
-	internaldtls.PunchRelay(alloc.RelayConn, serverUDP)
-	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, serverUDP)
-	time.Sleep(200 * time.Millisecond)
-
-	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer reconnCancel()
-	dtlsConn, _, err := internaldtls.DialOverTURN(reconnCtx, alloc.RelayConn, serverUDP, expectedFP)
-	if err != nil {
-		return fmt.Errorf("DialOverTURN: %w", err)
-	}
-	punchCancel()
-
-	// Auth + session ID.
-	if authToken != "" {
-		if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
-			dtlsConn.Close()
-			return fmt.Errorf("write auth token: %w", err)
-		}
-	}
-	var sid [16]byte
-	copy(sid[:], sessionID[:])
-	if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-		dtlsConn.Close()
-		return fmt.Errorf("write session id: %w", err)
-	}
-
-	m.AddConn(dtlsConn)
-	logger.Info("reconnect: new connection added to MUX",
-		"active", m.ActiveConns(),
-		"total", m.TotalConns(),
-	)
-	return nil
-}
