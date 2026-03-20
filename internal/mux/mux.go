@@ -724,11 +724,9 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 				}
 				continue
 			}
-			// Route raw IP packets to ring buffer (blocks when full for backpressure).
+			// Route raw IP packets to ring buffer (evicts oldest when full).
 			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
-				if err := m.rawPackets.Push(ctx, f); err != nil {
-					return
-				}
+				m.rawPackets.Push(f)
 				continue
 			}
 			if f.Type == FrameOpen {

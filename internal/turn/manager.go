@@ -18,7 +18,6 @@ type Allocation struct {
 	Client    *pionTurn.Client
 	RelayConn net.PacketConn
 	RelayAddr net.Addr
-	PeerAddr  net.Addr // remote relay address for keepalive writes
 	Creds     *provider.Credentials
 	CreatedAt time.Time
 	conn      net.Conn
@@ -193,18 +192,13 @@ func (m *Manager) Allocations() []*Allocation {
 	return out
 }
 
-// keepalivePayload is a minimal 1-byte packet sent through the relay to
-// trigger pion/turn's ChannelBind refresh and CreatePermission refresh.
-// It arrives at the peer's DTLS layer as an invalid record and is dropped.
-var keepalivePayload = []byte{0}
-
-// StartKeepalive writes a tiny packet through each relay connection to
-// keep TURN control state alive. VK TURN servers timeout allocations
-// after ~90s if no TURN control messages (Refresh, ChannelBind,
-// CreatePermission) flow. pion/turn only refreshes ChannelBind every
-// 5 minutes internally, which is too slow. Writing through RelayConn
-// forces pion to call maybeBind() → ChannelBind request, and also
-// refreshes CreatePermission. Call in a goroutine.
+// StartKeepalive sends periodic STUN Binding requests on all active
+// allocations to keep the TURN TCP connection alive. VK TURN servers
+// have a ~90s idle timeout on the control plane. While STUN Binding
+// alone may not reset TURN allocation lifetime, it keeps the TCP socket
+// active and prevents load balancer timeouts. The actual TURN allocation
+// refresh is handled by pion/turn's internal auto-refresh at lifetime/2.
+// Call in a goroutine.
 func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -216,25 +210,7 @@ func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
 			copy(allocs, m.allocations)
 			m.mu.Unlock()
 			for i, a := range allocs {
-				if a == nil {
-					continue
-				}
-				// Write through the relay conn to force pion/turn to
-				// maintain ChannelBind and Permission state. This sends
-				// either ChannelData (if binding exists) or SendIndication
-				// (if not), both of which are TURN control-plane activity.
-				if a.RelayConn != nil && a.PeerAddr != nil {
-					if a.conn != nil {
-						a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					}
-					if _, err := a.RelayConn.WriteTo(keepalivePayload, a.PeerAddr); err != nil {
-						m.logger.Debug("TURN relay keepalive failed", "index", i, "err", err)
-					}
-					if a.conn != nil {
-						a.conn.SetWriteDeadline(time.Time{})
-					}
-				} else if a.Client != nil {
-					// Fallback: STUN Binding if peer address unknown.
+				if a != nil && a.Client != nil {
 					if a.conn != nil {
 						a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 					}

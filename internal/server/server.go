@@ -541,8 +541,6 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		// Store peer address for TURN keepalive (relay-level WriteTo).
-		allocs[i].PeerAddr = clientUDP
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
 			internaldtls.PunchRelay(relayConn, addr)
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
@@ -733,7 +731,6 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 		return fmt.Errorf("allocate TURN: %w", err)
 	}
 	alloc := allocs[0]
-	alloc.PeerAddr = clientUDP
 	myAddr := alloc.RelayAddr.String()
 
 	if err := sigClient.SendPayload(ctx, internalsignal.WireConnOk, []byte(myAddr)); err != nil {

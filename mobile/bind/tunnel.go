@@ -443,8 +443,6 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		// Store peer address for TURN keepalive (relay-level WriteTo).
-		allocs[i].PeerAddr = serverUDP
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
 			internaldtls.PunchRelay(relayConn, addr)
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
@@ -519,7 +517,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	ready := t.muxReady
 	t.mu.Unlock()
 
-	state.m.EnableRawPackets(2048)
+	state.m.EnableRawPackets(4096)
 	state.m.SetIdleTimeout(15 * time.Second)
 	go state.m.DispatchLoop(muxCtx)
 	go state.m.StartPingLoop(muxCtx, 5*time.Second)

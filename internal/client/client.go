@@ -335,8 +335,6 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			results <- dtlsResult{index: i, err: err}
 			continue
 		}
-		// Store peer address for TURN keepalive (relay-level WriteTo).
-		allocs[i].PeerAddr = serverUDP
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
 			internaldtls.PunchRelay(relayConn, addr)
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
