@@ -1,15 +1,13 @@
 package provider
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"strings"
 )
 
-var maleFirstNames = []string{
+// MaleFirstNames is the pool of male first names used for display name generation.
+var MaleFirstNames = []string{
 	"Андрей", "Александр", "Алексей", "Артём", "Антон",
 	"Борис", "Вадим", "Валерий", "Виктор", "Владимир",
 	"Владислав", "Глеб", "Григорий", "Даниил", "Денис",
@@ -22,7 +20,8 @@ var maleFirstNames = []string{
 	"Коля", "Серёжа",
 }
 
-var femaleFirstNames = []string{
+// FemaleFirstNames is the pool of female first names used for display name generation.
+var FemaleFirstNames = []string{
 	"Анна", "Алина", "Анастасия", "Валерия", "Вероника",
 	"Виктория", "Дарья", "Евгения", "Екатерина", "Елена",
 	"Ирина", "Кристина", "Ксения", "Мария", "Марина",
@@ -31,13 +30,14 @@ var femaleFirstNames = []string{
 	"Алёна", "Юлия", "Диана", "Софья", "Маша",
 }
 
-// lastNamePairs stores male and female forms of each surname.
-type lastNamePair struct {
+// LastNamePair stores male and female forms of each surname.
+type LastNamePair struct {
 	Male   string
 	Female string
 }
 
-var lastNames = []lastNamePair{
+// LastNames is the pool of surname pairs used for display name generation.
+var LastNames = []LastNamePair{
 	{"Иванов", "Иванова"}, {"Петров", "Петрова"}, {"Сидоров", "Сидорова"},
 	{"Кузнецов", "Кузнецова"}, {"Соколов", "Соколова"}, {"Попов", "Попова"},
 	{"Лебедев", "Лебедева"}, {"Козлов", "Козлова"}, {"Новиков", "Новикова"},
@@ -56,14 +56,16 @@ var lastNames = []lastNamePair{
 	{"Антонов", "Антонова"}, {"Тарасов", "Тарасова"}, {"Жуков", "Жукова"},
 }
 
-var nickPrefixes = []string{
+// NickPrefixes is the pool of nickname prefixes used for display name generation.
+var NickPrefixes = []string{
 	"cool", "dark", "pro", "mega", "neo",
 	"mr", "just", "real", "big", "old",
 	"ice", "mad", "top", "fast", "true",
 	"super", "best", "the", "epic", "wild",
 }
 
-var nickBases = []string{
+// NickBases is the pool of nickname base words used for display name generation.
+var NickBases = []string{
 	"wolf", "hawk", "fox", "bear", "lion",
 	"tiger", "eagle", "shark", "viper", "cobra",
 	"phantom", "shadow", "ghost", "storm", "blaze",
@@ -72,7 +74,8 @@ var nickBases = []string{
 	"knight", "king", "chief", "boss", "legend",
 }
 
-var translitMap = map[rune]string{
+// TranslitMap maps Cyrillic runes to their Latin transliteration.
+var TranslitMap = map[rune]string{
 	'А': "A", 'Б': "B", 'В': "V", 'Г': "G", 'Д': "D",
 	'Е': "E", 'Ё': "E", 'Ж': "Zh", 'З': "Z", 'И': "I",
 	'Й': "Y", 'К': "K", 'Л': "L", 'М': "M", 'Н': "N",
@@ -89,10 +92,11 @@ var translitMap = map[rune]string{
 	'э': "e", 'ю': "yu", 'я': "ya",
 }
 
-func transliterate(s string) string {
+// Transliterate converts a Cyrillic string to Latin using TranslitMap.
+func Transliterate(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if lat, ok := translitMap[r]; ok {
+		if lat, ok := TranslitMap[r]; ok {
 			b.WriteString(lat)
 		} else {
 			b.WriteRune(r)
@@ -108,13 +112,13 @@ func randomGender() bool {
 
 func randomFirstName(male bool) string {
 	if male {
-		return maleFirstNames[rand.IntN(len(maleFirstNames))]
+		return MaleFirstNames[rand.IntN(len(MaleFirstNames))]
 	}
-	return femaleFirstNames[rand.IntN(len(femaleFirstNames))]
+	return FemaleFirstNames[rand.IntN(len(FemaleFirstNames))]
 }
 
 func randomLastName(male bool) string {
-	pair := lastNames[rand.IntN(len(lastNames))]
+	pair := LastNames[rand.IntN(len(LastNames))]
 	if male {
 		return pair.Male
 	}
@@ -148,112 +152,18 @@ func RandomDisplayName() string {
 	}
 }
 
-// DeriveDisplayNames generates deterministic display names from a shared token.
-// Both client and server independently compute the same name pairs.
-// Returns serverNames[0..n-1] and clientNames[0..n-1].
-// Names look like natural Telemost participant names (Russian names, nicknames).
-func DeriveDisplayNames(token string, n int) (serverNames, clientNames []string) {
-	used := make(map[string]bool)
-	serverNames = make([]string, n)
-	clientNames = make([]string, n)
-
-	for i := 0; i < n; i++ {
-		serverNames[i] = deriveUniqueName(token, "s", i, used)
-	}
-	for i := 0; i < n; i++ {
-		clientNames[i] = deriveUniqueName(token, "c", i, used)
-	}
-	return
-}
-
-// deriveUniqueName generates a deterministic name and retries with incrementing
-// suffix if the name collides with an already-used one.
-func deriveUniqueName(token, role string, index int, used map[string]bool) string {
-	for attempt := 0; attempt < 100; attempt++ {
-		name := deriveName(token, role, index+attempt*1000)
-		if !used[name] {
-			used[name] = true
-			return name
-		}
-	}
-	// Fallback: should never happen with reasonable name space.
-	name := deriveName(token, role, index)
-	used[name] = true
-	return name
-}
-
-// deriveName produces a single deterministic display name from HMAC(token, role+index).
-func deriveName(token, role string, index int) string {
-	mac := hmac.New(sha256.New, []byte(token))
-	mac.Write([]byte(fmt.Sprintf("%s-%d", role, index)))
-	h := mac.Sum(nil) // 32 bytes
-
-	// Use first 8 bytes as deterministic seed.
-	seed := binary.BigEndian.Uint64(h[:8])
-	r := rand.New(rand.NewPCG(seed, binary.BigEndian.Uint64(h[8:16])))
-
-	male := r.IntN(2) == 0
-	switch r.IntN(4) {
-	case 0:
-		// First name only.
-		return seededFirstName(r, male)
-	case 1:
-		// Last name only.
-		return seededLastName(r, male)
-	case 2:
-		// First + Last or Last + First.
-		first := seededFirstName(r, male)
-		last := seededLastName(r, male)
-		if r.IntN(2) == 0 {
-			return first + " " + last
-		}
-		return last + " " + first
-	default:
-		// Latin nickname.
-		return seededNickname(r)
-	}
-}
-
-func seededFirstName(r *rand.Rand, male bool) string {
-	if male {
-		return maleFirstNames[r.IntN(len(maleFirstNames))]
-	}
-	return femaleFirstNames[r.IntN(len(femaleFirstNames))]
-}
-
-func seededLastName(r *rand.Rand, male bool) string {
-	pair := lastNames[r.IntN(len(lastNames))]
-	if male {
-		return pair.Male
-	}
-	return pair.Female
-}
-
-func seededNickname(r *rand.Rand) string {
-	switch r.IntN(3) {
-	case 0:
-		pair := lastNames[r.IntN(len(lastNames))]
-		base := strings.ToLower(transliterate(pair.Male))
-		return fmt.Sprintf("%s%d", base, r.IntN(100))
-	case 1:
-		return nickPrefixes[r.IntN(len(nickPrefixes))] + nickBases[r.IntN(len(nickBases))]
-	default:
-		return fmt.Sprintf("%s%d", nickBases[r.IntN(len(nickBases))], r.IntN(1000))
-	}
-}
-
 func randomNickname() string {
 	switch rand.IntN(3) {
 	case 0:
 		// transliterated surname + digits
-		pair := lastNames[rand.IntN(len(lastNames))]
-		base := strings.ToLower(transliterate(pair.Male))
+		pair := LastNames[rand.IntN(len(LastNames))]
+		base := strings.ToLower(Transliterate(pair.Male))
 		return fmt.Sprintf("%s%d", base, rand.IntN(100))
 	case 1:
 		// prefix + base
-		return nickPrefixes[rand.IntN(len(nickPrefixes))] + nickBases[rand.IntN(len(nickBases))]
+		return NickPrefixes[rand.IntN(len(NickPrefixes))] + NickBases[rand.IntN(len(NickBases))]
 	default:
 		// base + digits
-		return fmt.Sprintf("%s%d", nickBases[rand.IntN(len(nickBases))], rand.IntN(1000))
+		return fmt.Sprintf("%s%d", NickBases[rand.IntN(len(NickBases))], rand.IntN(1000))
 	}
 }

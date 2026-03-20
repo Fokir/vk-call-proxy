@@ -319,7 +319,7 @@ func (s *Server) runTelemostSession(ctx context.Context, svc *telemost.Service, 
 	defer sessCancel()
 
 	// Derive deterministic display names from auth token.
-	serverNames, clientNames := provider.DeriveDisplayNames(s.cfg.AuthToken, n)
+	serverNames, clientNames := telemost.DeriveDisplayNames(s.cfg.AuthToken, n)
 
 	// Phase 1: Setup all N participants in parallel (non-blocking).
 	type setupResult struct {

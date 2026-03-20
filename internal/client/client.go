@@ -45,7 +45,7 @@ func RunTelemost(ctx context.Context, cfg *Config) {
 	logger.Info("starting Telemost WebRTC mode", "service", svc.Name(), "conns", cfg.NumConns)
 
 	// Derive deterministic display names from auth token for 1:1 pairing.
-	serverNames, clientNames := provider.DeriveDisplayNames(cfg.AuthToken, cfg.NumConns)
+	serverNames, clientNames := telemost.DeriveDisplayNames(cfg.AuthToken, cfg.NumConns)
 
 	var muxConns []io.ReadWriteCloser
 	var cleanups []func()

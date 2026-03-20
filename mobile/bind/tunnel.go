@@ -239,7 +239,7 @@ func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunne
 		return nil, fmt.Errorf("expected telemost.Service")
 	}
 
-	serverNames, clientNames := provider.DeriveDisplayNames(cfg.Token, cfg.NumConns)
+	serverNames, clientNames := telemost.DeriveDisplayNames(cfg.Token, cfg.NumConns)
 	sessionID := uuid.New()
 
 	var muxConns []io.ReadWriteCloser
