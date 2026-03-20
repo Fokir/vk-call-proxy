@@ -117,8 +117,9 @@ type Tunnel struct {
 	sessionID  uuid.UUID              // current session ID
 
 	// network change debouncing
-	networkDebounce *time.Timer    // coalesces rapid network change events
-	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
+	networkDebounce    *time.Timer    // coalesces rapid network change events
+	networkForce       chan struct{}   // signals reconnectLoop to do immediate full reconnect
+	lastNetworkChange  atomic.Int64   // UnixNano timestamp of last OnNetworkChanged call
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -589,6 +590,7 @@ func (t *Tunnel) teardownMux() {
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 30 * time.Second
+	const networkSettleDelay = 4 * time.Second // wait for OS to switch default route
 	backoff := time.Second
 
 	for {
@@ -628,6 +630,21 @@ func (t *Tunnel) reconnectLoop() {
 			case <-t.rootCtx.Done():
 				return
 			case <-time.After(backoff):
+			}
+
+			// If a network change happened recently, wait for the OS to fully
+			// switch the default route. Without this, new TCP connections may
+			// go through the dying interface (e.g. WiFi→LTE: signaling dies
+			// instantly but WiFi is still the default route for a few seconds).
+			if ts := t.lastNetworkChange.Load(); ts > 0 {
+				if wait := networkSettleDelay - time.Since(time.Unix(0, ts)); wait > 0 {
+					t.logger.Info("waiting for network to settle", "wait", wait.Round(time.Millisecond))
+					select {
+					case <-t.rootCtx.Done():
+						return
+					case <-time.After(wait):
+					}
+				}
 			}
 
 			attemptCtx, attemptCancel := context.WithTimeout(t.rootCtx, attemptTimeout)
@@ -905,6 +922,7 @@ func (t *Tunnel) OnNetworkChanged() {
 	})
 	t.mu.Unlock()
 
+	t.lastNetworkChange.Store(time.Now().UnixNano())
 	t.logger.Info("network change detected, debouncing")
 }
 
