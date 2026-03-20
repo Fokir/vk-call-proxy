@@ -189,7 +189,7 @@ func (ns *Stack) outboundLoop() {
 		view.Release()
 		pkt.DecRef()
 
-		_ = ns.m.SendFrame(&mux.Frame{
+		_ = ns.m.SendRawPacket(&mux.Frame{
 			StreamID: 0,
 			Type:     mux.FrameData,
 			Sequence: ns.m.NextSeq(),

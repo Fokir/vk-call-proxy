@@ -272,9 +272,47 @@ func (m *Mux) selectConn() *muxConn {
 }
 
 // SendFrame writes a frame using the SWRR-selected connection.
-// Use this for non-stream frames (raw packets, pings, control).
+// Use this for non-stream frames (pings, control).
 func (m *Mux) SendFrame(f *Frame) error {
 	return m.sendFrameOn(m.selectConn(), f)
+}
+
+// SendRawPacket writes a raw IP packet frame with a short write deadline
+// and no fallback. If the selected connection is congested, the packet is
+// dropped silently — this prevents TCP bidirectional congestion on TURN
+// relays from blocking ALL connections during heavy upload (e.g. speed tests).
+// TCP retransmits lost packets; UDP is best-effort by nature.
+func (m *Mux) SendRawPacket(f *Frame) error {
+	mc := m.selectConn()
+	if mc == nil {
+		return errors.New("no connections available")
+	}
+
+	data, err := f.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	const rawWriteDeadline = 200 * time.Millisecond
+
+	mc.mu.Lock()
+	if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.SetWriteDeadline(time.Now().Add(rawWriteDeadline))
+	}
+	_, err = mc.conn.Write(data)
+	if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.SetWriteDeadline(time.Time{})
+	}
+	mc.mu.Unlock()
+
+	if err != nil {
+		// Don't fallback — just drop. Avoids cascading congestion to other connections.
+		mc.stats.errors.Add(1)
+		return err
+	}
+	mc.stats.bytesSent.Add(int64(len(data)))
+	mc.stats.lastUsed.Store(time.Now().UnixNano())
+	return nil
 }
 
 // sendFrameOn writes a frame on a specific connection.

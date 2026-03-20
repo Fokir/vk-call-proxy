@@ -729,7 +729,7 @@ func (t *Tunnel) WritePacket(data []byte) error {
 		return nil // drop oversized packet
 	}
 
-	return m.SendFrame(&mux.Frame{
+	return m.SendRawPacket(&mux.Frame{
 		StreamID: 0,
 		Type:     mux.FrameData,
 		Sequence: m.NextSeq(),
@@ -849,7 +849,11 @@ func (t *Tunnel) Stop() {
 // OnNetworkChanged should be called by the mobile platform when the network
 // connectivity changes (e.g. WiFi→cellular).
 func (t *Tunnel) OnNetworkChanged() {
-	const debounceDelay = 2 * time.Second
+	const (
+		debounceDelay = 2 * time.Second
+		gracePeriod   = 15 * time.Second // WiFi DHCP/IPv6 SLAAC can take 10-20s to settle
+		healthProbe   = 8 * time.Second  // recent pong within this window = healthy
+	)
 
 	t.mu.Lock()
 	running := t.running
@@ -860,7 +864,7 @@ func (t *Tunnel) OnNetworkChanged() {
 		return
 	}
 
-	if connAge < 5*time.Second {
+	if connAge < gracePeriod {
 		t.mu.Unlock()
 		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
@@ -882,7 +886,16 @@ func (t *Tunnel) OnNetworkChanged() {
 	}
 
 	force := t.networkForce
+	mux := t.m
 	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
+		// Check if connections are still healthy before tearing down.
+		// A spurious network event (e.g. WiFi DHCP renewal) should not
+		// kill a working tunnel.
+		if mux != nil && mux.ActiveConns() > 0 && mux.IsHealthy(healthProbe) {
+			t.logger.Info("network change debounce fired but tunnel is healthy, skipping reconnect",
+				"active", mux.ActiveConns())
+			return
+		}
 		t.logger.Info("network change debounce fired, forcing full reconnect")
 		t.teardownMux()
 		select {
