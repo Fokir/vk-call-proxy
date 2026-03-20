@@ -5,6 +5,7 @@ package bind
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -105,6 +106,7 @@ type Tunnel struct {
 
 	// reconnect infrastructure
 	cfg        *TunnelConfig
+	fpBytes    []byte          // parsed fingerprint bytes from cfg.Fingerprint
 	svc        provider.Service
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -126,11 +128,12 @@ const MaxRecommendedConns = 8
 
 // TunnelConfig holds configuration for starting the tunnel.
 type TunnelConfig struct {
-	CallLink   string // call-link ID
-	ServerAddr string // VPN server address (host:port), empty = relay-to-relay mode
-	NumConns   int    // parallel TURN+DTLS connections
-	UseTCP     bool   // TCP vs UDP for TURN
-	Token      string // auth token for server (empty = no auth)
+	CallLink    string // call-link ID
+	ServerAddr  string // VPN server address (host:port), empty = relay-to-relay mode
+	NumConns    int    // parallel TURN+DTLS connections
+	UseTCP      bool   // TCP vs UDP for TURN
+	Token       string // auth token for server (empty = no auth)
+	Fingerprint string // server DTLS certificate SHA-256 fingerprint (hex, empty = no pinning)
 }
 
 // ValidateNumConns returns a warning message if NumConns exceeds the
@@ -181,6 +184,16 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		t.logger.Warn(warn)
 	}
 	t.cfg = cfg
+	if cfg.Fingerprint != "" {
+		fp, err := hex.DecodeString(cfg.Fingerprint)
+		if err != nil || len(fp) != 32 {
+			t.mu.Unlock()
+			return fmt.Errorf("invalid fingerprint: must be 64 hex characters (SHA-256)")
+		}
+		t.fpBytes = fp
+	} else {
+		t.fpBytes = nil
+	}
 	if telemost.IsTelemostLink(cfg.CallLink) {
 		t.svc = telemost.NewService(cfg.CallLink, cfg.Token)
 	} else {
@@ -297,7 +310,7 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	var muxConns []io.ReadWriteCloser
 	var cleanups []context.CancelFunc
 	for i, alloc := range allocs {
-		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverAddr)
+		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverAddr, t.fpBytes)
 		if err != nil {
 			t.logger.Warn("DTLS-over-TURN failed", "index", i, "err", err)
 			continue
@@ -435,7 +448,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
 			time.Sleep(500 * time.Millisecond)
 
-			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr)
+			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
 			if err != nil {
 				results <- dtlsResult{index: idx, err: err}
 				return
@@ -828,7 +841,7 @@ func (t *Tunnel) reconnectOne(ctx context.Context, sigClient provider.SignalingC
 	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, serverUDP)
 	time.Sleep(500 * time.Millisecond)
 
-	dtlsConn, _, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDP)
+	dtlsConn, _, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDP, t.fpBytes)
 	if err != nil {
 		return fmt.Errorf("DialOverTURN: %w", err)
 	}

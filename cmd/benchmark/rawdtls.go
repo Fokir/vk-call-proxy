@@ -115,7 +115,7 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig pr
 			var cleanup context.CancelFunc
 			var herr error
 			if isSender {
-				conn, cleanup, herr = internaldtls.DialOverTURN(ctx, relayConn, addr)
+				conn, cleanup, herr = internaldtls.DialOverTURN(ctx, relayConn, addr, nil)
 			} else {
 				conn, cleanup, herr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)
 			}

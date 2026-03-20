@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -39,8 +41,18 @@ func main() {
 	bindAddr := flag.String("bind", "127.0.0.1", "Bind address for SOCKS5/HTTP proxy listeners")
 	authToken := flag.String("token", "", "auth token for server")
 	noBypass := flag.Bool("no-bypass", false, "disable built-in bypass for Russian services (VK, Yandex, Gosuslugi, etc.)")
+	fingerprint := flag.String("fingerprint", "", "server DTLS certificate SHA-256 fingerprint (hex)")
 
 	flag.Parse()
+
+	var fpBytes []byte
+	if *fingerprint != "" {
+		var err error
+		fpBytes, err = hex.DecodeString(*fingerprint)
+		if err != nil || len(fpBytes) != 32 {
+			log.Fatalf("invalid fingerprint: must be 64 hex characters (SHA-256)")
+		}
+	}
 
 	if *numConns > 8 {
 		fmt.Fprintf(os.Stderr, "WARNING: --n=%d exceeds recommended maximum of 8. "+
@@ -86,9 +98,9 @@ func main() {
 	if tmSvc, ok := svc.(*telemost.Service); ok {
 		runTelemost(ctx, logger, siren, tmSvc, *numConns, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
 	} else if *serverAddr != "" {
-		runDirect(ctx, logger, siren, svc, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
+		runDirect(ctx, logger, siren, svc, *serverAddr, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, fpBytes, bypassMatcher)
 	} else {
-		runRelayToRelay(ctx, logger, siren, svc, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, bypassMatcher)
+		runRelayToRelay(ctx, logger, siren, svc, *numConns, *useTCP, *socks5Port, *httpPort, *bindAddr, *authToken, fpBytes, bypassMatcher)
 	}
 }
 
@@ -173,7 +185,7 @@ func runTelemost(ctx context.Context, logger *slog.Logger, siren *monitoring.Sir
 // runDirect connects through TURN to a server listening on a direct UDP address.
 func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
 	svc provider.Service, server string, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
-	bypassMatcher *bypass.Matcher) {
+	fpBytes []byte, bypassMatcher *bypass.Matcher) {
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
@@ -207,7 +219,7 @@ func runDirect(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren
 
 	var muxConns []io.ReadWriteCloser
 	for i, alloc := range allocs {
-		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDPAddr)
+		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDPAddr, fpBytes)
 		if err != nil {
 			logger.Warn("DTLS-over-TURN failed", "index", i, "err", err)
 			continue
@@ -293,7 +305,7 @@ func (rs *relaySession) Close() {
 // connectRelaySession establishes a full relay-to-relay session:
 // join conference → signaling → TURN allocations → relay addr exchange → DTLS.
 func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
-	svc provider.Service, numConns int, useTCP bool, authToken string) (*relaySession, error) {
+	svc provider.Service, numConns int, useTCP bool, authToken string, expectedFP []byte) (*relaySession, error) {
 
 	// 1. Join conference to get TURN creds and signaling endpoint.
 	jr, err := svc.FetchJoinInfo(ctx)
@@ -398,7 +410,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
 			time.Sleep(500 * time.Millisecond)
 
-			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr)
+			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)
 			if err != nil {
 				results <- dtlsResult{index: idx, err: err}
 				return
@@ -461,11 +473,11 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 // joins the same call. Relay addresses are exchanged via signaling.
 func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
 	svc provider.Service, numConns int, useTCP bool, socks5Port, httpPort int, bindAddr, authToken string,
-	bypassMatcher *bypass.Matcher) {
+	fpBytes []byte, bypassMatcher *bypass.Matcher) {
 
 	logger.Info("starting relay-to-relay mode", "service", svc.Name(), "conns", numConns)
 
-	sess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken)
+	sess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken, fpBytes)
 	if err != nil {
 		logger.Error("failed to establish relay session", "err", err)
 		os.Exit(1)
@@ -483,7 +495,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	// Start unified reconnect manager (handles per-conn reconnect + full session reconnect).
 	fullReconnect := make(chan struct{}, 1)
 
-	go reconnectManager(ctx, sess, fullReconnect, authToken, numConns, logger)
+	go reconnectManager(ctx, sess, fullReconnect, authToken, fpBytes, numConns, logger)
 
 	// Monitor signaling for session end — trigger full reconnect on hungup.
 	go func() {
@@ -523,7 +535,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 				case <-time.After(backoff):
 				}
 
-				newSess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken)
+				newSess, err := connectRelaySession(ctx, logger, siren, svc, numConns, useTCP, authToken, fpBytes)
 				if err != nil {
 					logger.Warn("full session reconnect failed", "err", err, "next_backoff", backoff)
 					backoff = backoff * 2
@@ -560,7 +572,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 				go sess.mgr.StartKeepalive(ctx, 10*time.Second)
 
 				// Restart reconnect manager for new session.
-				go reconnectManager(ctx, sess, fullReconnect, authToken, numConns, logger)
+				go reconnectManager(ctx, sess, fullReconnect, authToken, fpBytes, numConns, logger)
 
 				// Restart hungup monitor for new session.
 				go func() {
@@ -588,7 +600,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 // It handles per-connection reconnects when signaling is alive,
 // and triggers a full session reconnect when signaling is dead.
 func reconnectManager(ctx context.Context, sess *relaySession, fullReconnect chan struct{},
-	authToken string, targetConns int, logger *slog.Logger) {
+	authToken string, expectedFP []byte, targetConns int, logger *slog.Logger) {
 
 	sigClient := sess.sigClient
 	mgr := sess.mgr
@@ -718,7 +730,7 @@ func reconnectManager(ctx context.Context, sess *relaySession, fullReconnect cha
 					return
 				}
 
-				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
+				err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, expectedFP, logger)
 				if err == nil {
 					break
 				}
@@ -756,7 +768,7 @@ func reconnectManager(ctx context.Context, sess *relaySession, fullReconnect cha
 
 func reconnectOne(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, ackCh <-chan []byte,
-	sessionID uuid.UUID, authToken string, logger *slog.Logger) error {
+	sessionID uuid.UUID, authToken string, expectedFP []byte, logger *slog.Logger) error {
 
 	allocs, err := mgr.Allocate(ctx, 1)
 	if err != nil {
@@ -798,7 +810,7 @@ func reconnectOne(ctx context.Context, sigClient provider.SignalingClient,
 
 	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer reconnCancel()
-	dtlsConn, _, err := internaldtls.DialOverTURN(reconnCtx, alloc.RelayConn, serverUDP)
+	dtlsConn, _, err := internaldtls.DialOverTURN(reconnCtx, alloc.RelayConn, serverUDP, expectedFP)
 	if err != nil {
 		return fmt.Errorf("DialOverTURN: %w", err)
 	}

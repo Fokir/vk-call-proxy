@@ -2,6 +2,7 @@ package dtls
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -77,4 +78,9 @@ func (l *Listener) Accept(ctx context.Context) (net.Conn, error) {
 // Close shuts down the DTLS listener.
 func (l *Listener) Close() error {
 	return l.ln.Close()
+}
+
+// CertFingerprint returns the SHA-256 fingerprint of the server's DTLS certificate.
+func (l *Listener) CertFingerprint() [32]byte {
+	return sha256.Sum256(l.certPool.Certificate[0])
 }

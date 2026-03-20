@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -130,7 +131,9 @@ func (s *Server) runDirectMode(ctx context.Context) {
 	}
 	defer ln.Close()
 
-	s.cfg.Logger.Info("server listening (DTLS/UDP, direct mode)", "addr", s.cfg.ListenAddr)
+	fp := ln.CertFingerprint()
+	s.cfg.Logger.Info("server listening (DTLS/UDP, direct mode)", "addr", s.cfg.ListenAddr,
+		"fingerprint", hex.EncodeToString(fp[:]))
 
 	go func() {
 		<-ctx.Done()

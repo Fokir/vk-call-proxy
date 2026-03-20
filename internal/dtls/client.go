@@ -1,7 +1,9 @@
 package dtls
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -20,7 +22,7 @@ import (
 // Returns a net.Conn that implements io.ReadWriteCloser, suitable
 // for plugging directly into the MUX as a stream-oriented connection.
 // The returned CancelFunc must be called to stop the bridge goroutines.
-func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net.UDPAddr) (net.Conn, context.CancelFunc, error) {
+func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net.UDPAddr, expectedFP []byte) (net.Conn, context.CancelFunc, error) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate self-signed cert: %w", err)
@@ -100,6 +102,20 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
 		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
+		VerifyConnection: func(state *dtls.State) error {
+			if len(expectedFP) == 0 {
+				return nil // no pinning requested
+			}
+			certs := state.PeerCertificates
+			if len(certs) == 0 {
+				return fmt.Errorf("server presented no certificate")
+			}
+			got := sha256.Sum256(certs[0])
+			if !bytes.Equal(got[:], expectedFP) {
+				return fmt.Errorf("certificate fingerprint mismatch: got %x", got)
+			}
+			return nil
+		},
 	}
 
 	hsCtx, hsCancel := context.WithTimeout(ctx, 30*time.Second)
