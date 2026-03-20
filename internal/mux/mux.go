@@ -550,6 +550,7 @@ type Stream struct {
 	mux          *Mux
 	recv         chan []byte
 	closed       atomic.Bool
+	done         chan struct{}
 	leftover     []byte    // unread remainder from previous Read
 	assignedConn *muxConn  // pinned connection for write ordering (set once at creation)
 }
@@ -562,6 +563,7 @@ func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 		ID:           id,
 		mux:          m,
 		recv:         make(chan []byte, 1024),
+		done:         make(chan struct{}),
 		assignedConn: assigned,
 	}
 	m.streamCount.Add(1)
@@ -597,6 +599,7 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 					ID:   f.StreamID,
 					mux:  m,
 					recv: make(chan []byte, 1024),
+					done: make(chan struct{}),
 				}
 				m.streamCount.Add(1)
 				m.streams.Store(f.StreamID, s)
@@ -621,8 +624,7 @@ func (m *Mux) dispatch(f *Frame) {
 	case FrameData:
 		select {
 		case s.recv <- f.Payload:
-		default:
-			m.logger.Warn("stream recv buffer full, dropping frame", "stream", f.StreamID)
+		case <-s.done:
 		}
 	case FrameClose:
 		s.closed.Store(true)
@@ -700,6 +702,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					ID:           f.StreamID,
 					mux:          m,
 					recv:         make(chan []byte, 1024),
+					done:         make(chan struct{}),
 					assignedConn: m.selectConn(),
 				}
 				m.streamCount.Add(1)
@@ -782,6 +785,7 @@ func (s *Stream) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	close(s.done)
 	s.mux.streams.Delete(s.ID)
 	s.mux.streamCount.Add(-1)
 	return s.mux.sendFrameOn(s.assignedConn, &Frame{
