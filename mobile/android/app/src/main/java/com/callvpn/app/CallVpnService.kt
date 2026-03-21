@@ -237,6 +237,16 @@ class CallVpnService : VpnService() {
                             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
                         }
 
+                        // Broadcast connection stage.
+                        val stage = tunnel?.stage() ?: ""
+                        if (stage.isNotEmpty()) {
+                            val stageIntent = Intent(ACTION_STAGE).apply {
+                                putExtra(EXTRA_STAGE_TEXT, stage)
+                            }
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(stageIntent)
+                        }
+
                         // Broadcast connection count.
                         val active = tunnel?.activeConns()?.toInt() ?: 0
                         val total = tunnel?.totalConns()?.toInt() ?: 0
@@ -376,6 +386,8 @@ class CallVpnService : VpnService() {
         const val ACTION_CONN_COUNT = "com.callvpn.CONN_COUNT"
         const val EXTRA_ACTIVE_CONNS = "active_conns"
         const val EXTRA_TOTAL_CONNS = "total_conns"
+        const val ACTION_STAGE = "com.callvpn.STAGE"
+        const val EXTRA_STAGE_TEXT = "stage_text"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1
 

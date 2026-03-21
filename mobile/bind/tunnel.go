@@ -121,6 +121,9 @@ type Tunnel struct {
 	// network change debouncing
 	networkDebounce *time.Timer    // coalesces rapid network change events
 	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
+
+	// connection stage (for UI display)
+	stage atomic.Value // string
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -167,6 +170,21 @@ func (t *Tunnel) ReadLogs() string {
 // ClearLogs removes all buffered log lines.
 func (t *Tunnel) ClearLogs() {
 	t.logBuf.Clear()
+}
+
+// Stage returns the current connection stage for UI display.
+// Returns empty string when connected or idle.
+func (t *Tunnel) Stage() string {
+	v := t.stage.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+func (t *Tunnel) setStage(s string) {
+	t.stage.Store(s)
+	t.logger.Info("stage: " + s)
 }
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
@@ -365,12 +383,14 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	svc := t.svc
 	t.mu.Unlock()
 
+	t.setStage("Получение токена VK...")
 	jr, err := svc.FetchJoinInfo(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("join conference: %w", err)
 	}
 	t.logger.Info("joined conference", "conv_id", jr.ConvID)
 
+	t.setStage("Подключение к TURN...")
 	// Start TURN allocations in background — independent of signaling setup.
 	type allocResult struct {
 		allocs []*turn.Allocation
@@ -385,6 +405,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}()
 
 	// Meanwhile, set up signaling (connect + SetKey + disconnect handshake).
+	t.setStage("Подключение к сигналингу...")
 	sigClient, err := svc.ConnectSignaling(ctx, jr, t.logger.With("component", "signaling"))
 	if err != nil {
 		ar := <-allocCh
@@ -407,6 +428,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	rand.Read(nonceBytes)
 	nonce := hex.EncodeToString(nonceBytes)
 
+	t.setStage("Сброс старой сессии...")
 	// Tell server to kill any existing session (disconnect-req + ack handshake).
 	const disconnectRetries = 3
 	for i := 0; i < disconnectRetries; i++ {
@@ -421,6 +443,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		t.logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
 	}
 
+	t.setStage("Ожидание TURN...")
 	// Wait for TURN allocations to complete.
 	ar := <-allocCh
 	if ar.err != nil {
@@ -438,6 +461,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		ourAddrs[i] = a.RelayAddr.String()
 	}
 
+	t.setStage("Обмен relay адресами...")
 	sendDone := make(chan struct{})
 	sendCtx, sendCancel := context.WithCancel(ctx)
 	go func() {
@@ -485,6 +509,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	results := make(chan dtlsResult, pairCount)
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
+	t.setStage("Установка DTLS...")
 	sigClient.StartPunchDispatcher(ctx, nonce)
 	defer sigClient.StopPunchDispatcher()
 
@@ -595,6 +620,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	ready := t.muxReady
 	t.mu.Unlock()
 
+	t.setStage("") // clear stage — connected
 	state.m.EnableRawPackets(4096)
 	state.m.SetIdleTimeout(15 * time.Second)
 	go state.m.DispatchLoop(muxCtx)
@@ -694,9 +720,11 @@ func (t *Tunnel) reconnectLoop() {
 			select {
 			case <-m.Dead():
 				t.logger.Info("all connections dead, starting reconnect")
+				t.setStage("Переподключение...")
 				t.teardownMux()
 			case <-force:
 				t.logger.Info("network change forced reconnect")
+				t.setStage("Переподключение...")
 				t.teardownMux()
 			case <-t.rootCtx.Done():
 				return

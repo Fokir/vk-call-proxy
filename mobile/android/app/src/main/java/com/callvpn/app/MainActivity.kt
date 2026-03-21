@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
     private var activeConns = mutableStateOf(0)
     private var totalConns = mutableStateOf(0)
     private var logLines = mutableStateOf<List<String>>(emptyList())
+    private var connectionStage = mutableStateOf("")
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
@@ -106,6 +107,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val stageReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            connectionStage.value = intent?.getStringExtra(CallVpnService.EXTRA_STAGE_TEXT) ?: ""
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -127,6 +134,7 @@ class MainActivity : ComponentActivity() {
         lbm.registerReceiver(stateReceiver, IntentFilter(CallVpnService.ACTION_STATE_CHANGED))
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
         lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
+        lbm.registerReceiver(stageReceiver, IntentFilter(CallVpnService.ACTION_STAGE))
 
         handleQuickConnect(intent)
 
@@ -140,6 +148,7 @@ class MainActivity : ComponentActivity() {
                         vpnState = vpnState.value,
                         activeConns = activeConns.value,
                         totalConns = totalConns.value,
+                        connectionStage = connectionStage.value,
                         logLines = logLines.value,
                         onConnect = { callLink, serverAddr, token, numConns -> requestConnect(callLink, serverAddr, token, numConns) },
                         onDisconnect = { stopVpn() }
@@ -154,6 +163,7 @@ class MainActivity : ComponentActivity() {
         lbm.unregisterReceiver(stateReceiver)
         lbm.unregisterReceiver(logReceiver)
         lbm.unregisterReceiver(connCountReceiver)
+        lbm.unregisterReceiver(stageReceiver)
         super.onDestroy()
     }
 
@@ -236,6 +246,7 @@ fun CallVpnScreen(
     vpnState: VpnState,
     activeConns: Int,
     totalConns: Int,
+    connectionStage: String = "",
     logLines: List<String>,
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int) -> Unit,
     onDisconnect: () -> Unit
@@ -276,7 +287,7 @@ fun CallVpnScreen(
     }
     val statusText = when (vpnState) {
         VpnState.Disconnected -> "Отключён"
-        VpnState.Connecting -> "Подключение..."
+        VpnState.Connecting -> if (connectionStage.isNotEmpty()) connectionStage else "Подключение..."
         VpnState.Connected -> "Подключён"
     }
     val buttonColor = when (vpnState) {
