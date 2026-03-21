@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
@@ -72,29 +74,40 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 		return nil, fmt.Errorf("step1 anon token: %w", err)
 	}
 
-	// Step 2: Get anonymous payload
+	// Step 5: OK anonymous login — independent of steps 2-4, run in parallel.
+	var token5 string
+	var err5 error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		deviceID := uuid.New().String()
+		token5, err5 = okAnonLogin(ctx, client, ua, deviceID)
+	}()
+
+	// Steps 2-3-4: sequential chain (each depends on previous).
 	token2, err := vkAnonPayload(ctx, client, ua, token1)
 	if err != nil {
+		wg.Wait()
 		return nil, fmt.Errorf("step2 anon payload: %w", err)
 	}
 
-	// Step 3: Get messages token
 	token3, err := vkMessagesToken(ctx, client, ua, token2)
 	if err != nil {
+		wg.Wait()
 		return nil, fmt.Errorf("step3 messages token: %w", err)
 	}
 
-	// Step 4: Get join token
 	token4, err := vkJoinToken(ctx, client, ua, s.callLink, token3)
 	if err != nil {
+		wg.Wait()
 		return nil, fmt.Errorf("step4 join token: %w", err)
 	}
 
-	// Step 5: OK anonymous login
-	deviceID := uuid.New().String()
-	token5, err := okAnonLogin(ctx, client, ua, deviceID)
-	if err != nil {
-		return nil, fmt.Errorf("step5 ok login: %w", err)
+	// Wait for step 5 to complete.
+	wg.Wait()
+	if err5 != nil {
+		return nil, fmt.Errorf("step5 ok login: %w", err5)
 	}
 
 	// Step 6: Join conference and extract TURN credentials + WS info

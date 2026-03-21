@@ -370,12 +370,34 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}
 	t.logger.Info("joined conference", "conv_id", jr.ConvID)
 
+	// Start TURN allocations in background — independent of signaling setup.
+	type allocResult struct {
+		allocs []*turn.Allocation
+		mgr    *turn.Manager
+		err    error
+	}
+	allocCh := make(chan allocResult, 1)
+	go func() {
+		mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
+		allocs, err := mgr.Allocate(ctx, cfg.NumConns)
+		allocCh <- allocResult{allocs, mgr, err}
+	}()
+
+	// Meanwhile, set up signaling (connect + SetKey + disconnect handshake).
 	sigClient, err := svc.ConnectSignaling(ctx, jr, t.logger.With("component", "signaling"))
 	if err != nil {
+		ar := <-allocCh
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
 		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
 	if err := sigClient.SetKey(cfg.Token); err != nil {
 		sigClient.Close()
+		ar := <-allocCh
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
@@ -398,13 +420,17 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		t.logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
 	}
 
-	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
-	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
-	if err != nil {
+	// Wait for TURN allocations to complete.
+	ar := <-allocCh
+	if ar.err != nil {
 		sigClient.Close()
-		mgr.CloseAll()
-		return nil, fmt.Errorf("allocate TURN: %w", err)
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
+		return nil, fmt.Errorf("allocate TURN: %w", ar.err)
 	}
+	allocs := ar.allocs
+	mgr := ar.mgr
 
 	ourAddrs := make([]string, len(allocs))
 	for i, a := range allocs {

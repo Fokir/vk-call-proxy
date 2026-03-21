@@ -250,14 +250,35 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	}
 	logger.Info("joined conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
-	// 2. Connect to signaling.
+	// 2. Start TURN allocations in background — independent of signaling setup.
+	type allocResult struct {
+		allocs []*turn.Allocation
+		mgr    *turn.Manager
+		err    error
+	}
+	allocCh := make(chan allocResult, 1)
+	go func() {
+		mgr := turn.NewManager(svc, useTCP, logger)
+		allocs, err := mgr.Allocate(ctx, numConns)
+		allocCh <- allocResult{allocs, mgr, err}
+	}()
+
+	// Meanwhile, set up signaling (connect + SetKey + disconnect handshake).
 	sigClient, err := svc.ConnectSignaling(ctx, jr, logger.With("component", "signaling"))
 	if err != nil {
+		ar := <-allocCh
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
 		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
 
 	if err := sigClient.SetKey(authToken); err != nil {
 		sigClient.Close()
+		ar := <-allocCh
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
@@ -280,16 +301,18 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
 	}
 
-	// 3. Create TURN allocations.
-	mgr := turn.NewManager(svc, useTCP, logger)
-
-	allocs, err := mgr.Allocate(ctx, numConns)
-	if err != nil {
-		siren.AlertTURNAuthFailure(ctx, err)
+	// 3. Wait for TURN allocations to complete.
+	ar := <-allocCh
+	if ar.err != nil {
+		siren.AlertTURNAuthFailure(ctx, ar.err)
 		sigClient.Close()
-		mgr.CloseAll()
-		return nil, fmt.Errorf("allocate TURN: %w", err)
+		if ar.mgr != nil {
+			ar.mgr.CloseAll()
+		}
+		return nil, fmt.Errorf("allocate TURN: %w", ar.err)
 	}
+	mgr := ar.mgr
+	allocs := ar.allocs
 	logger.Info("TURN allocations created", "count", len(allocs))
 
 	// Collect our relay addresses.
