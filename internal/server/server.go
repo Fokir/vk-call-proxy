@@ -539,6 +539,9 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	results := make(chan dtlsResult, len(allocs))
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
+	sigClient.StartPunchDispatcher(ctx, clientNonce)
+	defer sigClient.StopPunchDispatcher()
+
 	for i := 0; i < len(allocs); i++ {
 		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
 		if err != nil {

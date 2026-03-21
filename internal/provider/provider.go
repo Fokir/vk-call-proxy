@@ -65,6 +65,8 @@ type SignalingClient interface {
 	SendDisconnectAck(ctx context.Context, nonce string) error
 	SendPunchReady(ctx context.Context, nonce string, index int) error
 	WaitPunchReady(ctx context.Context, nonce string, index int) error
+	StartPunchDispatcher(ctx context.Context, nonce string)
+	StopPunchDispatcher()
 	WaitForSessionEnd(ctx context.Context) (SessionEndReason, string)
 	SendPayload(ctx context.Context, tag string, data []byte) error
 	RecvPayload(ctx context.Context, tag string) ([]byte, error)

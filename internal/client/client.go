@@ -350,6 +350,9 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	results := make(chan dtlsResult, pairCount)
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
+	sigClient.StartPunchDispatcher(ctx, nonce)
+	defer sigClient.StopPunchDispatcher()
+
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
 		if err != nil {

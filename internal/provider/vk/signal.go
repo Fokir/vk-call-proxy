@@ -51,6 +51,8 @@ type SignalingClient struct {
 
 	subsMu sync.Mutex
 	subs   map[string]chan provider.SignalMessage // tag -> subscriber channel
+
+	punchDisp *punchDispatcher // initialized by StartPunchDispatcher
 }
 
 // SetKey derives an AES-256-GCM key from the shared token.
@@ -537,23 +539,32 @@ func (pd *punchDispatcher) wait(ctx context.Context, index int) error {
 	}
 }
 
-// WaitPunchReady blocks until a punch-ready signal for the given index
-// and nonce is received. Uses a punch dispatcher internally.
-func (c *SignalingClient) WaitPunchReady(ctx context.Context, nonce string, index int) error {
-	ch, unsub := c.Subscribe(wirePunchReady, 8)
-	defer unsub()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.done:
-			return fmt.Errorf("signaling connection closed")
-		case msg := <-ch:
-			if msg.Nonce == nonce && msg.Index == index {
-				return nil
-			}
-		}
+// StartPunchDispatcher initializes a shared punch dispatcher that subscribes
+// once to "av-punch" and fans out messages to per-index waiters. Must be
+// called before launching concurrent WaitPunchReady goroutines.
+func (c *SignalingClient) StartPunchDispatcher(ctx context.Context, nonce string) {
+	c.punchDisp = c.initPunchDispatcher(ctx, nonce)
+}
+
+// StopPunchDispatcher stops the punch dispatcher goroutine.
+func (c *SignalingClient) StopPunchDispatcher() {
+	if c.punchDisp != nil {
+		c.punchDisp.Close()
+		c.punchDisp = nil
 	}
+}
+
+// WaitPunchReady blocks until a punch-ready signal for the given index
+// and nonce is received. Uses the shared punch dispatcher if started,
+// otherwise falls back to waiting on the context (old peer without dispatcher).
+func (c *SignalingClient) WaitPunchReady(ctx context.Context, nonce string, index int) error {
+	pd := c.punchDisp
+	if pd == nil {
+		// Fallback: no dispatcher = old peer, just wait the timeout.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return pd.wait(ctx, index)
 }
 
 // WaitForSessionEnd blocks until one of the following occurs:
