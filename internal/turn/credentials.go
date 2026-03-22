@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 )
@@ -36,6 +37,34 @@ func (EnvProvider) FetchCredentials(_ context.Context) (*provider.Credentials, e
 		Host:     host,
 		Port:     port,
 	}, nil
+}
+
+// CachedProvider returns pre-fetched credentials first, then falls back to
+// the underlying provider when the cache is exhausted. This avoids expensive
+// VK API calls on reconnect when the TURN credentials are still valid.
+type CachedProvider struct {
+	mu       sync.Mutex
+	cache    []*provider.Credentials
+	fallback provider.CredentialsProvider
+}
+
+// NewCachedProvider creates a provider that serves from cache first.
+func NewCachedProvider(cached []*provider.Credentials, fallback provider.CredentialsProvider) *CachedProvider {
+	cp := make([]*provider.Credentials, len(cached))
+	copy(cp, cached)
+	return &CachedProvider{cache: cp, fallback: fallback}
+}
+
+func (p *CachedProvider) FetchCredentials(ctx context.Context) (*provider.Credentials, error) {
+	p.mu.Lock()
+	if len(p.cache) > 0 {
+		c := p.cache[0]
+		p.cache = p.cache[1:]
+		p.mu.Unlock()
+		return c, nil
+	}
+	p.mu.Unlock()
+	return p.fallback.FetchCredentials(ctx)
 }
 
 // ParseTURNURL extracts host and port from a TURN URL like "turn:1.2.3.4:3478?transport=tcp".

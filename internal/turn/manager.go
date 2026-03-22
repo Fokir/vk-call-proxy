@@ -228,6 +228,20 @@ func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// AllCredentials returns a copy of credentials from all current allocations.
+func (m *Manager) AllCredentials() []*provider.Credentials {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*provider.Credentials
+	for _, a := range m.allocations {
+		if a != nil && a.Creds != nil {
+			c := *a.Creds
+			out = append(out, &c)
+		}
+	}
+	return out
+}
+
 // CloseAll tears down all allocations.
 func (m *Manager) CloseAll() {
 	m.mu.Lock()

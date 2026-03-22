@@ -93,6 +93,7 @@ type tunnelState struct {
 	cleanups  []context.CancelFunc
 	sigClient provider.SignalingClient    // non-nil in relay mode; kept alive for reconnect signaling
 	sessionID uuid.UUID                  // session UUID for reconnect auth
+	joinInfo  *provider.JoinInfo         // cached for fast reconnect
 }
 
 // Tunnel is the main gomobile-exported type for mobile platforms.
@@ -117,6 +118,10 @@ type Tunnel struct {
 	connectedAt time.Time             // when the current MUX was established
 	sigClient  provider.SignalingClient // kept alive in relay mode for per-conn reconnects
 	sessionID  uuid.UUID              // current session ID
+
+	// credentials cache — reused on reconnect to skip VK API calls
+	cachedJoinInfo *provider.JoinInfo
+	cachedCreds    []*provider.Credentials
 
 	// network change debouncing
 	networkDebounce *time.Timer    // coalesces rapid network change events
@@ -381,17 +386,28 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 
 	t.mu.Lock()
 	svc := t.svc
+	cachedJI := t.cachedJoinInfo
+	cachedCreds := t.cachedCreds
 	t.mu.Unlock()
 
-	t.setStage("Получение токена VK...")
-	jr, err := svc.FetchJoinInfo(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("join conference: %w", err)
+	// Reuse cached JoinInfo from previous session if available.
+	var jr *provider.JoinInfo
+	if cachedJI != nil {
+		t.logger.Info("reusing cached JoinInfo", "conv_id", cachedJI.ConvID)
+		jr = cachedJI
+	} else {
+		t.setStage("Получение токена VK...")
+		var err error
+		jr, err = svc.FetchJoinInfo(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("join conference: %w", err)
+		}
+		t.logger.Info("joined conference", "conv_id", jr.ConvID)
 	}
-	t.logger.Info("joined conference", "conv_id", jr.ConvID)
 
 	t.setStage("Подключение к TURN...")
 	// Start TURN allocations in background — independent of signaling setup.
+	// Use cached credentials when available to skip VK API calls.
 	type allocResult struct {
 		allocs []*turn.Allocation
 		mgr    *turn.Manager
@@ -399,7 +415,12 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}
 	allocCh := make(chan allocResult, 1)
 	go func() {
-		mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
+		var credsProvider provider.CredentialsProvider = svc
+		if len(cachedCreds) > 0 {
+			t.logger.Info("reusing cached TURN credentials", "count", len(cachedCreds))
+			credsProvider = turn.NewCachedProvider(cachedCreds, svc)
+		}
+		mgr := turn.NewManager(credsProvider, cfg.UseTCP, t.logger)
 		allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 		allocCh <- allocResult{allocs, mgr, err}
 	}()
@@ -589,7 +610,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	t.logger.Info("tunnel connected (relay-to-relay)",
 		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
-	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups, sigClient: sigClient, sessionID: sessionID}, nil
+	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups, sigClient: sigClient, sessionID: sessionID, joinInfo: jr}, nil
 }
 
 // applyState installs a new tunnelState into the tunnel, starting
@@ -602,6 +623,9 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	t.sigClient = state.sigClient
 	t.sessionID = state.sessionID
 	t.connectedAt = time.Now()
+	if state.joinInfo != nil {
+		t.cachedJoinInfo = state.joinInfo
+	}
 	muxCtx, muxCancel := context.WithCancel(t.rootCtx)
 	t.muxCancel = muxCancel
 	ready := t.muxReady
@@ -652,6 +676,13 @@ func (t *Tunnel) teardownMux() {
 	cleanups := t.cleanups
 	mgr := t.mgr
 	sig := t.sigClient
+
+	// Cache credentials from live allocations for fast reconnect.
+	if mgr != nil {
+		if creds := mgr.AllCredentials(); len(creds) > 0 {
+			t.cachedCreds = creds
+		}
+	}
 
 	t.muxCancel = nil
 	t.m = nil
