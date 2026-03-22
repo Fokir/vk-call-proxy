@@ -156,10 +156,15 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 	}
 
 	// Use 20s default handshake timeout; if ctx has an earlier deadline, honour it.
+	// Close the pipe end when the timeout fires to force dtls.Server to abort.
 	hsCtx, hsCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer hsCancel()
+	stopHS := context.AfterFunc(hsCtx, func() {
+		conn1.Close()
+	})
 
 	dtlsConn, err := dtls.Server(conn1, clientRelayAddr, config)
+	stopHS() // cancel the AfterFunc if handshake succeeded in time
 	if err != nil {
 		bridgeCancel()
 		wg.Wait()

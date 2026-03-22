@@ -539,9 +539,6 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	results := make(chan dtlsResult, len(allocs))
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
-	sigClient.StartPunchDispatcher(ctx, clientNonce)
-	defer sigClient.StopPunchDispatcher()
-
 	for i := 0; i < len(allocs); i++ {
 		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
 		if err != nil {
@@ -557,12 +554,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
-
-				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
-				waitPunch := sigClient.PreparePunchWait(punchReadyCtx, clientNonce, idx)
-				_ = sigClient.SendPunchReady(ctx, clientNonce, idx)
-				_ = waitPunch()
-				prc()
+				time.Sleep(200 * time.Millisecond) // let TURN permissions establish
 
 				dtlsConn, cleanup, lastErr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)
 				punchLoopCancel()
@@ -579,7 +571,6 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		}(i, allocs[i].RelayConn, clientUDP)
 	}
 
-	var dtlsConns []net.Conn
 	var cleanups []context.CancelFunc
 	defer func() {
 		for _, c := range cleanups {
@@ -588,29 +579,6 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	}()
 
 	m := mux.New(s.cfg.Logger)
-	var firstConn bool
-	for j := 0; j < pairCount; j++ {
-		r := <-results
-		if r.err != nil {
-			s.cfg.Logger.Warn("AcceptOverTURN failed", "index", r.index, "err", r.err)
-			continue
-		}
-		cleanups = append(cleanups, r.cleanup)
-		dtlsConns = append(dtlsConns, r.conn)
-		if !firstConn {
-			firstConn = true
-			s.cfg.Logger.Info("first relay connection ready", "index", r.index)
-		}
-		s.cfg.Logger.Info("relay DTLS connection accepted", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(dtlsConns), pairCount))
-	}
-	punchCancel()
-
-	if !firstConn {
-		m.Close()
-		return fmt.Errorf("no relay DTLS connections established")
-	}
-
-	s.cfg.Logger.Info("relay-to-relay mode active", "connections", len(dtlsConns))
 	defer m.Close()
 
 	m.EnableRawPackets(4096)
@@ -624,6 +592,8 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	pingCtx, pingCancel := context.WithCancel(sessCtx)
 	defer pingCancel()
 
+	// Start MUX operations immediately so connections are served as
+	// soon as they are added — don't wait for all handshakes.
 	go m.DispatchLoop(sessCtx)
 	go m.StartPingLoop(pingCtx, 10*time.Second)
 	go mgr.StartKeepalive(sessCtx, 10*time.Second)
@@ -634,43 +604,80 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		defer ns.Close()
 	}
 
-	var wg sync.WaitGroup
+	// Process DTLS handshake results as they arrive: validate auth +
+	// session ID and add each connection to the MUX immediately.
 	var added atomic.Int32
-	for i, conn := range dtlsConns {
-		wg.Add(1)
-		go func(idx int, c net.Conn) {
-			defer wg.Done()
-			if s.cfg.AuthToken != "" {
-				if err := mux.ValidateAuthToken(c, s.cfg.AuthToken); err != nil {
-					s.cfg.Logger.Warn("auth failed on relay conn", "index", idx, "err", err)
+	var firstConn atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(pairCount)
+	go func() {
+		for j := 0; j < pairCount; j++ {
+			r := <-results
+			if r.err != nil {
+				s.cfg.Logger.Warn("AcceptOverTURN failed", "index", r.index, "err", r.err)
+				wg.Done()
+				continue
+			}
+			cleanups = append(cleanups, r.cleanup)
+			if firstConn.CompareAndSwap(false, true) {
+				s.cfg.Logger.Info("first relay connection ready", "index", r.index)
+			}
+			go func(idx int, c net.Conn) {
+				defer wg.Done()
+				if s.cfg.AuthToken != "" {
+					if err := mux.ValidateAuthToken(c, s.cfg.AuthToken); err != nil {
+						s.cfg.Logger.Warn("auth failed on relay conn", "index", idx, "err", err)
+						c.Close()
+						return
+					}
+				}
+				sessionID, err := mux.ReadSessionID(c)
+				if err != nil {
+					s.cfg.Logger.Warn("read session id failed on relay conn", "index", idx, "err", err)
 					c.Close()
 					return
 				}
-			}
-			sessionID, err := mux.ReadSessionID(c)
-			if err != nil {
-				s.cfg.Logger.Warn("read session id failed on relay conn", "index", idx, "err", err)
-				c.Close()
-				return
-			}
-			s.cfg.Logger.Info("connection received",
-				"index", idx,
-				"session_id", fmt.Sprintf("%x", sessionID),
-			)
-			m.AddConn(c)
-			added.Add(1)
-		}(i, conn)
-	}
-	wg.Wait()
+				s.cfg.Logger.Info("connection received",
+					"index", idx,
+					"session_id", fmt.Sprintf("%x", sessionID),
+				)
+				m.AddConn(c)
+				added.Add(1)
+			}(r.index, r.conn)
+		}
+	}()
 
-	if added.Load() == 0 {
-		return fmt.Errorf("no connections passed auth/session handshake")
+	// Wait for at least one connection before proceeding to the session loop.
+	// Use a short poll so we don't block the entire session on slow handshakes.
+	waitCtx, waitCancel := context.WithTimeout(sessCtx, 60*time.Second)
+	defer waitCancel()
+	for {
+		if added.Load() > 0 {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			punchCancel()
+			wg.Wait()
+			if added.Load() == 0 {
+				return fmt.Errorf("no connections passed auth/session handshake")
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
+	// Cancel punch loops once at least one connection is live; remaining
+	// handshakes will complete with their own punch contexts.
+	punchCancel()
 
 	s.cfg.Logger.Info("MUX connections ready",
 		"active", m.ActiveConns(),
-		"total", int(added.Load()),
 	)
+
+	// Ensure remaining handshakes finish in the background.
+	go func() {
+		wg.Wait()
+		s.cfg.Logger.Info("all relay handshakes completed", "added", added.Load(), "total", pairCount)
+	}()
 
 	// Drain dead connections so their MUX slots are reused by AddConn.
 	go func() {

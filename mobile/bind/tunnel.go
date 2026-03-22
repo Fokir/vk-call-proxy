@@ -429,19 +429,13 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	nonce := hex.EncodeToString(nonceBytes)
 
 	t.setStage("Сброс старой сессии...")
-	// Tell server to kill any existing session (disconnect-req + ack handshake).
-	const disconnectRetries = 3
-	for i := 0; i < disconnectRetries; i++ {
-		_ = sigClient.SendDisconnectReq(ctx, nonce)
-		ackCtx, ackCancel := context.WithTimeout(ctx, 2*time.Second)
-		err := sigClient.WaitDisconnectAck(ackCtx, nonce)
-		ackCancel()
-		if err == nil {
-			t.logger.Info("disconnect ack received", "nonce", nonce)
-			break
-		}
-		t.logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
+	// Tell server to kill any existing session — fire once with a short timeout.
+	_ = sigClient.SendDisconnectReq(ctx, nonce)
+	ackCtx, ackCancel := context.WithTimeout(ctx, 1*time.Second)
+	if err := sigClient.WaitDisconnectAck(ackCtx, nonce); err == nil {
+		t.logger.Info("disconnect ack received", "nonce", nonce)
 	}
+	ackCancel()
 
 	t.setStage("Ожидание TURN...")
 	// Wait for TURN allocations to complete.
@@ -510,8 +504,6 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
 	t.setStage("Установка DTLS...")
-	sigClient.StartPunchDispatcher(ctx, nonce)
-	defer sigClient.StopPunchDispatcher()
 
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
@@ -527,12 +519,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
-
-				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
-				waitPunch := sigClient.PreparePunchWait(punchReadyCtx, nonce, idx)
-				_ = sigClient.SendPunchReady(ctx, nonce, idx)
-				_ = waitPunch()
-				prc()
+				time.Sleep(200 * time.Millisecond) // let TURN permissions establish
 
 				var c net.Conn
 				c, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
@@ -737,12 +724,16 @@ func (t *Tunnel) reconnectLoop() {
 		default:
 		}
 
+		firstAttempt := true
 		for {
-			select {
-			case <-t.rootCtx.Done():
-				return
-			case <-time.After(backoff):
+			if !firstAttempt {
+				select {
+				case <-t.rootCtx.Done():
+					return
+				case <-time.After(backoff):
+				}
 			}
+			firstAttempt = false
 
 			attemptCtx, attemptCancel := context.WithTimeout(t.rootCtx, attemptTimeout)
 			var state *tunnelState
