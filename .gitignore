@@ -6,6 +6,7 @@
 *.dylib
 /server
 /client
+server-linux-amd64
 /tmp
 /logs
 /docs
@@ -27,7 +28,8 @@ vendor/
 Thumbs.db
 
 # Mobile build artifacts
-mobile/android/app/libs/*.aar
+mobile/android/app/libs/
+mobile/android/local.properties
 mobile/android/.gradle/
 mobile/android/build/
 mobile/android/app/build/
