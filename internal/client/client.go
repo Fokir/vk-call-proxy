@@ -282,14 +282,6 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
-	// Start signaling keepalive to prevent VK from kicking us as idle.
-	// Sends accept-call + periodic transmit-data/change-media-settings.
-	if ka, ok := sigClient.(interface {
-		StartSignalingKeepAlive(context.Context, *slog.Logger)
-	}); ok {
-		ka.StartSignalingKeepAlive(ctx, logger)
-	}
-
 	// Generate session nonce for filtering ghost messages.
 	nonceBytes := make([]byte, 8)
 	rand.Read(nonceBytes)
@@ -307,6 +299,14 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			break
 		}
 		logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
+	}
+
+	// Start signaling keepalive AFTER disconnect handshake to prevent VK
+	// from kicking us as idle. Must be after disconnect to avoid race.
+	if ka, ok := sigClient.(interface {
+		StartSignalingKeepAlive(context.Context, *slog.Logger)
+	}); ok {
+		ka.StartSignalingKeepAlive(ctx, logger)
 	}
 
 	// 3. Wait for TURN allocations to complete.
