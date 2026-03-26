@@ -29,6 +29,18 @@ const (
 	httpTimeout    = 20 * time.Second
 )
 
+// classifyToken detects token format by prefix.
+// Returns "vk" for VK access tokens (vk1.a.*), "ok" for OK auth tokens ($*).
+func classifyToken(token string) string {
+	if strings.HasPrefix(token, "vk1.a.") {
+		return "vk"
+	}
+	if strings.HasPrefix(token, "$") {
+		return "ok"
+	}
+	return "unknown"
+}
+
 // Service implements provider.Service for VK Calls.
 type Service struct {
 	callLink string
@@ -263,6 +275,67 @@ func okAnonLogin(ctx context.Context, client *http.Client, ua string, deviceID s
 	return resp.SessionKey, nil
 }
 
+// vkGetCallToken exchanges a VK access_token for an OK auth_token via messages.getCallToken.
+func vkGetCallToken(ctx context.Context, client *http.Client, ua string, accessToken string) (authToken string, apiBaseURL string, err error) {
+	data := url.Values{
+		"env":          {"production"},
+		"access_token": {accessToken},
+	}
+	endpoint := fmt.Sprintf("https://api.vk.com/method/messages.getCallToken?v=%s&client_id=%s", vkAPIVersion, vkClientID)
+	body, err := httpPost(ctx, client, ua, endpoint, data)
+	if err != nil {
+		return "", "", err
+	}
+	var errResp vkErrorResponse
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != nil {
+		if errResp.Error.Code == 5 {
+			return "", "", fmt.Errorf("VK token expired (error 5): %s", errResp.Error.Msg)
+		}
+		if rle := checkVKRateLimit(body); rle != nil {
+			return "", "", rle
+		}
+		return "", "", fmt.Errorf("VK API error %d: %s", errResp.Error.Code, errResp.Error.Msg)
+	}
+	var resp struct {
+		Response struct {
+			Token      string `json:"token"`
+			APIBaseURL string `json:"api_base_url"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", "", fmt.Errorf("parse getCallToken response: %w", err)
+	}
+	if resp.Response.Token == "" {
+		return "", "", fmt.Errorf("empty token in getCallToken response: %s", string(body))
+	}
+	return resp.Response.Token, resp.Response.APIBaseURL, nil
+}
+
+// okAuthWithToken performs OK auth.anonymLogin with an auth_token (version 3).
+func okAuthWithToken(ctx context.Context, client *http.Client, ua string, authToken string, deviceID string) (string, error) {
+	sessionData := fmt.Sprintf(`{"version":3,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS","auth_token":"%s"}`, deviceID, authToken)
+	data := url.Values{
+		"session_data":    {sessionData},
+		"method":          {"auth.anonymLogin"},
+		"format":          {"JSON"},
+		"application_key": {okAppKey},
+	}
+	body, err := httpPost(ctx, client, ua, "https://calls.okcdn.ru/fb.do", data)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		SessionKey string `json:"session_key"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("parse auth response: %w", err)
+	}
+	if resp.SessionKey == "" {
+		return "", fmt.Errorf("empty session_key in auth response: %s", string(body))
+	}
+	return resp.SessionKey, nil
+}
+
 type joinConferenceResult struct {
 	creds     *provider.Credentials
 	endpoint  string
@@ -270,16 +343,18 @@ type joinConferenceResult struct {
 	deviceIdx int
 }
 
-func okJoinConference(ctx context.Context, client *http.Client, ua string, link, vkToken, sessionKey string) (*joinConferenceResult, error) {
+func okJoinConference(ctx context.Context, client *http.Client, ua string, link, anonymToken, sessionKey string) (*joinConferenceResult, error) {
 	data := url.Values{
 		"joinLink":        {link},
 		"isVideo":         {"false"},
 		"protocolVersion": {"5"},
-		"anonymToken":     {vkToken},
 		"method":          {"vchat.joinConversationByLink"},
 		"format":          {"JSON"},
 		"application_key": {okAppKey},
 		"session_key":     {sessionKey},
+	}
+	if anonymToken != "" {
+		data.Set("anonymToken", anonymToken)
 	}
 	body, err := httpPost(ctx, client, ua, "https://calls.okcdn.ru/fb.do", data)
 	if err != nil {
