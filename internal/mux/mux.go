@@ -19,6 +19,9 @@ var ErrMuxClosed = errors.New("mux closed")
 // pingPayloadSize is the size of the Ping/Pong payload: 8 bytes timestamp + 4 bytes connIdx.
 const pingPayloadSize = 12
 
+// stripSeqSize is the size of the per-stream sequence prefix prepended to striped frame payloads.
+const stripSeqSize = 4 // 4-byte per-stream sequence prefix in payload
+
 // encodePingPayload encodes a timestamp and connection index into a Ping payload.
 func encodePingPayload(ts time.Time, connIdx int) []byte {
 	buf := make([]byte, pingPayloadSize)
@@ -137,6 +140,7 @@ type muxConn struct {
 	stats      connStats
 	mu         sync.Mutex // serializes writes
 	wrrCurrent int64      // smooth weighted round-robin current weight (protected by Mux.mu)
+	rtxRing    retransmitRing // retransmit ring for optimistic retransmission
 }
 
 // New creates a multiplexer over the given connections.
@@ -838,19 +842,44 @@ func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, errors.New("stream closed")
 	}
+	maxChunk := MaxFramePayload
+	if s.striping {
+		maxChunk = MaxFramePayload - stripSeqSize
+	}
 	total := 0
 	for len(p) > 0 {
 		chunk := p
-		if len(chunk) > MaxFramePayload {
-			chunk = p[:MaxFramePayload]
+		if len(chunk) > maxChunk {
+			chunk = p[:maxChunk]
 		}
-		err := s.mux.sendFrameOn(s.assignedConn, &Frame{
+
+		var payload []byte
+		if s.striping {
+			payload = make([]byte, stripSeqSize+len(chunk))
+			binary.BigEndian.PutUint32(payload[0:stripSeqSize], s.nextStripSeq.Add(1)-1)
+			copy(payload[stripSeqSize:], chunk)
+		} else {
+			payload = chunk
+		}
+
+		f := &Frame{
 			StreamID: s.ID,
 			Type:     FrameData,
 			Sequence: s.mux.NextSeq(),
-			Length:   uint32(len(chunk)),
-			Payload:  chunk,
-		})
+			Length:   uint32(len(payload)),
+			Payload:  payload,
+		}
+
+		mc := s.mux.selectConn()
+		if s.striping && mc != nil {
+			if data, err := f.MarshalBinary(); err == nil {
+				mc.rtxRing.mu.Lock()
+				mc.rtxRing.Push(data)
+				mc.rtxRing.mu.Unlock()
+			}
+		}
+
+		err := s.mux.sendFrameOn(mc, f)
 		if err != nil {
 			if total > 0 {
 				return total, err
