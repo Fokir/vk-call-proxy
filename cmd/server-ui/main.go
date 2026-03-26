@@ -95,8 +95,20 @@ func (w *logWriter) allLines() []string {
 
 // instanceConfig is per-instance persistent config.
 type instanceConfig struct {
-	CallLink  string `json:"call_link"`
-	AuthToken string `json:"auth_token"`
+	CallLink  string   `json:"call_link"`            // single link (backward compat)
+	CallLinks []string `json:"call_links,omitempty"` // multi-link pool
+	AuthToken string   `json:"auth_token"`
+}
+
+// links returns all configured links, preferring CallLinks over CallLink.
+func (ic instanceConfig) links() []string {
+	if len(ic.CallLinks) > 0 {
+		return ic.CallLinks
+	}
+	if ic.CallLink != "" {
+		return []string{ic.CallLink}
+	}
+	return nil
 }
 
 // appConfig persists between restarts.

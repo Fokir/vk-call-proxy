@@ -17,6 +17,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/mux"
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
+	"github.com/call-vpn/call-vpn/internal/tunnel"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
 )
@@ -797,5 +798,41 @@ func allocateWithToken(ctx context.Context, svc provider.Service, mgr *turn.Mana
 		return nil, fmt.Errorf("allocate with credentials: %w", err)
 	}
 	return alloc, nil
+}
+
+// MultiRelayConfig configures multi-call pool relay mode.
+type MultiRelayConfig struct {
+	Pool          *tunnel.CallPool
+	SocksPort     int
+	HTTPPort      int
+	BindAddr      string
+	BypassMatcher *bypass.Matcher
+	Logger        *slog.Logger
+	Siren         *monitoring.Siren
+}
+
+// RunMultiRelay starts the multi-call pool relay mode.
+// The pool manages N parallel calls, each contributing connections to a shared MUX.
+func RunMultiRelay(ctx context.Context, cfg *MultiRelayConfig) {
+	logger := cfg.Logger
+
+	m, err := cfg.Pool.StartClient(ctx)
+	if err != nil {
+		logger.Error("multi-call pool start failed", "err", err)
+		return
+	}
+
+	logger.Info("multi-call tunnel connected", "active", m.ActiveConns())
+
+	go m.DispatchLoop(ctx)
+	go m.StartPingLoop(ctx, 10*time.Second)
+
+	// Pool handles reconnect internally; just run proxies.
+	dialMux := func() *mux.Mux { return cfg.Pool.Mux() }
+	totalConns := 0
+	for _, s := range cfg.Pool.Status() {
+		totalConns += s.ActiveConn
+	}
+	startRelayProxies(ctx, logger, cfg.Siren, dialMux, totalConns, cfg.SocksPort, cfg.HTTPPort, cfg.BindAddr, cfg.BypassMatcher)
 }
 

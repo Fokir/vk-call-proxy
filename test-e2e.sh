@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # E2E test script for call-vpn relay-to-relay mode
 #
-# Usage: ./test-e2e.sh [--n=4] [--monitor=5] [--download-url=URL]
+# Usage: ./test-e2e.sh [--n=4] [--links=1] [--monitor=5] [--download-url=URL]
 #
 # Options:
-#   --n=N             Number of parallel connections (default: 4)
+#   --n=N             Number of parallel connections per call (default: 4)
+#   --links=N         Number of call links to use (default: 1, reads VK_CALL_LINK_1..N from .env)
 #   --monitor=MIN     Enable periodic connectivity checks every 60s for MIN minutes.
 #                     Without this flag, the script runs speed tests and exits.
 #   --download-url=U  URL for large file download test (default: https://linkmeter.net)
 #
 # Examples:
-#   ./test-e2e.sh                           # quick: 4 conns, speed test only
-#   ./test-e2e.sh --n=1                     # baseline: 1 conn, speed test only
-#   ./test-e2e.sh --n=4 --monitor=5         # 4 conns + 5 min monitoring
+#   ./test-e2e.sh                           # quick: 1 call × 4 conns, speed test only
+#   ./test-e2e.sh --n=1                     # baseline: 1 call × 1 conn, speed test only
+#   ./test-e2e.sh --n=4 --monitor=5         # 1 call × 4 conns + 5 min monitoring
+#   ./test-e2e.sh --n=2 --links=2           # 2 calls × 2 conns = 4 total
+#   ./test-e2e.sh --n=4 --links=2           # 2 calls × 4 conns = 8 total
 #   ./test-e2e.sh --download-url=http://example.com/100MB.bin
 
 set -euo pipefail
@@ -20,6 +23,7 @@ cd "$(dirname "$0")"
 
 # --- Config ---
 CONNS=4
+LINKS=1
 MONITOR_MIN=0
 SOCKS_PORT=2080
 HTTP_PORT=3080
@@ -28,6 +32,7 @@ DOWNLOAD_URL="https://linkmeter.net"
 for arg in "$@"; do
   case $arg in
     --n=*) CONNS="${arg#*=}" ;;
+    --links=*) LINKS="${arg#*=}" ;;
     --monitor=*) MONITOR_MIN="${arg#*=}" ;;
     --download-url=*) DOWNLOAD_URL="${arg#*=}" ;;
   esac
@@ -46,7 +51,26 @@ while IFS='=' read -r key val; do
   export "$key=$val"
 done < <(grep -v '^\s*#' .env | grep '=')
 
-for var in VK_CALL_LINK VPN_TOKEN VK_TOKEN_1; do
+# Build link args based on --links=N
+LINK_ARGS=""
+if [[ "$LINKS" -gt 1 ]]; then
+  for i in $(seq 1 "$LINKS"); do
+    varname="VK_CALL_LINK_$i"
+    if [[ -z "${!varname:-}" ]]; then
+      echo "FATAL: $varname not set in .env (needed for --links=$LINKS)"
+      exit 1
+    fi
+    LINK_ARGS="$LINK_ARGS --link=${!varname}"
+  done
+else
+  if [[ -z "${VK_CALL_LINK:-}" ]]; then
+    echo "FATAL: VK_CALL_LINK not set in .env"
+    exit 1
+  fi
+  LINK_ARGS="--link=$VK_CALL_LINK"
+fi
+
+for var in VPN_TOKEN VK_TOKEN_1; do
   if [[ -z "${!var:-}" ]]; then
     echo "FATAL: $var not set in .env"
     exit 1
@@ -197,9 +221,10 @@ sleep 1
 
 # --- Start server ---
 echo ""
-echo "[$(ts)] Starting server (n=$CONNS)..."
+TOTAL_CONNS=$((CONNS * LINKS))
+echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
 ./callvpn-server.exe \
-  --link="$VK_CALL_LINK" \
+  $LINK_ARGS \
   --tcp=true \
   --n="$CONNS" \
   --token="$VPN_TOKEN" \
@@ -215,9 +240,9 @@ echo "[$(ts)] Server running (PID $SERVER_PID)"
 
 # --- Start client ---
 echo ""
-echo "[$(ts)] Starting client (n=$CONNS)..."
+echo "[$(ts)] Starting client (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
 ./callvpn-client.exe \
-  --link="$VK_CALL_LINK" \
+  $LINK_ARGS \
   --n="$CONNS" \
   --tcp=true \
   --token="$VPN_TOKEN" \

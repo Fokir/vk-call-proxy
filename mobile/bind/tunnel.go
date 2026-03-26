@@ -23,6 +23,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/tunnel"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
 )
@@ -94,6 +95,7 @@ type tunnelState struct {
 	sigClient provider.SignalingClient    // non-nil in relay mode; kept alive for reconnect signaling
 	sessionID uuid.UUID                  // session UUID for reconnect auth
 	joinInfo  *provider.JoinInfo         // cached for fast reconnect
+	pool      *tunnel.CallPool           // non-nil in multi-call pool mode
 }
 
 // Tunnel is the main gomobile-exported type for mobile platforms.
@@ -126,6 +128,9 @@ type Tunnel struct {
 	// network change debouncing
 	networkDebounce *time.Timer    // coalesces rapid network change events
 	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
+
+	// multi-call pool (non-nil in pool mode)
+	pool *tunnel.CallPool
 
 	// connection stage (for UI display)
 	stage atomic.Value // string
@@ -220,10 +225,24 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	} else {
 		t.fpBytes = nil
 	}
-	if telemost.IsTelemostLink(cfg.CallLink) {
-		t.svc = telemost.NewService(cfg.CallLink, cfg.Token)
+	// Parse links: comma-separated for multi-call pool
+	links := strings.Split(cfg.CallLink, ",")
+	var cleanLinks []string
+	for _, l := range links {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			cleanLinks = append(cleanLinks, l)
+		}
+	}
+	if len(cleanLinks) == 0 {
+		t.mu.Unlock()
+		return fmt.Errorf("no valid call links provided")
+	}
+
+	if telemost.IsTelemostLink(cleanLinks[0]) {
+		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
-		t.svc = vk.NewService(cfg.CallLink)
+		t.svc = vk.NewService(cleanLinks[0])
 	}
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
@@ -233,9 +252,12 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 
 	var state *tunnelState
 	var err error
-	if cfg.ServerAddr != "" {
+	if len(cleanLinks) > 1 && cfg.ServerAddr == "" {
+		// Multi-call pool mode
+		state, err = t.connectMultiRelay(t.rootCtx, cfg, cleanLinks)
+	} else if cfg.ServerAddr != "" {
 		state, err = t.connectDirect(t.rootCtx, cfg)
-	} else if telemost.IsTelemostLink(cfg.CallLink) {
+	} else if telemost.IsTelemostLink(cleanLinks[0]) {
 		state, err = t.connectTelemost(t.rootCtx, cfg)
 	} else {
 		state, err = t.connectRelay(t.rootCtx, cfg)
@@ -412,6 +434,48 @@ func allocateWithToken(ctx context.Context, svc provider.Service, mgr *turn.Mana
 // connectRelay creates TURN allocations, exchanges relay addresses via
 // signaling, and establishes DTLS connections to the server's relay addresses.
 // Returns a tunnelState without mutating t.
+// connectMultiRelay establishes multiple VK calls feeding one shared MUX via CallPool.
+func (t *Tunnel) connectMultiRelay(ctx context.Context, cfg *TunnelConfig, links []string) (*tunnelState, error) {
+	var vkTokens []string
+	if cfg.VKTokens != "" {
+		vkTokens = strings.Split(cfg.VKTokens, ",")
+	}
+
+	services := make([]provider.Service, len(links))
+	for i, link := range links {
+		if telemost.IsTelemostLink(link) {
+			services[i] = telemost.NewService(link, cfg.Token)
+		} else {
+			services[i] = vk.NewService(link)
+		}
+	}
+
+	pool := tunnel.NewCallPool(tunnel.PoolConfig{
+		Services:     services,
+		ConnsPerCall: cfg.NumConns,
+		UseTCP:       cfg.UseTCP,
+		AuthToken:    cfg.Token,
+		VKTokens:     vkTokens,
+		Logger:       t.logger,
+	})
+
+	m, err := pool.StartClient(ctx)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("multi-relay pool start: %w", err)
+	}
+
+	go m.DispatchLoop(ctx)
+	go m.StartPingLoop(ctx, 10*time.Second)
+
+	t.logger.Info("multi-relay tunnel connected", "calls", len(links), "active", m.ActiveConns())
+
+	return &tunnelState{
+		m:    m,
+		pool: pool,
+	}, nil
+}
+
 func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("token is required for relay-to-relay mode")
@@ -755,6 +819,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	t.cleanups = state.cleanups
 	t.sigClient = state.sigClient
 	t.sessionID = state.sessionID
+	t.pool = state.pool
 	t.connectedAt = time.Now()
 	if state.joinInfo != nil {
 		t.cachedJoinInfo = state.joinInfo
@@ -817,11 +882,14 @@ func (t *Tunnel) teardownMux() {
 		}
 	}
 
+	pool := t.pool
+
 	t.muxCancel = nil
 	t.m = nil
 	t.cleanups = nil
 	t.mgr = nil
 	t.sigClient = nil
+	t.pool = nil
 	// Only create a new muxReady if there was something to tear down.
 	// Repeated calls with nothing to tear down must not replace the channel
 	// (getMux may already be waiting on it).
@@ -848,6 +916,9 @@ func (t *Tunnel) teardownMux() {
 	}
 	if mgr != nil {
 		mgr.CloseAll()
+	}
+	if pool != nil {
+		pool.Close()
 	}
 }
 

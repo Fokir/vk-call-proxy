@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
+	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
@@ -28,9 +29,10 @@ func (s *stringSlice) Set(v string) error {
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
-	callLink := flag.String("link", "", "call link ID for relay-to-relay mode (env: VK_CALL_LINK)")
+	var callLinks stringSlice
+	flag.Var(&callLinks, "link", "call link ID for relay mode (repeatable for multi-call pool, env: VK_CALL_LINK)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
-	numConns := flag.Int("n", 1, "number of parallel connections (Telemost mode)")
+	numConns := flag.Int("n", 1, "number of parallel connections per call")
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	flag.Parse()
@@ -43,8 +45,10 @@ func main() {
 	if *authToken == "" {
 		*authToken = os.Getenv("VPN_TOKEN")
 	}
-	if *callLink == "" {
-		*callLink = os.Getenv("VK_CALL_LINK")
+	if len(callLinks) == 0 {
+		if env := os.Getenv("VK_CALL_LINK"); env != "" {
+			callLinks = []string{env}
+		}
 	}
 	if len(vkTokens) == 0 {
 		if env := os.Getenv("VK_TOKENS"); env != "" {
@@ -66,12 +70,19 @@ func main() {
 		Logger:     logger,
 	}
 
-	// Enable relay-to-relay mode with the appropriate service.
-	if *callLink != "" {
-		if telemost.IsTelemostLink(*callLink) {
-			cfg.Service = telemost.NewService(*callLink, *authToken)
-		} else {
-			cfg.Service = vk.NewService(*callLink)
+	// Enable relay-to-relay mode with the appropriate service(s).
+	if len(callLinks) > 0 {
+		services := make([]provider.Service, len(callLinks))
+		for i, link := range callLinks {
+			if telemost.IsTelemostLink(link) {
+				services[i] = telemost.NewService(link, *authToken)
+			} else {
+				services[i] = vk.NewService(link)
+			}
+		}
+		cfg.Service = services[0]
+		if len(services) > 1 {
+			cfg.Services = services
 		}
 	}
 

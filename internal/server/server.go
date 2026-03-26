@@ -19,6 +19,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
+	"github.com/call-vpn/call-vpn/internal/tunnel"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
 
@@ -28,6 +29,7 @@ type Config struct {
 	AuthToken  string             // Client authentication token
 	VKTokens   []string           // VK account tokens for authenticated TURN credential flow
 	Service    provider.Service   // Call service (VK, MAX, etc.) for relay-to-relay mode; nil = direct only
+	Services   []provider.Service // Multi-call pool: multiple services (nil = single link via Service)
 	UseTCP     bool               // Use TCP for TURN connections
 	NumConns   int                // Number of parallel connections (Telemost mode)
 	Logger     *slog.Logger
@@ -98,7 +100,9 @@ func (s *Server) Start(ctx context.Context) {
 	ctx, s.cancel = context.WithCancel(ctx)
 	go func() {
 		defer close(s.done)
-		if s.cfg.Service != nil {
+		if len(s.cfg.Services) > 1 {
+			s.runMultiRelayMode(ctx)
+		} else if s.cfg.Service != nil {
 			if _, ok := s.cfg.Service.(*telemost.Service); ok {
 				s.runTelemostMode(ctx)
 			} else {
@@ -437,6 +441,73 @@ func (s *Server) runTelemostSession(ctx context.Context, svc *telemost.Service, 
 }
 
 // --- Relay mode ---
+
+// runMultiRelayMode handles multi-call pool relay mode (N parallel VK calls → shared MUX).
+func (s *Server) runMultiRelayMode(ctx context.Context) {
+	logger := s.cfg.Logger
+	logger.Info("starting multi-relay mode", "calls", len(s.cfg.Services), "conns_per_call", s.cfg.NumConns)
+
+	pool := tunnel.NewCallPool(tunnel.PoolConfig{
+		Services:     s.cfg.Services,
+		ConnsPerCall: s.cfg.NumConns,
+		UseTCP:       s.cfg.UseTCP,
+		AuthToken:    s.cfg.AuthToken,
+		VKTokens:     s.cfg.VKTokens,
+		Logger:       logger,
+	})
+	defer pool.Close()
+
+	m, err := pool.StartServer(ctx)
+	if err != nil {
+		logger.Error("multi-relay pool start failed", "err", err)
+		return
+	}
+
+	logger.Info("multi-relay tunnel connected", "active", m.ActiveConns())
+
+	m.EnableRawPackets(4096)
+	m.EnableStreamAccept(64)
+	m.SetIdleTimeout(90 * time.Second)
+	m.SetMaxStreams(10000)
+
+	go m.DispatchLoop(ctx)
+	go m.StartPingLoop(ctx, 10*time.Second)
+
+	ns := netstack.New(logger, m)
+	if ns != nil {
+		ns.Start(ctx)
+		defer ns.Close()
+	}
+
+	go func() {
+		for {
+			select {
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				m.RemoveConn(idx)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case stream, ok := <-m.AcceptedStreams():
+			if !ok {
+				return
+			}
+			go handleStream(ctx, logger, stream)
+		case <-m.Dead():
+			logger.Warn("all connections dead in multi-relay mode")
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
 func (s *Server) runRelayMode(ctx context.Context) {
 	s.cfg.Logger.Info("starting relay-to-relay mode", "service", s.cfg.Service.Name())

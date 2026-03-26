@@ -349,11 +349,26 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 		}
 		f.connIdx = idx
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
-		select {
-		case m.inFrames <- f:
-		case <-m.ctx.Done():
+		if !m.trySendInFrame(f) {
 			return
 		}
+	}
+}
+
+// trySendInFrame sends a frame to the inFrames channel with panic recovery
+// for the AddConn/Close race where inFrames may be closed while a readLoop
+// from a newly added connection tries to send.
+func (m *Mux) trySendInFrame(f *Frame) (sent bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			sent = false
+		}
+	}()
+	select {
+	case m.inFrames <- f:
+		return true
+	case <-m.ctx.Done():
+		return false
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/tunnel"
 )
 
 type stringSlice []string
@@ -32,7 +33,8 @@ func (s *stringSlice) Set(v string) error {
 func main() {
 	socks5Port := flag.Int("socks5-port", 1080, "SOCKS5 proxy listen port")
 	httpPort := flag.Int("http-port", 8080, "HTTP/HTTPS proxy listen port")
-	callLink := flag.String("link", "", "call link ID (e.g. abcd1234)")
+	var callLinks stringSlice
+	flag.Var(&callLinks, "link", "call link ID (repeatable for multi-call pool)")
 	numConns := flag.Int("n", 16, "Number of parallel TURN+DTLS connections")
 	useTCP := flag.Bool("tcp", true, "Use TCP for TURN connections")
 	serverAddr := flag.String("server", "", "VPN server address (host:port), empty = relay-to-relay mode")
@@ -68,7 +70,7 @@ func main() {
 			"High connection counts may cause VK call instability and potential call blocking.\n", *numConns)
 	}
 
-	if *callLink == "" {
+	if len(callLinks) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --link is required")
 		fmt.Fprintln(os.Stderr, "Usage: client --link=<call-link> [--server=<host:port>] [options]")
 		flag.PrintDefaults()
@@ -78,12 +80,14 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	siren := monitoring.New(logger)
 
-	// Create call service provider (auto-detect from link).
-	var svc provider.Service
-	if telemost.IsTelemostLink(*callLink) {
-		svc = telemost.NewService(*callLink, *authToken)
-	} else {
-		svc = vk.NewService(*callLink)
+	// Create call service providers (auto-detect from link).
+	services := make([]provider.Service, len(callLinks))
+	for i, link := range callLinks {
+		if telemost.IsTelemostLink(link) {
+			services[i] = telemost.NewService(link, *authToken)
+		} else {
+			services[i] = vk.NewService(link)
+		}
 	}
 
 	var bypassMatcher *bypass.Matcher
@@ -103,6 +107,34 @@ func main() {
 		cancel()
 	}()
 
+	// Multi-call pool mode: N links → shared MUX for fault tolerance
+	if len(callLinks) > 1 {
+		logger.Info("multi-call pool mode", "calls", len(callLinks), "conns_per_call", *numConns)
+		pool := tunnel.NewCallPool(tunnel.PoolConfig{
+			Services:     services,
+			ConnsPerCall: *numConns,
+			UseTCP:       *useTCP,
+			AuthToken:    *authToken,
+			VKTokens:     []string(vkTokens),
+			Fingerprint:  fpBytes,
+			Logger:       logger,
+		})
+		defer pool.Close()
+
+		client.RunMultiRelay(ctx, &client.MultiRelayConfig{
+			Pool:          pool,
+			SocksPort:     *socks5Port,
+			HTTPPort:      *httpPort,
+			BindAddr:      *bindAddr,
+			BypassMatcher: bypassMatcher,
+			Logger:        logger,
+			Siren:         siren,
+		})
+		return
+	}
+
+	// Single-link mode: backward compatible
+	svc := services[0]
 	cfg := &client.Config{
 		Service:       svc,
 		ServerAddr:    *serverAddr,
