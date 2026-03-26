@@ -283,16 +283,23 @@ func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, router *Signa
 	return m, nil
 }
 
-func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, router *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, nonce string, _ int, preAllocs []*turn.Allocation) (*mux.Mux, error) {
+func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, router *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, _ string, _ int, preAllocs []*turn.Allocation) (*mux.Mux, error) {
 	tokenIdx := 0
 	tokens := deduplicateTokens(s.vkTokens)
 	punchIdx := 0
 	usedPreAlloc := false
+	clientNonce := "" // learned from first client message (server doesn't know client's nonce upfront)
 
 	for batch := 0; ; batch++ {
-		clientAddrs, _, final, _, err := sigClient.RecvRelayBatch(ctx, "server", nonce)
+		// First receive uses no filter (clientNonce="") to learn client's nonce.
+		// Subsequent receives filter by learned client nonce.
+		clientAddrs, _, final, recvNonce, err := sigClient.RecvRelayBatch(ctx, "server", clientNonce)
 		if err != nil {
 			return m, fmt.Errorf("slot %d: recv client batch %d: %w", s.index, batch, err)
+		}
+		if clientNonce == "" {
+			clientNonce = recvNonce
+			s.logger.Info("learned client nonce", "nonce", clientNonce)
 		}
 
 		needed := len(clientAddrs)
@@ -319,12 +326,13 @@ func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, router *Signa
 			continue
 		}
 
+		// Respond with CLIENT's nonce (not server's) so client can filter by its own nonce
 		serverAddrs := allocAddrs(allocs)
-		if err := router.BroadcastRelayBatch(ctx, serverAddrs, "server", nonce, batch, final); err != nil {
+		if err := router.BroadcastRelayBatch(ctx, serverAddrs, "server", clientNonce, batch, final); err != nil {
 			s.logger.Warn("broadcast server addrs failed", "err", err)
 		}
 
-		m, err = s.dtlsHandshakeParallel(ctx, m, allocs, clientAddrs, sigClient, nonce, punchIdx, [16]byte{})
+		m, err = s.dtlsHandshakeParallel(ctx, m, allocs, clientAddrs, sigClient, clientNonce, punchIdx, [16]byte{})
 		if err != nil {
 			s.logger.Warn("dtls batch failed", "batch", batch, "err", err)
 		}
