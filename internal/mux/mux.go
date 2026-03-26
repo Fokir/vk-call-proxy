@@ -630,18 +630,29 @@ type Stream struct {
 	done         chan struct{}
 	leftover     []byte    // unread remainder from previous Read
 	assignedConn *muxConn  // pinned connection for write ordering (set once at creation)
+
+	// Striping fields (active when stream created with >1 conn)
+	striping     bool
+	nextStripSeq atomic.Uint32  // sender: per-stream sequence counter
+	reorder      *reorderBuffer // receiver: reorder buffer (nil if !striping)
+	closePending atomic.Bool    // receiver: FrameClose deferred until reorder drains
 }
 
 // OpenStream creates a new logical stream and sends an open frame to the peer.
 // The stream is pinned to a connection chosen via SWRR for write ordering.
 func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 	assigned := m.selectConn()
+	striping := m.TotalConns() > 1
 	s := &Stream{
 		ID:           id,
 		mux:          m,
 		recv:         make(chan []byte, 1024),
 		done:         make(chan struct{}),
 		assignedConn: assigned,
+		striping:     striping,
+	}
+	if striping {
+		s.reorder = newReorderBuffer()
 	}
 	m.streamCount.Add(1)
 	m.streams.Store(id, s)
@@ -672,11 +683,16 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
+				striping := m.TotalConns() > 1
 				s := &Stream{
-					ID:   f.StreamID,
-					mux:  m,
-					recv: make(chan []byte, 1024),
-					done: make(chan struct{}),
+					ID:       f.StreamID,
+					mux:      m,
+					recv:     make(chan []byte, 1024),
+					done:     make(chan struct{}),
+					striping: striping,
+				}
+				if striping {
+					s.reorder = newReorderBuffer()
 				}
 				m.streamCount.Add(1)
 				m.streams.Store(f.StreamID, s)
@@ -780,12 +796,17 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
+				striping := m.TotalConns() > 1
 				s := &Stream{
 					ID:           f.StreamID,
 					mux:          m,
 					recv:         make(chan []byte, 1024),
 					done:         make(chan struct{}),
 					assignedConn: m.selectConn(),
+					striping:     striping,
+				}
+				if striping {
+					s.reorder = newReorderBuffer()
 				}
 				m.streamCount.Add(1)
 				m.streams.Store(f.StreamID, s)
