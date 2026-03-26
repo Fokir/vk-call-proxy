@@ -135,12 +135,20 @@ type Mux struct {
 	streamCount atomic.Int32 // current active stream count
 }
 
+// writeReq is a frame pushed to a connection's async write channel.
+type writeReq struct {
+	data []byte
+	wg   *sync.WaitGroup // decremented after write completes (may be nil)
+}
+
 type muxConn struct {
 	conn       io.ReadWriteCloser
 	stats      connStats
 	mu         sync.Mutex // serializes writes
 	wrrCurrent int64      // smooth weighted round-robin current weight (protected by Mux.mu)
 	rtxRing    retransmitRing // retransmit ring for optimistic retransmission
+	writeCh    chan writeReq  // async write channel for striped frames
+	writeDone  chan struct{}  // closed when writeLoop exits
 }
 
 // New creates a multiplexer over the given connections.
@@ -156,13 +164,18 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 		connDied: make(chan int, 32),
 	}
 	for _, c := range conns {
-		mc := &muxConn{conn: c}
+		mc := &muxConn{
+			conn:      c,
+			writeCh:   make(chan writeReq, 256),
+			writeDone: make(chan struct{}),
+		}
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
 		m.conns = append(m.conns, mc)
 	}
-	// Start reader goroutines for each connection.
+	// Start reader and writer goroutines for each connection.
 	for i, mc := range m.conns {
 		m.activeReaders.Add(1)
+		go m.writeLoop(mc)
 		go m.readLoop(i, mc)
 	}
 	return m
@@ -186,8 +199,10 @@ func (m *Mux) SetMaxStreams(n int) {
 // to provide stream semantics for ReadFrame's io.ReadFull calls.
 func (m *Mux) readLoop(idx int, mc *muxConn) {
 	defer func() {
-		mc.conn.Close() // close DTLS connection immediately to free resources
-		m.RemoveConn(idx) // retransmit buffered frames + check reorder gaps
+		mc.conn.Close()    // close DTLS connection immediately to free resources
+		close(mc.writeCh)  // stop writeLoop (drains remaining frames)
+		<-mc.writeDone     // wait for writeLoop to finish
+		m.RemoveConn(idx)  // retransmit buffered frames + check reorder gaps
 
 		// Notify about dead connection (non-blocking).
 		select {
@@ -223,6 +238,34 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 		case <-m.ctx.Done():
 			return
 		}
+	}
+}
+
+// writeLoop drains the async write channel for a connection.
+// Frames pushed to mc.writeCh are written to the underlying conn serially.
+// This decouples Stream.Write from TCP write latency, allowing parallel
+// writes across different connections when striping is active.
+func (m *Mux) writeLoop(mc *muxConn) {
+	defer close(mc.writeDone)
+	for req := range mc.writeCh {
+		mc.mu.Lock()
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		}
+		_, err := mc.conn.Write(req.data)
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Time{})
+		}
+		mc.mu.Unlock()
+		if req.wg != nil {
+			req.wg.Done()
+		}
+		if err != nil {
+			mc.stats.errors.Add(1)
+			continue
+		}
+		mc.stats.bytesSent.Add(int64(len(req.data)))
+		mc.stats.lastUsed.Store(time.Now().UnixNano())
 	}
 }
 
@@ -480,7 +523,11 @@ func (m *Mux) UpdateLatency(idx int, rtt time.Duration) {
 // for a given session. Reuses nil slots left by RemoveConn to prevent
 // unbounded growth of the connection slice.
 func (m *Mux) AddConn(conn io.ReadWriteCloser) {
-	mc := &muxConn{conn: conn}
+	mc := &muxConn{
+		conn:      conn,
+		writeCh:   make(chan writeReq, 256),
+		writeDone: make(chan struct{}),
+	}
 	mc.stats.lastUsed.Store(time.Now().UnixNano())
 
 	m.mu.Lock()
@@ -499,6 +546,7 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 	m.mu.Unlock()
 
 	m.activeReaders.Add(1)
+	go m.writeLoop(mc)
 	go m.readLoop(idx, mc)
 }
 
@@ -679,6 +727,7 @@ type Stream struct {
 	nextStripSeq atomic.Uint32  // sender: per-stream sequence counter
 	reorder      *reorderBuffer // receiver: reorder buffer (nil if !striping)
 	closePending atomic.Bool    // receiver: FrameClose deferred until reorder drains
+	inflight     sync.WaitGroup // sender: tracks in-flight async writes
 }
 
 // OpenStream creates a new logical stream and sends an open frame to the peer.
@@ -967,20 +1016,42 @@ func (s *Stream) Write(p []byte) (int, error) {
 		}
 
 		mc := s.mux.selectConn()
-		if s.striping && mc != nil {
-			if data, err := f.MarshalBinary(); err == nil {
-				mc.rtxRing.mu.Lock()
-				mc.rtxRing.Push(data)
-				mc.rtxRing.mu.Unlock()
+		if mc == nil {
+			if total > 0 {
+				return total, errors.New("no connections available")
 			}
+			return 0, errors.New("no connections available")
 		}
 
-		err := s.mux.sendFrameOn(mc, f)
-		if err != nil {
-			if total > 0 {
-				return total, err
+		if s.striping {
+			// Async write: push marshaled frame to conn's write channel.
+			// This returns immediately, allowing parallel writes across conns.
+			data, err := f.MarshalBinary()
+			if err != nil {
+				if total > 0 {
+					return total, err
+				}
+				return 0, err
 			}
-			return 0, err
+			mc.rtxRing.mu.Lock()
+			mc.rtxRing.Push(data)
+			mc.rtxRing.mu.Unlock()
+			s.inflight.Add(1)
+			select {
+			case mc.writeCh <- writeReq{data: data, wg: &s.inflight}:
+			default:
+				// Channel full — backpressure. Write synchronously as fallback.
+				s.mux.sendFrameOn(mc, f)
+				s.inflight.Done()
+			}
+		} else {
+			err := s.mux.sendFrameOn(mc, f)
+			if err != nil {
+				if total > 0 {
+					return total, err
+				}
+				return 0, err
+			}
 		}
 		total += len(chunk)
 		p = p[len(chunk):]
@@ -1009,9 +1080,13 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // Close sends a close frame and removes the stream.
+// For striped streams, waits for all async writes to complete first.
 func (s *Stream) Close() error {
 	if s.closed.Swap(true) {
 		return nil
+	}
+	if s.striping {
+		s.inflight.Wait() // flush all pending async writes
 	}
 	close(s.done)
 	s.mux.streams.Delete(s.ID)
