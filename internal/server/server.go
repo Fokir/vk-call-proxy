@@ -26,6 +26,7 @@ import (
 type Config struct {
 	ListenAddr string             // DTLS/UDP listen address for direct mode
 	AuthToken  string             // Client authentication token
+	VKTokens   []string           // VK account tokens for authenticated TURN credential flow
 	Service    provider.Service   // Call service (VK, MAX, etc.) for relay-to-relay mode; nil = direct only
 	UseTCP     bool               // Use TCP for TURN connections
 	NumConns   int                // Number of parallel connections (Telemost mode)

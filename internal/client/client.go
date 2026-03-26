@@ -28,7 +28,8 @@ type Config struct {
 	NumConns      int
 	UseTCP        bool
 	AuthToken     string
-	Fingerprint   []byte // DTLS cert fingerprint (nil = no pinning)
+	VKTokens      []string // VK account tokens for authenticated TURN credential flow
+	Fingerprint   []byte   // DTLS cert fingerprint (nil = no pinning)
 	SocksPort     int
 	HTTPPort      int
 	BindAddr      string

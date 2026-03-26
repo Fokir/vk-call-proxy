@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
@@ -15,12 +17,22 @@ import (
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
 	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
 	callLink := flag.String("link", "", "call link ID for relay-to-relay mode (env: VK_CALL_LINK)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
 	numConns := flag.Int("n", 1, "number of parallel connections (Telemost mode)")
+	var vkTokens stringSlice
+	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	flag.Parse()
 
 	if *numConns > 8 {
@@ -34,12 +46,21 @@ func main() {
 	if *callLink == "" {
 		*callLink = os.Getenv("VK_CALL_LINK")
 	}
+	if len(vkTokens) == 0 {
+		if env := os.Getenv("VK_TOKENS"); env != "" {
+			vkTokens = strings.Split(env, ",")
+		}
+	}
+	if len(vkTokens) > 16 {
+		log.Fatal("maximum 16 VK tokens allowed")
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg := server.Config{
 		ListenAddr: *listenAddr,
 		AuthToken:  *authToken,
+		VKTokens:   []string(vkTokens),
 		UseTCP:     *useTCP,
 		NumConns:   *numConns,
 		Logger:     logger,

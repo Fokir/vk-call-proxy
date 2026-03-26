@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/call-vpn/call-vpn/internal/bypass"
@@ -19,6 +20,14 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 )
+
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
 
 func main() {
 	socks5Port := flag.Int("socks5-port", 1080, "SOCKS5 proxy listen port")
@@ -31,8 +40,19 @@ func main() {
 	authToken := flag.String("token", "", "auth token for server")
 	noBypass := flag.Bool("no-bypass", false, "disable built-in bypass for Russian services (VK, Yandex, Gosuslugi, etc.)")
 	fingerprint := flag.String("fingerprint", "", "server DTLS certificate SHA-256 fingerprint (hex)")
+	var vkTokens stringSlice
+	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 
 	flag.Parse()
+
+	if len(vkTokens) == 0 {
+		if env := os.Getenv("VK_TOKENS"); env != "" {
+			vkTokens = strings.Split(env, ",")
+		}
+	}
+	if len(vkTokens) > 16 {
+		log.Fatal("maximum 16 VK tokens allowed")
+	}
 
 	var fpBytes []byte
 	if *fingerprint != "" {
@@ -89,6 +109,7 @@ func main() {
 		NumConns:      *numConns,
 		UseTCP:        *useTCP,
 		AuthToken:     *authToken,
+		VKTokens:      []string(vkTokens),
 		Fingerprint:   fpBytes,
 		SocksPort:     *socks5Port,
 		HTTPPort:      *httpPort,
