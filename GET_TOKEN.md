@@ -1,26 +1,35 @@
 # How to Get a VK Token
 
-## Via OAuth (Recommended)
+## Способ 1: Через vkhost.github.io (Самый простой)
 
-1. Open this URL in your browser:
+1. Откройте https://vkhost.github.io/
+2. Выберите любое приложение из списка (например, **VK Admin** или **Kate Mobile**)
+3. Поставьте галочку **"Доступ в любое время"** — это даёт бессрочный токен
+4. Нажмите **"Получить"**
+5. Авторизуйтесь в VK и нажмите "Разрешить"
+6. Скопируйте `access_token` из адресной строки (начинается с `vk1.a.`)
+
+## Способ 2: Via OAuth URL
+
+1. Откройте в браузере:
 
    ```
    https://oauth.vk.com/authorize?client_id=6287487&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=offline&response_type=token&v=5.274
    ```
 
-2. Click "Allow" to authorize
-3. You'll be redirected to a URL like:
+2. Нажмите "Разрешить"
+3. Вы будете перенаправлены на URL вида:
    ```
    https://oauth.vk.com/blank.html#access_token=vk1.a.XXXXX&expires_in=0&user_id=12345
    ```
-4. Copy the `access_token` value (starts with `vk1.a.`)
+4. Скопируйте значение `access_token` (начинается с `vk1.a.`)
 
-## Using Your Own App ID
+## Свой App ID
 
-1. Go to https://vk.com/editapp?act=create
-2. Create a Standalone app
-3. Note the App ID
-4. Use the URL above but replace `client_id=6287487` with your App ID
+1. Перейдите на https://vk.com/editapp?act=create
+2. Создайте приложение типа Standalone
+3. Запомните App ID
+4. Замените `client_id=6287487` в URL выше на свой App ID
 
 ## Usage
 
