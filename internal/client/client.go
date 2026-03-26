@@ -245,23 +245,14 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	}
 
 	// 1. Join conference to get TURN creds and signaling endpoint.
-	// If VK tokens are available, try authenticated join first.
+	// Always use anonymous flow for signaling — VK kicks authenticated
+	// participants faster than anonymous ones (~7s vs ~120s).
+	// VK tokens are used only for TURN credential allocation (allocateWithToken).
 	var jr *provider.JoinInfo
 	var err error
-	if len(vkTokens) > 0 {
-		if tap, ok := svc.(provider.TokenAuthProvider); ok {
-			jr, err = tap.FetchJoinInfoWithToken(ctx, vkTokens[0])
-			if err != nil {
-				logger.Warn("first token failed for JoinInfo, falling back to anonymous", "err", err)
-				jr = nil
-			}
-		}
-	}
-	if jr == nil {
-		jr, err = svc.FetchJoinInfo(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("join conference: %w", err)
-		}
+	jr, err = svc.FetchJoinInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("join conference: %w", err)
 	}
 	logger.Info("joined conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 

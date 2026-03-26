@@ -444,20 +444,11 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	} else {
 		t.setStage("Получение токена VK...")
 		var err error
-		if len(vkTokens) > 0 {
-			if tap, ok := svc.(provider.TokenAuthProvider); ok {
-				jr, err = tap.FetchJoinInfoWithToken(ctx, vkTokens[0])
-				if err != nil {
-					t.logger.Warn("first VK token failed for JoinInfo, falling back to anonymous", "err", err)
-					jr = nil
-				}
-			}
-		}
-		if jr == nil {
-			jr, err = svc.FetchJoinInfo(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("join conference: %w", err)
-			}
+		// Always use anonymous flow for signaling — VK kicks authenticated
+		// participants faster than anonymous ones.
+		jr, err = svc.FetchJoinInfo(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("join conference: %w", err)
 		}
 		t.logger.Info("joined conference", "conv_id", jr.ConvID)
 	}
