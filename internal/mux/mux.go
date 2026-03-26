@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -133,6 +134,8 @@ type Mux struct {
 
 	maxStreams   int          // 0 = unlimited
 	streamCount atomic.Int32 // current active stream count
+
+	disableStriping bool // if true, streams are pinned to one conn even with >1 conn
 }
 
 // writeReq is a frame pushed to a connection's async write channel.
@@ -156,12 +159,13 @@ type muxConn struct {
 func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Mux{
-		logger:   logger,
-		inFrames: make(chan *Frame, 256),
-		ctx:      ctx,
-		cancel:   cancel,
-		allDead:  make(chan struct{}),
-		connDied: make(chan int, 32),
+		logger:          logger,
+		inFrames:        make(chan *Frame, 256),
+		ctx:             ctx,
+		cancel:          cancel,
+		allDead:         make(chan struct{}),
+		connDied:        make(chan int, 32),
+		disableStriping: os.Getenv("NO_STRIPING") == "1",
 	}
 	for _, c := range conns {
 		mc := &muxConn{
@@ -192,6 +196,12 @@ func (m *Mux) SetIdleTimeout(d time.Duration) {
 // 0 means unlimited (default). Must be called before DispatchLoop.
 func (m *Mux) SetMaxStreams(n int) {
 	m.maxStreams = n
+}
+
+// DisableStriping prevents stream frame distribution across connections.
+// Streams will be pinned to a single conn even with >1 conn (old behavior).
+func (m *Mux) DisableStriping() {
+	m.disableStriping = true
 }
 
 // readLoop reads frames from a single underlying connection.
@@ -734,7 +744,7 @@ type Stream struct {
 // The stream is pinned to a connection chosen via SWRR for write ordering.
 func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 	assigned := m.selectConn()
-	striping := m.TotalConns() > 1
+	striping := !m.disableStriping && m.TotalConns() > 1
 	s := &Stream{
 		ID:           id,
 		mux:          m,
@@ -775,7 +785,7 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
-				striping := m.TotalConns() > 1
+				striping := !m.disableStriping && m.TotalConns() > 1
 				s := &Stream{
 					ID:       f.StreamID,
 					mux:      m,
@@ -945,7 +955,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
-				striping := m.TotalConns() > 1
+				striping := !m.disableStriping && m.TotalConns() > 1
 				s := &Stream{
 					ID:           f.StreamID,
 					mux:          m,
