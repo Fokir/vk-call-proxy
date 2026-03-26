@@ -125,7 +125,7 @@ func (r *retransmitRing) Drain() [][]byte {
 
 const (
 	reorderMaxFrames  = 4096
-	reorderGapTimeout = 2 * time.Second
+	reorderGapTimeout = 5 * time.Second
 )
 
 type reorderEntry struct {
