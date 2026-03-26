@@ -3,6 +3,7 @@ package mux
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"testing"
 )
@@ -56,4 +57,82 @@ func newTestMux(n int) *Mux {
 		m.conns = append(m.conns, &muxConn{conn: &dummyConn{}})
 	}
 	return m
+}
+
+func TestFrameClose_DeferredWithPendingReorder(t *testing.T) {
+	m := newTestMux(2)
+
+	s := &Stream{
+		ID:       1,
+		mux:      m,
+		recv:     make(chan []byte, 1024),
+		done:     make(chan struct{}),
+		striping: true,
+		reorder:  newReorderBuffer(),
+	}
+	m.streams.Store(uint32(1), s)
+
+	// Insert out-of-order frame (seq 1, gap at seq 0)
+	m.dispatch(&Frame{StreamID: 1, Type: FrameData,
+		Payload: append(binary.BigEndian.AppendUint32(nil, 1), []byte("data1")...)})
+
+	// Send FrameClose — should be deferred
+	m.dispatch(&Frame{StreamID: 1, Type: FrameClose})
+	if s.closed.Load() {
+		t.Fatal("stream should not be closed yet — reorder buffer has pending frames")
+	}
+	if !s.closePending.Load() {
+		t.Fatal("closePending should be set")
+	}
+
+	// Fill the gap (seq 0) — should flush both frames and execute deferred close
+	m.dispatch(&Frame{StreamID: 1, Type: FrameData,
+		Payload: append(binary.BigEndian.AppendUint32(nil, 0), []byte("data0")...)})
+
+	// Stream should now be closed
+	if !s.closed.Load() {
+		t.Fatal("stream should be closed after reorder buffer drained")
+	}
+
+	// Verify data was delivered in order
+	d0 := <-s.recv
+	if string(d0) != "data0" {
+		t.Fatalf("expected 'data0', got '%s'", d0)
+	}
+	d1 := <-s.recv
+	if string(d1) != "data1" {
+		t.Fatalf("expected 'data1', got '%s'", d1)
+	}
+}
+
+func TestNonStripedStream_BackwardCompat(t *testing.T) {
+	m := newTestMux(1)
+
+	s := &Stream{
+		ID:           1,
+		mux:          m,
+		recv:         make(chan []byte, 1024),
+		done:         make(chan struct{}),
+		assignedConn: m.conns[0],
+		striping:     m.TotalConns() > 1,
+	}
+	if s.striping {
+		t.Fatal("should not be striped with 1 conn")
+	}
+	if s.reorder != nil {
+		t.Fatal("reorder buffer should be nil for non-striped stream")
+	}
+
+	m.streams.Store(uint32(1), s)
+
+	// Dispatch data without StripSeq prefix — should work as before
+	m.dispatch(&Frame{StreamID: 1, Type: FrameData, Payload: []byte("hello")})
+	select {
+	case data := <-s.recv:
+		if string(data) != "hello" {
+			t.Fatalf("expected 'hello', got '%s'", data)
+		}
+	default:
+		t.Fatal("expected data in recv channel")
+	}
 }
