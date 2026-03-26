@@ -310,3 +310,40 @@ VK_CALL_LINK_3=xyz789abc...
 # Stability: 2 calls × 2 conns, 10 min monitoring
 ./test-e2e.sh --n=2 --links=2 --monitor=10
 ```
+
+## Acceptance Criteria (post-implementation E2E testing)
+
+Implementation is complete only after ALL of these pass:
+
+### 1. Basic connectivity
+- [ ] `--link=A --n=4` (single call) works identically to current behavior
+- [ ] `--link=A --link=B --n=2` (multi-call) establishes tunnel, proxy responds
+- [ ] HTTP and SOCKS5 proxies both work through multi-call tunnel
+
+### 2. Speed
+- [ ] Multi-call (2×2=4 conns) throughput ≥ single-call (1×4=4 conns) on selectel 10MB
+- [ ] No regression: single-call speed unchanged vs current baseline (~100 KB/s)
+
+### 3. Stability
+- [ ] 10 minute monitoring with `--links=2 --n=2 --monitor=10`: all connectivity checks pass
+- [ ] No reconnect storms (serial queue works, no rate limit errors in logs)
+- [ ] Server pre-allocation works: client connect time with multi-call ≤ single-call + 5s
+
+### 4. Fault tolerance
+- [ ] Kill one call's browser tab: tunnel continues on remaining call(s)
+- [ ] Killed call's slot reconnects automatically (verify in logs)
+- [ ] After reconnect: all conns restored, speed back to normal
+
+### 5. Graceful degradation
+- [ ] Client 1 link + server 2 links: tunnel works on 1 common call
+- [ ] Client 2 links + server 1 link: tunnel works on 1 common call
+- [ ] Mismatched links: no errors, idle slots visible in logs
+
+### 6. Signaling redundancy
+- [ ] Relay addr exchange succeeds even if sent through non-primary WS
+- [ ] Duplicate messages are filtered (no double allocation or double handshake)
+
+### 7. Build & unit tests
+- [ ] `go build ./...` clean
+- [ ] `go test ./...` all pass
+- [ ] `go test ./internal/tunnel/...` new tests pass
