@@ -46,8 +46,9 @@ type Service struct {
 	callLink string
 }
 
-// Compile-time check.
+// Compile-time checks.
 var _ provider.Service = (*Service)(nil)
+var _ provider.TokenAuthProvider = (*Service)(nil)
 
 // NewService creates a VK call service provider.
 func NewService(callLink string) *Service {
@@ -126,6 +127,58 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 	result, err := okJoinConference(ctx, client, ua, s.callLink, token4, token5)
 	if err != nil {
 		return nil, fmt.Errorf("step6 join conference: %w", err)
+	}
+
+	return &provider.JoinInfo{
+		Credentials: *result.creds,
+		WSEndpoint:  result.endpoint,
+		ConvID:      result.convID,
+		DeviceIdx:   result.deviceIdx,
+	}, nil
+}
+
+// resolveOKAuthToken converts a token to an OK auth_token.
+// For "vk" tokens: calls messages.getCallToken API.
+// For "ok" tokens: returns as-is with a TTL warning.
+func resolveOKAuthToken(ctx context.Context, client *http.Client, ua string, token string) (authToken string, err error) {
+	switch classifyToken(token) {
+	case "vk":
+		authToken, _, err = vkGetCallToken(ctx, client, ua, token)
+		return authToken, err
+	case "ok":
+		slog.Warn("using OK auth_token directly — TTL unknown, token may expire without warning")
+		return token, nil
+	default:
+		return "", fmt.Errorf("unrecognized token format (expected vk1.a.* or $*): %.20s...", token)
+	}
+}
+
+// FetchJoinInfoWithToken implements provider.TokenAuthProvider.
+// Uses the authorized 3-step flow: resolve OK auth_token → auth.anonymLogin(v3) → joinConference.
+func (s *Service) FetchJoinInfoWithToken(ctx context.Context, token string) (*provider.JoinInfo, error) {
+	ua := randomUserAgent()
+	client := &http.Client{
+		Timeout:   httpTimeout,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+
+	// Step 1: Resolve token to OK auth_token
+	authToken, err := resolveOKAuthToken(ctx, client, ua, token)
+	if err != nil {
+		return nil, fmt.Errorf("resolve auth token: %w", err)
+	}
+
+	// Step 2: OK auth with token (version 3)
+	deviceID := uuid.New().String()
+	sessionKey, err := okAuthWithToken(ctx, client, ua, authToken, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("ok auth with token: %w", err)
+	}
+
+	// Step 3: Join conference without anonymToken (empty string = omit)
+	result, err := okJoinConference(ctx, client, ua, s.callLink, "", sessionKey)
+	if err != nil {
+		return nil, fmt.Errorf("join conference: %w", err)
 	}
 
 	return &provider.JoinInfo{
