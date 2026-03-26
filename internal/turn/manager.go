@@ -130,6 +130,7 @@ func (m *Manager) dialAndAllocate(ctx context.Context, creds *provider.Credentia
 		// small (16KB) bottlenecks throughput. Adaptive bridge pacing
 		// handles relay overflow protection.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
 			tcpConn.SetWriteBuffer(131072)
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(10 * time.Second)

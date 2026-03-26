@@ -101,6 +101,7 @@ type connStats struct {
 	bytesSent atomic.Int64
 	errors    atomic.Int64
 	lastUsed  atomic.Int64 // unix nano
+	prevSent  atomic.Int64 // bytesSent snapshot at last throughput measurement
 }
 
 // Mux multiplexes framed streams over multiple underlying connections,
@@ -135,7 +136,9 @@ type Mux struct {
 	maxStreams   int          // 0 = unlimited
 	streamCount atomic.Int32 // current active stream count
 
-	disableStriping bool // if true, streams are pinned to one conn even with >1 conn
+	disableStriping bool       // if true, streams are pinned to one conn even with >1 conn
+	adaptiveStripe  atomic.Bool // adaptive: currently striping?
+	prevThroughput  atomic.Int64 // bytes/sec before striping was enabled (for comparison)
 }
 
 // writeReq is a frame pushed to a connection's async write channel.
@@ -198,10 +201,112 @@ func (m *Mux) SetMaxStreams(n int) {
 	m.maxStreams = n
 }
 
-// EnableStriping allows stream frame distribution across connections.
-// By default striping is off (use ENABLE_STRIPING=1 env var or this method).
+// EnableStriping forces striping on (overrides adaptive logic).
+// By default striping is adaptive — auto-enabled when throughput saturates a single conn.
+// Use ENABLE_STRIPING=1 env var for the same effect.
 func (m *Mux) EnableStriping() {
 	m.disableStriping = false
+	m.adaptiveStripe.Store(true)
+}
+
+// shouldStripe returns true if new streams should use striping.
+// Logic: ENABLE_STRIPING=1 forces on, otherwise adaptive decision.
+func (m *Mux) shouldStripe() bool {
+	if m.TotalConns() <= 1 {
+		return false
+	}
+	if !m.disableStriping {
+		return true // explicitly enabled via env or EnableStriping()
+	}
+	return m.adaptiveStripe.Load() // adaptive decision
+}
+
+// Adaptive striping thresholds.
+const (
+	// If best conn throughput exceeds this, enable striping for new streams.
+	// ~200 KB/s is near the pacing limit of a single conn.
+	stripeSaturationThreshold = 150_000 // bytes/sec
+
+	// If total throughput drops below this fraction of pre-striping throughput, disable.
+	stripeDegradationRatio = 0.7 // 70% — striping making things worse
+
+	// How often to re-evaluate adaptive striping.
+	stripeEvalInterval = 10 * time.Second
+)
+
+// StartAdaptiveStriping monitors throughput and auto-enables/disables striping.
+// Call in a goroutine. Stops when ctx is cancelled.
+func (m *Mux) StartAdaptiveStriping(ctx context.Context) {
+	ticker := time.NewTicker(stripeEvalInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.evalAdaptiveStriping()
+		}
+	}
+}
+
+func (m *Mux) evalAdaptiveStriping() {
+	if !m.disableStriping {
+		return // striping forced on, skip adaptive
+	}
+	if m.TotalConns() <= 1 {
+		return
+	}
+
+	// Measure throughput per conn since last eval
+	m.mu.Lock()
+	conns := make([]*muxConn, len(m.conns))
+	copy(conns, m.conns)
+	m.mu.Unlock()
+
+	var totalBps int64
+	var bestBps int64
+	for _, mc := range conns {
+		if mc == nil {
+			continue
+		}
+		sent := mc.stats.bytesSent.Load()
+		prev := mc.stats.prevSent.Swap(sent)
+		bps := (sent - prev) * int64(time.Second) / int64(stripeEvalInterval)
+		if bps < 0 {
+			bps = 0
+		}
+		totalBps += bps
+		if bps > bestBps {
+			bestBps = bps
+		}
+	}
+
+	wasStriping := m.adaptiveStripe.Load()
+
+	if !wasStriping {
+		// Consider enabling: is best conn saturated?
+		if bestBps > stripeSaturationThreshold {
+			m.prevThroughput.Store(totalBps)
+			m.adaptiveStripe.Store(true)
+			m.logger.Info("adaptive striping: ENABLED",
+				"best_conn_bps", bestBps,
+				"total_bps", totalBps,
+				"threshold", stripeSaturationThreshold)
+		}
+	} else {
+		// Consider disabling: did throughput degrade?
+		prevBps := m.prevThroughput.Load()
+		if prevBps > 0 && totalBps < int64(float64(prevBps)*stripeDegradationRatio) {
+			m.adaptiveStripe.Store(false)
+			m.logger.Info("adaptive striping: DISABLED (degradation)",
+				"total_bps", totalBps,
+				"prev_bps", prevBps,
+				"ratio", float64(totalBps)/float64(prevBps))
+		} else if totalBps > 0 {
+			// Update baseline for next comparison
+			m.prevThroughput.Store(totalBps)
+		}
+	}
 }
 
 // readLoop reads frames from a single underlying connection.
@@ -252,29 +357,64 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 }
 
 // writeLoop drains the async write channel for a connection.
-// Frames pushed to mc.writeCh are written to the underlying conn serially.
-// This decouples Stream.Write from TCP write latency, allowing parallel
-// writes across different connections when striping is active.
+// Batches multiple frames into a single TCP write to reduce syscall
+// overhead and avoid Nagle-like delays on small writes.
 func (m *Mux) writeLoop(mc *muxConn) {
 	defer close(mc.writeDone)
-	for req := range mc.writeCh {
+	var batch []writeReq
+	for {
+		// Block on first frame
+		req, ok := <-mc.writeCh
+		if !ok {
+			return
+		}
+		batch = append(batch[:0], req)
+
+		// Drain all immediately available frames (non-blocking)
+	drain:
+		for len(batch) < 64 {
+			select {
+			case r, ok := <-mc.writeCh:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, r)
+			default:
+				break drain
+			}
+		}
+
+		// Coalesce into single buffer for one TCP write
+		totalLen := 0
+		for _, r := range batch {
+			totalLen += len(r.data)
+		}
+		buf := make([]byte, 0, totalLen)
+		for _, r := range batch {
+			buf = append(buf, r.data...)
+		}
+
 		mc.mu.Lock()
 		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
 			d.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		}
-		_, err := mc.conn.Write(req.data)
+		_, err := mc.conn.Write(buf)
 		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
 			d.SetWriteDeadline(time.Time{})
 		}
 		mc.mu.Unlock()
-		if req.wg != nil {
-			req.wg.Done()
+
+		// Signal all waiters
+		for _, r := range batch {
+			if r.wg != nil {
+				r.wg.Done()
+			}
 		}
 		if err != nil {
 			mc.stats.errors.Add(1)
 			continue
 		}
-		mc.stats.bytesSent.Add(int64(len(req.data)))
+		mc.stats.bytesSent.Add(int64(totalLen))
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
 	}
 }
@@ -744,7 +884,7 @@ type Stream struct {
 // The stream is pinned to a connection chosen via SWRR for write ordering.
 func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 	assigned := m.selectConn()
-	striping := !m.disableStriping && m.TotalConns() > 1
+	striping := m.shouldStripe()
 	s := &Stream{
 		ID:           id,
 		mux:          m,
@@ -785,7 +925,7 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
-				striping := !m.disableStriping && m.TotalConns() > 1
+				striping := m.shouldStripe()
 				s := &Stream{
 					ID:       f.StreamID,
 					mux:      m,
@@ -955,7 +1095,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
 					continue
 				}
-				striping := !m.disableStriping && m.TotalConns() > 1
+				striping := m.shouldStripe()
 				s := &Stream{
 					ID:           f.StreamID,
 					mux:          m,
