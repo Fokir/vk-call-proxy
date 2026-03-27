@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
-	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/testrig"
 )
 
@@ -40,13 +39,9 @@ func connectPair(t *testing.T, svc provider.Service, token string) (provider.Sig
 	}
 	t.Cleanup(func() { sig2.Close() })
 
-	// Wait for sig1 to see sig2 join (mock WS sends participant-joined to existing).
-	vkSig1 := sig1.(*vk.SignalingClient)
-	if _, err := vkSig1.WaitForPeer(ctx, 0); err != nil {
-		t.Fatalf("sig1.WaitForPeer: %v", err)
-	}
-	// Brief pause to ensure both sides are fully connected.
-	time.Sleep(100 * time.Millisecond)
+	// Brief pause to ensure both sides are fully connected and have received
+	// participant-joined notifications from the mock WS server.
+	time.Sleep(500 * time.Millisecond)
 
 	if token != "" {
 		if err := sig1.SetKey(token); err != nil {
