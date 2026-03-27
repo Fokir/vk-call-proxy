@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -58,10 +59,17 @@ const DefaultWritePace = 5 * time.Millisecond
 var bridgeWritePace = DefaultWritePace
 
 // SetWritePace overrides the per-connection relay write pacing.
-// Call with WritePaceForConns(n) before creating TURN connections
-// to scale pacing with the number of parallel connections.
 func SetWritePace(d time.Duration) {
 	bridgeWritePace = d
+}
+
+// ScalePaceIfStriping increases per-connection pacing when striping is enabled
+// (ENABLE_STRIPING=1). Without striping each stream uses one conn so default
+// pacing is fine; with striping all conns share the relay's ~200 pkts/s limit.
+func ScalePaceIfStriping(numConns int) {
+	if os.Getenv("ENABLE_STRIPING") == "1" {
+		SetWritePace(WritePaceForConns(numConns))
+	}
 }
 
 // WritePaceForConns returns the per-connection pacing to keep total relay rate

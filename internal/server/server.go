@@ -634,8 +634,8 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 // disconnects. The caller (runPersistentRelaySession) keeps the VK
 // session alive across multiple client connections.
 func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service, vkTokens []string, initialCreds *provider.Credentials) error {
-	// Scale per-connection write pacing so total relay rate stays ~200 pkts/s.
-	internaldtls.SetWritePace(internaldtls.WritePaceForConns(s.cfg.NumConns))
+	// Scale write pacing only when striping is active.
+	internaldtls.ScalePaceIfStriping(s.cfg.NumConns)
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	if initialCreds != nil {
 		mgr.SetInitialCredentials(initialCreds)
