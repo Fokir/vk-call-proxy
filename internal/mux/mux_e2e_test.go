@@ -419,3 +419,174 @@ func TestMUX_E2E_ConnDied(t *testing.T) {
 	clientMux.Close()
 	serverMux.Close()
 }
+
+func TestMUX_E2E_RawPackets(t *testing.T) {
+	rig := testrig.New(t, testrig.Options{TURNServers: 1})
+	pair := setupDTLSPair(t, rig)
+	t.Cleanup(pair.cleanup)
+
+	logger := slog.Default()
+
+	clientMux := mux.New(logger, pair.clientConn)
+	serverMux := mux.New(logger, pair.serverConn)
+
+	// Enable raw packets on the receiver (server) side.
+	serverMux.EnableRawPackets(64)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	go serverMux.DispatchLoop(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	// Send a raw packet (StreamID=0, FrameData) from client.
+	payload := []byte("raw-ip-packet-test-data")
+	f := &mux.Frame{
+		StreamID: 0,
+		Type:     mux.FrameData,
+		Payload:  payload,
+	}
+	f.Length = uint32(len(payload))
+	if err := clientMux.SendRawPacket(f); err != nil {
+		t.Fatalf("SendRawPacket: %v", err)
+	}
+
+	// Read from the RawPackets ring buffer on server side.
+	rb := serverMux.RawPackets()
+	if rb == nil {
+		t.Fatal("RawPackets() returned nil")
+	}
+
+	var received *mux.Frame
+	select {
+	case <-rb.Ready():
+		var ok bool
+		received, ok = rb.Pop()
+		if !ok {
+			t.Fatal("Pop returned false after Ready signal")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for raw packet")
+	}
+
+	if !bytes.Equal(received.Payload, payload) {
+		t.Fatalf("raw packet data mismatch: got %q, want %q", received.Payload, payload)
+	}
+
+	cancel()
+	clientMux.Close()
+	serverMux.Close()
+}
+
+func TestMUX_E2E_MultiConnBenchmark(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-conn benchmark in short mode")
+	}
+
+	rig := testrig.New(t, testrig.Options{TURNServers: 1})
+
+	connCounts := []int{1, 2}
+	const payloadSize = 256 * 1024 // 256 KB
+
+	for _, numConns := range connCounts {
+		t.Run(fmt.Sprintf("conns=%d", numConns), func(t *testing.T) {
+			// Create N DTLS pairs.
+			pairs := make([]dtlsPair, numConns)
+			for i := range pairs {
+				pairs[i] = setupDTLSPair(t, rig)
+				t.Cleanup(pairs[i].cleanup)
+			}
+
+			logger := slog.Default()
+
+			// Build client/server MUX with first connection.
+			clientMux := mux.New(logger, pairs[0].clientConn)
+			serverMux := mux.New(logger, pairs[0].serverConn)
+			for i := 1; i < numConns; i++ {
+				clientMux.AddConn(pairs[i].clientConn)
+				serverMux.AddConn(pairs[i].serverConn)
+			}
+
+			// No explicit striping — use default adaptive mode (off for short transfers).
+			serverMux.EnableStreamAccept(16)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			go serverMux.DispatchLoop(ctx)
+			time.Sleep(50 * time.Millisecond)
+
+			// Generate payload.
+			payload := make([]byte, payloadSize)
+			if _, err := rand.Read(payload); err != nil {
+				t.Fatalf("rand.Read: %v", err)
+			}
+
+			// Open stream on client.
+			stream, err := clientMux.OpenStream(1)
+			if err != nil {
+				t.Fatalf("OpenStream: %v", err)
+			}
+
+			// Receive in background.
+			var recvWg sync.WaitGroup
+			recvWg.Add(1)
+			var recvErr error
+			var recvBytes int
+			go func() {
+				defer recvWg.Done()
+				select {
+				case srv := <-serverMux.AcceptedStreams():
+					buf := make([]byte, payloadSize)
+					total := 0
+					for total < payloadSize {
+						n, err := srv.Read(buf[total:])
+						if n > 0 {
+							total += n
+						}
+						if err != nil {
+							if total >= payloadSize {
+								break
+							}
+							recvErr = err
+							recvBytes = total
+							return
+						}
+					}
+					recvBytes = total
+				case <-ctx.Done():
+					recvErr = ctx.Err()
+				}
+			}()
+
+			// Send payload.
+			start := time.Now()
+			written := 0
+			for written < payloadSize {
+				n, err := stream.Write(payload[written:])
+				if err != nil {
+					t.Fatalf("write at offset %d: %v", written, err)
+				}
+				written += n
+			}
+
+			recvWg.Wait()
+			elapsed := time.Since(start)
+
+			if recvErr != nil {
+				t.Fatalf("receive error: %v (got %d bytes)", recvErr, recvBytes)
+			}
+			if recvBytes != payloadSize {
+				t.Fatalf("received %d bytes, want %d", recvBytes, payloadSize)
+			}
+
+			mbps := float64(payloadSize) / elapsed.Seconds() / (1 << 20)
+			t.Logf("conns=%d throughput=%.2f MB/s (%d bytes in %v)",
+				numConns, mbps, payloadSize, elapsed.Round(time.Millisecond))
+
+			cancel()
+			clientMux.Close()
+			serverMux.Close()
+		})
+	}
+}

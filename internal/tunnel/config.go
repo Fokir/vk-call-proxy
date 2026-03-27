@@ -40,13 +40,14 @@ func (s SlotState) String() string {
 
 // PoolConfig configures the CallPool.
 type PoolConfig struct {
-	Services     []provider.Service // one per call link
-	ConnsPerCall int                // --n flag (default 4)
-	UseTCP       bool               // TCP vs UDP for TURN
-	AuthToken    string             // VPN auth token (shared)
-	VKTokens     []string           // VK account tokens for fast allocation
-	Fingerprint  []byte             // server DTLS cert fingerprint (client only)
-	Logger       *slog.Logger
+	Services         []provider.Service // one per call link
+	ConnsPerCall     int                // --n flag (default 4)
+	UseTCP           bool               // TCP vs UDP for TURN
+	AuthToken        string             // VPN auth token (shared)
+	VKTokens         []string           // VK account tokens for fast allocation
+	Fingerprint      []byte             // server DTLS cert fingerprint (client only)
+	SlotConnectDelay time.Duration      // delay between sequential slot connects (0 = default 3s)
+	Logger           *slog.Logger
 }
 
 // SlotStatus is a snapshot of one slot's health.

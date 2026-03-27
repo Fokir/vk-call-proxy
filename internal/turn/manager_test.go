@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/testrig"
@@ -144,4 +145,64 @@ func TestManager_CloseAll(t *testing.T) {
 	if n := len(mgr.Allocations()); n != 0 {
 		t.Fatalf("expected 0 allocations after CloseAll, got %d", n)
 	}
+}
+
+func TestManager_AllocateGradual(t *testing.T) {
+	rig := testrig.New(t, testrig.Options{TURNServers: 1})
+	creds := rig.Credentials(0)
+
+	mgr := turn.NewManager(&staticCreds{c: creds}, false, slog.Default())
+	defer mgr.CloseAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ch := mgr.AllocateGradual(ctx, 4, turn.GradualOpts{BatchSize: 2})
+
+	var totalAllocs int
+	var batches int
+	var sawFinal bool
+	for br := range ch {
+		batches++
+		totalAllocs += len(br.Allocs)
+		t.Logf("batch %d: %d allocs, final=%v", batches, len(br.Allocs), br.Final)
+
+		// Verify each allocation has a valid relay address.
+		for i, a := range br.Allocs {
+			if a.RelayAddr == nil {
+				t.Errorf("batch %d alloc %d: RelayAddr is nil", batches, i)
+				continue
+			}
+			host, port, err := net.SplitHostPort(a.RelayAddr.String())
+			if err != nil {
+				t.Errorf("batch %d alloc %d: bad RelayAddr %q: %v", batches, i, a.RelayAddr, err)
+				continue
+			}
+			if host == "" || port == "" {
+				t.Errorf("batch %d alloc %d: empty host or port", batches, i)
+			}
+		}
+
+		if br.Final {
+			sawFinal = true
+		}
+	}
+
+	if totalAllocs != 4 {
+		t.Fatalf("expected 4 total allocations, got %d", totalAllocs)
+	}
+	if !sawFinal {
+		t.Fatal("never received a batch with Final=true")
+	}
+	if batches < 2 {
+		t.Fatalf("expected at least 2 batches (batch_size=2, total=4), got %d", batches)
+	}
+
+	// Verify all 4 are tracked by the manager.
+	allocs := mgr.Allocations()
+	if len(allocs) != 4 {
+		t.Fatalf("manager tracks %d allocations, want 4", len(allocs))
+	}
+
+	t.Logf("AllocateGradual completed: %d batches, %d total allocations", batches, totalAllocs)
 }

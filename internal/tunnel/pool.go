@@ -48,6 +48,14 @@ func NewCallPool(cfg PoolConfig) *CallPool {
 	}
 }
 
+// slotDelay returns the configured slot connect delay, falling back to the default constant.
+func (p *CallPool) slotDelay() time.Duration {
+	if p.cfg.SlotConnectDelay > 0 {
+		return p.cfg.SlotConnectDelay
+	}
+	return slotConnectDelay
+}
+
 // StartClient connects all slots sequentially, allocates connections,
 // and returns the shared MUX for proxy to use.
 // First slot to establish connections makes the MUX available; remaining continue in background.
@@ -61,14 +69,16 @@ func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
 	}
 	p.mu.Unlock()
 
+	delay := p.slotDelay()
+
 	// Phase 1: Sequential connect (rate limit safe)
 	for i, slot := range p.slots {
 		if i > 0 {
-			p.logger.Info("waiting before next slot connect", "delay", slotConnectDelay)
+			p.logger.Info("waiting before next slot connect", "delay", delay)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(slotConnectDelay):
+			case <-time.After(delay):
 			}
 		}
 
@@ -131,6 +141,8 @@ func (p *CallPool) StartServer(ctx context.Context) (*mux.Mux, error) {
 	}
 	p.mu.Unlock()
 
+	delay := p.slotDelay()
+
 	// Phase 1: Sequential connect + pre-allocate 1 TURN per slot
 	type preAlloc struct {
 		slot   *CallSlot
@@ -143,7 +155,7 @@ func (p *CallPool) StartServer(ctx context.Context) (*mux.Mux, error) {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(slotConnectDelay):
+			case <-time.After(delay):
 			}
 		}
 
