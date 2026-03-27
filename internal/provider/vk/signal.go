@@ -152,13 +152,15 @@ func fromWireRole(mode string) string {
 
 // ConnectSignaling dials the VK WebSocket endpoint and starts the read loop.
 // The first message received is a "connection" notification with our peer ID.
-func ConnectSignaling(ctx context.Context, wsEndpoint string, logger *slog.Logger) (*SignalingClient, error) {
+// deviceIdx differentiates concurrent connections from the same anonymous user;
+// VK kicks participants with the same deviceIdx via "ANOTHER_DEVICE".
+func ConnectSignaling(ctx context.Context, wsEndpoint string, deviceIdx int, logger *slog.Logger) (*SignalingClient, error) {
 	// VK requires additional query parameters for the signaling WebSocket.
 	sep := "&"
 	if !strings.Contains(wsEndpoint, "?") {
 		sep = "?"
 	}
-	wsEndpoint += sep + randomJoinParams()
+	wsEndpoint += sep + joinParamsWithDeviceIdx(deviceIdx)
 
 	dialer := websocket.Dialer{}
 	conn, _, err := dialer.DialContext(ctx, wsEndpoint, nil)

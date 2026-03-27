@@ -67,5 +67,5 @@ func (s *mockService) FetchCredentials(ctx context.Context) (*provider.Credentia
 }
 
 func (s *mockService) ConnectSignaling(ctx context.Context, info *provider.JoinInfo, logger *slog.Logger) (provider.SignalingClient, error) {
-	return vk.ConnectSignaling(ctx, info.WSEndpoint, logger)
+	return vk.ConnectSignaling(ctx, info.WSEndpoint, info.DeviceIdx, logger)
 }

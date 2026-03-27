@@ -185,7 +185,7 @@ func (s *Service) FetchJoinInfoWithToken(ctx context.Context, token string) (*pr
 
 // ConnectSignaling connects to VK WebSocket signaling.
 func (s *Service) ConnectSignaling(ctx context.Context, info *provider.JoinInfo, logger *slog.Logger) (provider.SignalingClient, error) {
-	return ConnectSignaling(ctx, info.WSEndpoint, logger)
+	return ConnectSignaling(ctx, info.WSEndpoint, info.DeviceIdx, logger)
 }
 
 // --- VK auth chain (private) ---
