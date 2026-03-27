@@ -26,6 +26,8 @@ class CallVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var rootManager: RootManager? = null
     private var tunInterfaceName: String? = null
+    private var tunReaderThread: Thread? = null
+    private var tunWriterThread: Thread? = null
     @Volatile
     private var running = false
     @Volatile
@@ -266,7 +268,7 @@ class CallVpnService : VpnService() {
             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
 
             // Read from TUN -> write to tunnel
-            Thread {
+            tunReaderThread = Thread {
                 val input = FileInputStream(vpn.fileDescriptor)
                 val buf = ByteArray(1500)
                 while (running) {
@@ -284,10 +286,10 @@ class CallVpnService : VpnService() {
                         }
                     }
                 }
-            }.start()
+            }.also { it.start() }
 
             // Read from tunnel -> write to TUN
-            Thread {
+            tunWriterThread = Thread {
                 val output = FileOutputStream(vpn.fileDescriptor)
                 val buf = ByteArray(1500)
                 while (running) {
@@ -305,7 +307,7 @@ class CallVpnService : VpnService() {
                         }
                     }
                 }
-            }.start()
+            }.also { it.start() }
         }.start()
     }
 
@@ -321,8 +323,21 @@ class CallVpnService : VpnService() {
         tunInterfaceName = null
         rootManager = null
 
-        tunnel?.stop()
+        // Close VPN interface FIRST to unblock reader/writer threads that
+        // may be stuck on blocking I/O.  Without this the threads keep the
+        // TUN device alive and Android leaves stale routes in place, which
+        // causes "no internet" after disconnect until WiFi is toggled.
         vpnInterface?.close()
+        vpnInterface = null
+
+        // Wait for I/O threads to exit (they will get an IOException from
+        // the closed FD and break out of their loops).
+        try { tunReaderThread?.join(2000) } catch (_: Exception) {}
+        try { tunWriterThread?.join(2000) } catch (_: Exception) {}
+        tunReaderThread = null
+        tunWriterThread = null
+
+        tunnel?.stop()
         broadcastState("disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
