@@ -186,7 +186,7 @@ func (s *CallSlot) AllocateAndConnectServer(ctx context.Context, m *mux.Mux, rou
 	return s.allocateServer(ctx, m, router, mgr, sigClient, nonce, n, preAllocs)
 }
 
-func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, router *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, nonce string, n int, sessionID [16]byte) (*mux.Mux, error) {
+func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, _ *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, nonce string, n int, sessionID [16]byte) (*mux.Mux, error) {
 	// Disconnect handshake (clear previous session)
 	dctx, dcancel := context.WithTimeout(ctx, 6*time.Second)
 	sigClient.SendDisconnectReq(dctx, nonce)
@@ -217,8 +217,8 @@ func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, router *Signa
 	punchIdx := 0
 	if len(tokenAllocs) > 0 {
 		addrs := allocAddrs(tokenAllocs)
-		if err := router.BroadcastRelayBatch(ctx, addrs, "client", nonce, 0, anonCount == 0); err != nil {
-			return m, fmt.Errorf("slot %d: broadcast batch 0: %w", s.index, err)
+		if err := sigClient.SendRelayBatch(ctx, addrs, "client", nonce, 0, anonCount == 0); err != nil {
+			return m, fmt.Errorf("slot %d: send batch 0: %w", s.index, err)
 		}
 
 		serverAddrs, _, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
@@ -248,8 +248,8 @@ func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, router *Signa
 			}
 
 			addrs := allocAddrs(br.Allocs)
-			if err := router.BroadcastRelayBatch(ctx, addrs, "client", nonce, batchNum, br.Final); err != nil {
-				s.logger.Warn("broadcast batch failed", "batch", batchNum, "err", err)
+			if err := sigClient.SendRelayBatch(ctx, addrs, "client", nonce, batchNum, br.Final); err != nil {
+				s.logger.Warn("send batch failed", "batch", batchNum, "err", err)
 				continue
 			}
 
@@ -283,7 +283,7 @@ func (s *CallSlot) allocateClient(ctx context.Context, m *mux.Mux, router *Signa
 	return m, nil
 }
 
-func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, router *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, _ string, _ int, preAllocs []*turn.Allocation) (*mux.Mux, error) {
+func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, _ *SignalingRouter, mgr *turn.Manager, sigClient provider.SignalingClient, _ string, _ int, preAllocs []*turn.Allocation) (*mux.Mux, error) {
 	tokenIdx := 0
 	tokens := deduplicateTokens(s.vkTokens)
 	punchIdx := 0
@@ -328,7 +328,7 @@ func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, router *Signa
 
 		// Respond with CLIENT's nonce (not server's) so client can filter by its own nonce
 		serverAddrs := allocAddrs(allocs)
-		if err := router.BroadcastRelayBatch(ctx, serverAddrs, "server", clientNonce, batch, final); err != nil {
+		if err := sigClient.SendRelayBatch(ctx, serverAddrs, "server", clientNonce, batch, final); err != nil {
 			s.logger.Warn("broadcast server addrs failed", "err", err)
 		}
 
