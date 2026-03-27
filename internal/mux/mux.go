@@ -227,8 +227,11 @@ func (m *Mux) shouldStripe() bool {
 // Adaptive striping thresholds.
 const (
 	// If best conn throughput exceeds this, enable striping for new streams.
-	// ~200 KB/s is near the pacing limit of a single conn.
-	stripeSaturationThreshold = 150_000 // bytes/sec
+	// Set high to prevent auto-enabling over TCP TURN relays where striping
+	// causes reorder timeouts due to TCP congestion jitter between connections.
+	// Only ENABLE_STRIPING=1 forces it on. Threshold would need to be ~500 KB/s+
+	// to work with direct (non-TURN) connections.
+	stripeSaturationThreshold = 500_000 // bytes/sec
 
 	// If total throughput drops below this fraction of pre-striping throughput, disable.
 	stripeDegradationRatio = 0.7 // 70% — striping making things worse
