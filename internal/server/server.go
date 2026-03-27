@@ -607,7 +607,7 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 	const maxConsecErrors = 3
 	consecErrors := 0
 	for {
-		err := s.acceptOneClient(ctx, sigClient, svc, s.cfg.VKTokens)
+		err := s.acceptOneClient(ctx, sigClient, svc, s.cfg.VKTokens, &jr.Credentials)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -633,8 +633,11 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 // signaling channel, serves its session, and returns when the client
 // disconnects. The caller (runPersistentRelaySession) keeps the VK
 // session alive across multiple client connections.
-func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service, vkTokens []string) error {
+func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service, vkTokens []string, initialCreds *provider.Credentials) error {
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
+	if initialCreds != nil {
+		mgr.SetInitialCredentials(initialCreds)
+	}
 	defer mgr.CloseAll()
 
 	vkTokens = deduplicateTokens(vkTokens, s.cfg.Logger)
@@ -685,14 +688,21 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 				if tokenIdx >= len(vkTokens) {
 					break
 				}
-				info, err := tap.FetchJoinInfoWithToken(ctx, vkTokens[tokenIdx])
-				if err != nil {
-					s.cfg.Logger.Warn("server token fetch failed, stopping token allocation",
-						"tokenIdx", tokenIdx, "err", err)
-					tokenIdx++
-					break
+				var creds *provider.Credentials
+				if tokenIdx == 0 && initialCreds != nil {
+					// First token was already used for initial join — reuse those credentials.
+					creds = initialCreds
+				} else {
+					info, err := tap.FetchJoinInfoWithToken(ctx, vkTokens[tokenIdx])
+					if err != nil {
+						s.cfg.Logger.Warn("server token fetch failed, stopping token allocation",
+							"tokenIdx", tokenIdx, "err", err)
+						tokenIdx++
+						break
+					}
+					creds = &info.Credentials
 				}
-				alloc, err := mgr.AllocateWithCredentials(ctx, &info.Credentials)
+				alloc, err := mgr.AllocateWithCredentials(ctx, creds)
 				if err != nil {
 					s.cfg.Logger.Warn("server token TURN alloc failed, skipping token",
 						"tokenIdx", tokenIdx, "err", err)
@@ -1063,8 +1073,33 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 	go func() {
 		defer wg.Done()
 		buf2 := make([]byte, mux.MaxFramePayload)
-		n, err := io.CopyBuffer(stream, outConn, buf2)
-		logger.Info("target→stream done", "stream_id", stream.ID, "target", target, "bytes", n, "err", err)
+		var total int64
+		for {
+			nr, readErr := outConn.Read(buf2)
+			if nr > 0 {
+				nw, writeErr := stream.Write(buf2[:nr])
+				total += int64(nw)
+				if total%(256*1024) < int64(nr) {
+					logger.Debug("target→stream progress",
+						"stream_id", stream.ID,
+						"target", target,
+						"bytes", total,
+					)
+				}
+				if writeErr != nil {
+					logger.Info("target→stream done", "stream_id", stream.ID, "target", target, "bytes", total, "err", writeErr)
+					return
+				}
+				if nw != nr {
+					logger.Info("target→stream done", "stream_id", stream.ID, "target", target, "bytes", total, "err", "short write")
+					return
+				}
+			}
+			if readErr != nil {
+				logger.Info("target→stream done", "stream_id", stream.ID, "target", target, "bytes", total, "err", readErr)
+				return
+			}
+		}
 	}()
 
 	wg.Wait()

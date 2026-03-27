@@ -1,5 +1,5 @@
 // Package vk implements provider.Service for VK Calls.
-// It fetches TURN credentials via the 6-step VK/OK authentication chain
+// It fetches TURN credentials via the VK/OK authentication chain
 // and connects to VK WebSocket signaling for relay-to-relay mode.
 package vk
 
@@ -24,7 +24,7 @@ import (
 const (
 	vkClientID     = "6287487"
 	vkClientSecret = "QbYic1K3lEV5kTGiqlq2"
-	vkAPIVersion   = "5.264"
+	vkAPIVersion   = "5.274"
 	okAppKey       = "CGMMEJLGDIHBABABA"
 	httpTimeout    = 20 * time.Second
 )
@@ -58,7 +58,7 @@ func NewService(callLink string) *Service {
 func (s *Service) Name() string { return "vk" }
 
 // FetchCredentials obtains anonymous TURN credentials from VK using the
-// 6-step authentication chain. Each call generates a fresh anonymous identity.
+// 4-step authentication chain. Each call generates a fresh anonymous identity.
 func (s *Service) FetchCredentials(ctx context.Context) (*provider.Credentials, error) {
 	ji, err := s.FetchJoinInfo(ctx)
 	if err != nil {
@@ -68,10 +68,15 @@ func (s *Service) FetchCredentials(ctx context.Context) (*provider.Credentials, 
 	return &creds, nil
 }
 
-// FetchJoinInfo performs the full 6-step VK authentication chain and returns
+// FetchJoinInfo performs the VK authentication chain and returns
 // TURN credentials, WebSocket endpoint, and conversation info.
+//
+// Flow (4 steps, OK login runs in parallel with steps 1-2):
+//  1. get_anonym_token(token_type=messages) → messages token
+//  2. calls.getAnonymousToken(messages_token) → join token
+//  3. auth.anonymLogin → session_key (parallel)
+//  4. vchat.joinConversationByLink(join_token, session_key) → TURN + WS
 func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error) {
-	// Select a random User-Agent once per session so all requests look consistent.
 	ua := randomUserAgent()
 
 	client := &http.Client{
@@ -81,52 +86,41 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 		},
 	}
 
-	// Step 1: Get anonymous token
-	token1, err := vkAnonToken(ctx, client, ua)
-	if err != nil {
-		return nil, fmt.Errorf("step1 anon token: %w", err)
-	}
-
-	// Step 5: OK anonymous login — independent of steps 2-4, run in parallel.
-	var token5 string
-	var err5 error
+	// Step 3: OK anonymous login — independent of steps 1-2, run in parallel.
+	var sessionKey string
+	var errOK error
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		deviceID := uuid.New().String()
-		token5, err5 = okAnonLogin(ctx, client, ua, deviceID)
+		sessionKey, errOK = okAnonLogin(ctx, client, ua, deviceID)
 	}()
 
-	// Steps 2-3-4: sequential chain (each depends on previous).
-	token2, err := vkAnonPayload(ctx, client, ua, token1)
+	// Step 1: Get messages-scoped anonymous token (no payload/scopes step needed)
+	messagesToken, err := vkMessagesToken(ctx, client, ua)
 	if err != nil {
 		wg.Wait()
-		return nil, fmt.Errorf("step2 anon payload: %w", err)
+		return nil, fmt.Errorf("step1 messages token: %w", err)
 	}
 
-	token3, err := vkMessagesToken(ctx, client, ua, token2)
+	// Step 2: Get join token (call-specific)
+	joinToken, err := vkJoinToken(ctx, client, ua, s.callLink, messagesToken)
 	if err != nil {
 		wg.Wait()
-		return nil, fmt.Errorf("step3 messages token: %w", err)
+		return nil, fmt.Errorf("step2 join token: %w", err)
 	}
 
-	token4, err := vkJoinToken(ctx, client, ua, s.callLink, token3)
-	if err != nil {
-		wg.Wait()
-		return nil, fmt.Errorf("step4 join token: %w", err)
-	}
-
-	// Wait for step 5 to complete.
+	// Wait for step 3 to complete.
 	wg.Wait()
-	if err5 != nil {
-		return nil, fmt.Errorf("step5 ok login: %w", err5)
+	if errOK != nil {
+		return nil, fmt.Errorf("step3 ok login: %w", errOK)
 	}
 
-	// Step 6: Join conference and extract TURN credentials + WS info
-	result, err := okJoinConference(ctx, client, ua, s.callLink, token4, token5)
+	// Step 4: Join conference and extract TURN credentials + WS info
+	result, err := okJoinConference(ctx, client, ua, s.callLink, joinToken, sessionKey)
 	if err != nil {
-		return nil, fmt.Errorf("step6 join conference: %w", err)
+		return nil, fmt.Errorf("step4 join conference: %w", err)
 	}
 
 	return &provider.JoinInfo{
@@ -196,63 +190,10 @@ func (s *Service) ConnectSignaling(ctx context.Context, info *provider.JoinInfo,
 
 // --- VK auth chain (private) ---
 
-func vkAnonToken(ctx context.Context, client *http.Client, ua string) (string, error) {
-	data := url.Values{
-		"client_secret":           {vkClientSecret},
-		"client_id":               {vkClientID},
-		"scopes":                  {"audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous"},
-		"isApiOauthAnonymEnabled": {"false"},
-		"version":                 {"1"},
-		"app_id":                  {vkClientID},
-	}
-	body, err := httpPost(ctx, client, ua, "https://login.vk.ru/?act=get_anonym_token", data)
-	if err != nil {
-		return "", err
-	}
-	if rle := checkLoginRateLimit(body); rle != nil {
-		slog.Warn("VK login rate limit", "code", rle.Code, "msg", rle.Message)
-		return "", rle
-	}
-	var resp struct {
-		Data struct {
-			AccessToken string `json:"access_token"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("parse response: %w", err)
-	}
-	if resp.Data.AccessToken == "" {
-		return "", fmt.Errorf("empty token in response: %s", string(body))
-	}
-	return resp.Data.AccessToken, nil
-}
-
-func vkAnonPayload(ctx context.Context, client *http.Client, ua string, token1 string) (string, error) {
-	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=%s&client_id=%s", vkAPIVersion, vkClientID)
-	data := url.Values{"access_token": {token1}}
-	body, err := vkAPIPost(ctx, client, ua, endpoint, data)
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		Response struct {
-			Payload string `json:"payload"`
-		} `json:"response"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("parse response: %w", err)
-	}
-	if resp.Response.Payload == "" {
-		return "", fmt.Errorf("empty payload in response: %s", string(body))
-	}
-	return resp.Response.Payload, nil
-}
-
-func vkMessagesToken(ctx context.Context, client *http.Client, ua string, token2 string) (string, error) {
+func vkMessagesToken(ctx context.Context, client *http.Client, ua string) (string, error) {
 	data := url.Values{
 		"client_id":     {vkClientID},
 		"token_type":    {"messages"},
-		"payload":       {token2},
 		"client_secret": {vkClientSecret},
 		"version":       {"1"},
 		"app_id":        {vkClientID},

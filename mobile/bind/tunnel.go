@@ -568,6 +568,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		credsProvider = turn.NewCachedProvider(cachedCreds, svc)
 	}
 	mgr := turn.NewManager(credsProvider, cfg.UseTCP, t.logger)
+	mgr.SetInitialCredentials(&jr.Credentials)
 
 	sessionID := uuid.New()
 	var (
@@ -662,7 +663,14 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			tokenWg.Add(1)
 			go func(idx int, token string) {
 				defer tokenWg.Done()
-				alloc, aErr := allocateWithToken(ctx, svc, mgr, token)
+				var alloc *turn.Allocation
+				var aErr error
+				if idx == 0 {
+					// First token was already used for initial join — reuse those credentials.
+					alloc, aErr = mgr.AllocateWithCredentials(ctx, &jr.Credentials)
+				} else {
+					alloc, aErr = allocateWithToken(ctx, svc, mgr, token)
+				}
 				tokenMu.Lock()
 				defer tokenMu.Unlock()
 				if aErr != nil {

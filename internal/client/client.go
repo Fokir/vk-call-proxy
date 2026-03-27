@@ -313,6 +313,9 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 
 	// 3. Start batched TURN allocations.
 	mgr := turn.NewManager(svc, useTCP, logger)
+	// Reuse credentials from initial join to avoid re-joining the conference
+	// (VK hangs up the signaling session when a new anonymous participant joins).
+	mgr.SetInitialCredentials(&jr.Credentials)
 
 	// 4. Process batches: allocate → signaling → DTLS → MUX.
 	sessionID := uuid.New()
@@ -341,6 +344,8 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	anonConns := numConns - tokenConns
 
 	// Token allocation phase: allocate all tokens in parallel, send as batch 0.
+	// For the first token (index 0): reuse initial join credentials to avoid
+	// re-joining the conference (VK hangs up on duplicate joins).
 	if tokenConns > 0 {
 		tokenAllocs := make([]*turn.Allocation, tokenConns)
 		var tokenWg sync.WaitGroup
@@ -349,7 +354,14 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			tokenWg.Add(1)
 			go func(idx int, token string) {
 				defer tokenWg.Done()
-				alloc, aErr := allocateWithToken(ctx, svc, mgr, token)
+				var alloc *turn.Allocation
+				var aErr error
+				if idx == 0 {
+					// First token was already used for initial join — reuse those credentials.
+					alloc, aErr = mgr.AllocateWithCredentials(ctx, &jr.Credentials)
+				} else {
+					alloc, aErr = allocateWithToken(ctx, svc, mgr, token)
+				}
 				tokenMu.Lock()
 				defer tokenMu.Unlock()
 				if aErr != nil {

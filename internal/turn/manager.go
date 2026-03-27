@@ -39,21 +39,31 @@ func (a *Allocation) Close() error {
 
 // Manager handles multiple TURN allocations with credential rotation.
 type Manager struct {
-	mu          sync.Mutex
-	allocations []*Allocation
-	creds       provider.CredentialsProvider
-	useTCP      bool
-	logger      *slog.Logger
+	mu           sync.Mutex
+	allocations  []*Allocation
+	creds        provider.CredentialsProvider
+	initialCreds *provider.Credentials // reuse credentials from initial join (no re-join)
+	useTCP       bool
+	logger       *slog.Logger
 }
 
 // NewManager creates a TURN allocation manager.
-// The creds provider is called for each allocation to obtain TURN credentials.
+// The creds provider is called for each allocation to obtain TURN credentials,
+// unless initial credentials are set via SetInitialCredentials.
 func NewManager(creds provider.CredentialsProvider, useTCP bool, logger *slog.Logger) *Manager {
 	return &Manager{
 		creds:  creds,
 		useTCP: useTCP,
 		logger: logger,
 	}
+}
+
+// SetInitialCredentials provides pre-fetched credentials from the initial
+// conference join. When set, createAllocation reuses these instead of calling
+// FetchCredentials (which would re-join the conference and trigger a hangup).
+// Same credentials work for multiple TURN allocations on different servers.
+func (m *Manager) SetInitialCredentials(creds *provider.Credentials) {
+	m.initialCreds = creds
 }
 
 // Allocate creates n new TURN allocations, each with independently fetched
@@ -101,10 +111,18 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 }
 
 func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
-	// Each allocation gets fresh credentials (different anonymous identity)
-	creds, err := m.creds.FetchCredentials(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("fetch credentials: %w", err)
+	var creds *provider.Credentials
+	if m.initialCreds != nil {
+		// Reuse credentials from initial join — avoids re-joining the conference.
+		c := *m.initialCreds
+		creds = &c
+	} else {
+		// Each allocation gets fresh credentials (different anonymous identity).
+		var err error
+		creds, err = m.creds.FetchCredentials(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch credentials: %w", err)
+		}
 	}
 	// Round-robin across available TURN servers to distribute load
 	if len(creds.Servers) > 1 {
