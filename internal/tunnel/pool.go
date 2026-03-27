@@ -117,7 +117,12 @@ func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
 		p.mu.Unlock()
 
 		if p.m != nil {
-			go p.allocateRemaining(ctx, slot.index, sessionID)
+			// Allocate remaining slots synchronously so that all TURN
+			// allocations finish before Start() returns.  On Android the
+			// VPN interface is established right after Start(), routing all
+			// traffic through the tunnel — any outstanding VK API / TURN
+			// requests would then loop back through the unfinished tunnel.
+			p.allocateRemaining(ctx, slot.index, sessionID)
 			go p.reconnectLoop(ctx)
 			go p.monitorSlots(ctx)
 			return p.m, nil

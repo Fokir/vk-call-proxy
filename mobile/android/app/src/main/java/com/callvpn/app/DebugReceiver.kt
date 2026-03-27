@@ -34,6 +34,7 @@ class DebugReceiver : BroadcastReceiver() {
                     putExtra(CallVpnService.EXTRA_SERVER_ADDR, serverAddr)
                     putExtra(CallVpnService.EXTRA_NUM_CONNS, profile.numConns)
                     putExtra(CallVpnService.EXTRA_TOKEN, profile.token)
+                    putExtra(CallVpnService.EXTRA_VK_TOKENS, profile.vkTokens)
                 }
                 ContextCompat.startForegroundService(context, svcIntent)
             }

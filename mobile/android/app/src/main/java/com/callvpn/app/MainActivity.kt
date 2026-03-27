@@ -60,6 +60,7 @@ class MainActivity : ComponentActivity() {
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
+    private var pendingVkTokens = ""
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -169,11 +170,12 @@ class MainActivity : ComponentActivity() {
 
     private var pendingNumConns = 4
 
-    private fun requestConnect(callLink: String, serverAddr: String, token: String, numConns: Int) {
+    private fun requestConnect(callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String = "") {
         pendingCallLink = callLink
         pendingServerAddr = serverAddr
         pendingToken = token
         pendingNumConns = numConns
+        pendingVkTokens = vkTokens
 
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -194,6 +196,7 @@ class MainActivity : ComponentActivity() {
             putExtra(CallVpnService.EXTRA_SERVER_ADDR, pendingServerAddr)
             putExtra(CallVpnService.EXTRA_NUM_CONNS, pendingNumConns)
             putExtra(CallVpnService.EXTRA_TOKEN, pendingToken)
+            putExtra(CallVpnService.EXTRA_VK_TOKENS, pendingVkTokens)
         }
         ContextCompat.startForegroundService(this, intent)
     }
@@ -220,7 +223,7 @@ class MainActivity : ComponentActivity() {
         if (callLink.isBlank()) return
 
         val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
-        requestConnect(callLink, serverAddr, profile.token, profile.numConns)
+        requestConnect(callLink, serverAddr, profile.token, profile.numConns, profile.vkTokens)
     }
 
     companion object {

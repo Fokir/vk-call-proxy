@@ -13,7 +13,8 @@ data class Profile(
     val callLink: String = "",
     val serverAddr: String = "",
     val token: String = "",
-    val numConns: Int = 4
+    val numConns: Int = 4,
+    val vkTokens: String = ""
 ) {
     fun isTelemostLink(): Boolean {
         return callLink.contains("telemost.yandex") ||
@@ -28,6 +29,7 @@ data class Profile(
         put("serverAddr", serverAddr)
         put("token", token)
         put("numConns", numConns)
+        if (vkTokens.isNotEmpty()) put("vkTokens", vkTokens)
     }
 
     companion object {
@@ -38,7 +40,8 @@ data class Profile(
             callLink = obj.optString("callLink", ""),
             serverAddr = obj.optString("serverAddr", ""),
             token = obj.optString("token", ""),
-            numConns = obj.optInt("numConns", 4)
+            numConns = obj.optInt("numConns", 4),
+            vkTokens = obj.optString("vkTokens", "")
         )
     }
 }
