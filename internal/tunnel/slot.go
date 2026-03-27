@@ -414,7 +414,7 @@ func (s *CallSlot) dtlsHandshakeParallel(ctx context.Context, m *mux.Mux, allocs
 				// Punch relay to create TURN permission
 				punchLoopCtx, punchLoopCancel := context.WithCancel(ctx)
 				internaldtls.PunchRelay(alloc.RelayConn, rAddr)
-				internaldtls.StartPunchLoop(punchLoopCtx, alloc.RelayConn, rAddr)
+				go internaldtls.StartPunchLoop(punchLoopCtx, alloc.RelayConn, rAddr)
 
 				if s.role == RoleClient {
 					// Client: punch signaling with 3s timeout (best effort)
