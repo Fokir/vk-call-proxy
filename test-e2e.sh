@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # E2E test script for call-vpn relay-to-relay mode
 #
-# Usage: ./test-e2e.sh [--n=4] [--links=1] [--monitor=5] [--download-url=URL]
+# Usage: ./test-e2e.sh [--n=4] [--links=1] [--monitor=5] [--download-url=URL] [--vk-token[=TOKEN]]
 #
 # Options:
 #   --n=N             Number of parallel connections per call (default: 4)
@@ -9,13 +9,16 @@
 #   --monitor=MIN     Enable periodic connectivity checks every 60s for MIN minutes.
 #                     Without this flag, the script runs speed tests and exits.
 #   --download-url=U  URL for large file download test (default: https://linkmeter.net)
+#   --vk-token        Use VK tokens from .env (VK_TOKEN_1, VK_TOKEN_2)
+#   --vk-token=TOKEN  Use specified VK token for both server and client
 #
 # Examples:
-#   ./test-e2e.sh                           # quick: 1 call × 4 conns, speed test only
-#   ./test-e2e.sh --n=1                     # baseline: 1 call × 1 conn, speed test only
-#   ./test-e2e.sh --n=4 --monitor=5         # 1 call × 4 conns + 5 min monitoring
+#   ./test-e2e.sh --n=1                     # anonymous: 1 call × 1 conn
+#   ./test-e2e.sh --n=4                     # anonymous: 1 call × 4 conns
+#   ./test-e2e.sh --n=1 --vk-token          # token from .env: 1 call × 1 conn
+#   ./test-e2e.sh --n=4 --vk-token=vk1.a.X  # explicit token: 1 call × 4 conns
+#   ./test-e2e.sh --n=4 --monitor=5         # anonymous + 5 min monitoring
 #   ./test-e2e.sh --n=2 --links=2           # 2 calls × 2 conns = 4 total
-#   ./test-e2e.sh --n=4 --links=2           # 2 calls × 4 conns = 8 total
 #   ./test-e2e.sh --download-url=http://example.com/100MB.bin
 
 set -euo pipefail
@@ -27,7 +30,9 @@ LINKS=1
 MONITOR_MIN=0
 SOCKS_PORT=2080
 HTTP_PORT=3080
-DOWNLOAD_URL="https://linkmeter.net"
+DOWNLOAD_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-6.12.xz"
+USE_VK_TOKEN=""    # empty=anonymous, "env"=from .env, "vk1.a.X"=explicit
+VERBOSE=""
 
 for arg in "$@"; do
   case $arg in
@@ -35,6 +40,9 @@ for arg in "$@"; do
     --links=*) LINKS="${arg#*=}" ;;
     --monitor=*) MONITOR_MIN="${arg#*=}" ;;
     --download-url=*) DOWNLOAD_URL="${arg#*=}" ;;
+    --vk-token=*) USE_VK_TOKEN="${arg#*=}" ;;
+    --vk-token) USE_VK_TOKEN="env" ;;
+    --verbose) VERBOSE="--verbose" ;;
   esac
 done
 
@@ -70,12 +78,41 @@ else
   LINK_ARGS="--link=$VK_CALL_LINK"
 fi
 
-for var in VPN_TOKEN VK_TOKEN_1 VK_TOKEN_2; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "FATAL: $var not set in .env"
-    exit 1
+# Determine auth mode.
+if [[ -z "${VPN_TOKEN:-}" ]]; then
+  echo "FATAL: VPN_TOKEN not set in .env"
+  exit 1
+fi
+
+AUTH_MODE="anonymous"
+VK_TOKEN_ARGS_SERVER=""
+VK_TOKEN_ARGS_CLIENT=""
+
+if [[ -n "$USE_VK_TOKEN" ]]; then
+  if [[ "$USE_VK_TOKEN" == "env" ]]; then
+    # --vk-token (no value) → load from .env
+    if [[ -z "${VK_TOKEN_1:-}" || -z "${VK_TOKEN_2:-}" ]]; then
+      echo "FATAL: --vk-token requires VK_TOKEN_1 and VK_TOKEN_2 in .env"
+      exit 1
+    fi
+    AUTH_MODE="token (env)"
+    VK_TOKEN_ARGS_SERVER="--vk-token=$VK_TOKEN_2"
+    VK_TOKEN_ARGS_CLIENT="--vk-token=$VK_TOKEN_1"
+  else
+    # --vk-token=VALUE → use explicit token for both
+    AUTH_MODE="token (explicit)"
+    VK_TOKEN_ARGS_SERVER="--vk-token=$USE_VK_TOKEN"
+    VK_TOKEN_ARGS_CLIENT="--vk-token=$USE_VK_TOKEN"
   fi
-done
+fi
+
+echo "=== E2E Test ==="
+echo "  Mode:        $AUTH_MODE"
+echo "  Connections:  $CONNS"
+echo "  Links:        $LINKS"
+echo "  Monitor:      ${MONITOR_MIN}m"
+echo "  Verbose:      $([ -n "$VERBOSE" ] && echo yes || echo no)"
+echo ""
 
 # --- Helpers ---
 ts() { date +"%H:%M:%S"; }
@@ -195,40 +232,63 @@ run_download_test() {
 
 cleanup() {
   echo ""
-  echo "[$(ts)] Shutting down gracefully (SIGINT → wait 5s → SIGKILL)..."
-  kill -INT $CLIENT_PID 2>/dev/null || true
-  sleep 3
-  kill -INT $SERVER_PID 2>/dev/null || true
-  sleep 5
-  kill -9 $CLIENT_PID 2>/dev/null || true
-  kill -9 $SERVER_PID 2>/dev/null || true
+  echo "[$(ts)] Shutting down gracefully..."
+  if $IS_WINDOWS; then
+    # Kill the actual binaries (pipe makes $PID point to `sed`, not .exe).
+    taskkill //F //IM "callvpn-client${EXE}" >/dev/null 2>&1 || true
+    taskkill //F //IM "callvpn-server${EXE}" >/dev/null 2>&1 || true
+    # Kill the sed pipe processes so `wait` doesn't hang.
+    kill -9 $CLIENT_PID 2>/dev/null || true
+    kill -9 $SERVER_PID 2>/dev/null || true
+  else
+    kill -INT $CLIENT_PID 2>/dev/null || true
+    kill -INT $SERVER_PID 2>/dev/null || true
+    sleep 3
+    kill -9 $CLIENT_PID 2>/dev/null || true
+    kill -9 $SERVER_PID 2>/dev/null || true
+  fi
   wait $CLIENT_PID 2>/dev/null || true
   wait $SERVER_PID 2>/dev/null || true
   echo "[$(ts)] Done."
 }
+# --- Platform detection ---
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
+  IS_WINDOWS=true
+  EXE=".exe"
+else
+  IS_WINDOWS=false
+  EXE=""
+fi
+
 trap cleanup EXIT
 
 # --- Build ---
 echo "[$(ts)] Building binaries..."
-go build -o callvpn-server.exe ./cmd/server
-go build -o callvpn-client.exe ./cmd/client
+go build -o "callvpn-server${EXE}" ./cmd/server
+go build -o "callvpn-client${EXE}" ./cmd/client
 echo "[$(ts)] Build OK"
 
 # --- Kill stale processes ---
-taskkill //F //IM callvpn-server.exe >/dev/null 2>&1 || true
-taskkill //F //IM callvpn-client.exe >/dev/null 2>&1 || true
+if $IS_WINDOWS; then
+  taskkill //F //IM "callvpn-server${EXE}" >/dev/null 2>&1 || true
+  taskkill //F //IM "callvpn-client${EXE}" >/dev/null 2>&1 || true
+else
+  pkill -f "callvpn-server" 2>/dev/null || true
+  pkill -f "callvpn-client" 2>/dev/null || true
+fi
 sleep 1
 
 # --- Start server ---
 echo ""
 TOTAL_CONNS=$((CONNS * LINKS))
 echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-./callvpn-server.exe \
+./callvpn-server${EXE} \
   $LINK_ARGS \
   --tcp=true \
   --n="$CONNS" \
   --token="$VPN_TOKEN" \
-  --vk-token="$VK_TOKEN_2" \
+  $VK_TOKEN_ARGS_SERVER \
+  $VERBOSE \
   2>&1 | sed "s/^/  [server] /" &
 SERVER_PID=$!
 sleep 12
@@ -242,14 +302,15 @@ echo "[$(ts)] Server running (PID $SERVER_PID)"
 # --- Start client ---
 echo ""
 echo "[$(ts)] Starting client (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-./callvpn-client.exe \
+./callvpn-client${EXE} \
   $LINK_ARGS \
   --n="$CONNS" \
   --tcp=true \
   --token="$VPN_TOKEN" \
   --socks5-port=$SOCKS_PORT \
   --http-port=$HTTP_PORT \
-  --vk-token="$VK_TOKEN_1" \
+  $VK_TOKEN_ARGS_CLIENT \
+  $VERBOSE \
   2>&1 | sed "s/^/  [client] /" &
 CLIENT_PID=$!
 
