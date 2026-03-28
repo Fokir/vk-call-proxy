@@ -65,4 +65,5 @@ const (
 	reconnectInitDelay = 3 * time.Second
 	reconnectMaxDelay  = 60 * time.Second
 	slotConnectDelay   = 3 * time.Second // delay between sequential slot connects
+	serverSlotTimeout  = 45 * time.Second // per-slot timeout for server Phase 2
 )

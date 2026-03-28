@@ -192,21 +192,42 @@ func (p *CallPool) StartServer(ctx context.Context) (*mux.Mux, error) {
 		preAllocMap[pa.slot.index] = pa.allocs
 	}
 
-	// Phase 2: Wait for client relay addrs, exchange, DTLS
+	// Phase 2: Wait for client relay addrs, exchange, DTLS (parallel with per-slot timeout)
+	type phase2Result struct {
+		idx int
+		m   *mux.Mux
+		err error
+	}
+
+	var phase2Slots []*CallSlot
 	for _, slot := range p.slots {
 		if slot.SignalingClient() == nil {
 			continue
 		}
+		phase2Slots = append(phase2Slots, slot)
+	}
 
-		m, err := slot.AllocateAndConnectServer(ctx, p.m, p.router, p.cfg.ConnsPerCall, preAllocMap[slot.index])
-		if err != nil {
-			p.logger.Error("slot allocate failed", "slot", slot.index, "err", err)
+	resultCh := make(chan phase2Result, len(phase2Slots))
+	for _, slot := range phase2Slots {
+		go func(s *CallSlot) {
+			slotCtx, slotCancel := context.WithTimeout(ctx, serverSlotTimeout)
+			defer slotCancel()
+
+			m, err := s.AllocateAndConnectServer(slotCtx, p.m, p.router, p.cfg.ConnsPerCall, preAllocMap[s.index])
+			resultCh <- phase2Result{idx: s.index, m: m, err: err}
+		}(slot)
+	}
+
+	for range phase2Slots {
+		res := <-resultCh
+		if res.err != nil {
+			p.logger.Error("slot allocate failed", "slot", res.idx, "err", res.err)
+			p.queueReconnect(res.idx)
 			continue
 		}
-
 		p.mu.Lock()
 		if p.m == nil {
-			p.m = m
+			p.m = res.m
 		}
 		p.mu.Unlock()
 	}

@@ -956,3 +956,64 @@ func TestPool_TURNFailureMidBatch(t *testing.T) {
 	t.Logf("pool works with partial TURN failure: client=%d server=%d active conns",
 		clientMux.ActiveConns(), serverResult.m.ActiveConns())
 }
+
+// TestPool_ServerPhase2Timeout verifies that server Phase 2 completes even when
+// one slot never receives a client batch. The timed-out slot should not block
+// the entire pool — the successful slot should establish the MUX.
+func TestPool_ServerPhase2Timeout(t *testing.T) {
+	// 2 calls, but client only connects to call 0.
+	rig := testrig.New(t, testrig.Options{TURNServers: 2, Calls: 2})
+	logger := testLogger(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Server uses both calls.
+	serverPool := tunnel.NewCallPool(tunnel.PoolConfig{
+		Services:         []provider.Service{rig.Service(0), rig.Service(1)},
+		ConnsPerCall:     1,
+		AuthToken:        "test123",
+		SlotConnectDelay: 100 * time.Millisecond,
+		Logger:           logger,
+	})
+	defer serverPool.Close()
+
+	serverCh := startServerPool(ctx, serverPool)
+
+	// Wait for server to connect and pre-allocate on both slots.
+	time.Sleep(3 * time.Second)
+
+	// Client only connects to call 0 — slot 1 on the server will never
+	// receive a client relay batch and should time out after serverSlotTimeout (45s).
+	clientPool := tunnel.NewCallPool(tunnel.PoolConfig{
+		Services:         []provider.Service{rig.Service(0)},
+		ConnsPerCall:     1,
+		AuthToken:        "test123",
+		SlotConnectDelay: 100 * time.Millisecond,
+		Logger:           logger,
+	})
+	defer clientPool.Close()
+
+	clientMux, err := clientPool.StartClient(ctx)
+	if err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+
+	// Server should finish within ~50s (slot 1 times out at 45s).
+	select {
+	case res := <-serverCh:
+		if res.err != nil {
+			t.Fatalf("server start: %v", res.err)
+		}
+		if res.m.ActiveConns() < 1 {
+			t.Fatalf("server MUX active conns = %d, want >= 1", res.m.ActiveConns())
+		}
+		t.Logf("server completed with %d active conns (timed-out slot queued for reconnect)", res.m.ActiveConns())
+	case <-time.After(55 * time.Second):
+		t.Fatal("server did not complete within 55s — Phase 2 likely blocked on timed-out slot")
+	}
+
+	if clientMux.ActiveConns() < 1 {
+		t.Fatalf("client MUX active conns = %d, want >= 1", clientMux.ActiveConns())
+	}
+}
