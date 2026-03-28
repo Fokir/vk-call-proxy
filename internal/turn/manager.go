@@ -2,9 +2,12 @@ package turn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +15,54 @@ import (
 	"github.com/pion/logging"
 	pionTurn "github.com/pion/turn/v4"
 )
+
+// ErrCredentialsExpired is returned when TURN credentials have expired
+// (401 Unauthorized or username timestamp in the past). Callers should
+// rejoin the conference to obtain fresh credentials.
+var ErrCredentialsExpired = errors.New("TURN credentials expired")
+
+// credentialsExpired checks whether TURN credentials have expired by parsing
+// the timestamp prefix from the username (format: "expiry:userId").
+// Returns true if the credentials expire within the next 60 seconds.
+func credentialsExpired(creds *provider.Credentials) bool {
+	parts := strings.SplitN(creds.Username, ":", 2)
+	if len(parts) < 2 {
+		return false // unknown format, assume valid
+	}
+	expiry, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Now().Unix()+60 > expiry // expired or expiring within 60s
+}
+
+// CredentialRefreshTimer returns a timer that fires 5 minutes before the TURN
+// credentials expire (based on the username timestamp). If the expiry cannot
+// be parsed or is already past, the timer fires in 1 minute.
+func CredentialRefreshTimer(creds *provider.Credentials, logger *slog.Logger) *time.Timer {
+	const margin = 5 * time.Minute
+
+	parts := strings.SplitN(creds.Username, ":", 2)
+	if len(parts) < 2 {
+		return time.NewTimer(30 * time.Minute) // unknown format, fallback
+	}
+	expiry, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.NewTimer(30 * time.Minute)
+	}
+
+	expiryTime := time.Unix(expiry, 0)
+	refreshAt := expiryTime.Add(-margin)
+	delay := time.Until(refreshAt)
+	if delay < time.Minute {
+		delay = time.Minute
+	}
+
+	logger.Info("credential refresh scheduled",
+		"expiry", expiryTime.Format(time.RFC3339),
+		"refresh_in", delay.Round(time.Second))
+	return time.NewTimer(delay)
+}
 
 // Allocation represents a single TURN relay allocation.
 type Allocation struct {
@@ -112,10 +163,13 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 
 func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
 	var creds *provider.Credentials
-	if m.initialCreds != nil {
+	if m.initialCreds != nil && !credentialsExpired(m.initialCreds) {
 		// Reuse credentials from initial join — avoids re-joining the conference.
 		c := *m.initialCreds
 		creds = &c
+	} else if m.initialCreds != nil {
+		// Initial credentials expired — signal caller to rejoin.
+		return nil, fmt.Errorf("%w: username %s", ErrCredentialsExpired, m.initialCreds.Username)
 	} else {
 		// Each allocation gets fresh credentials (different anonymous identity).
 		var err error
@@ -193,6 +247,12 @@ func (m *Manager) dialAndAllocate(ctx context.Context, creds *provider.Credentia
 	if err != nil {
 		client.Close()
 		conn.Close()
+		// Detect expired credentials: TURN returns 401 when the time-limited
+		// username has expired. Wrap with sentinel so callers can rejoin.
+		errStr := err.Error()
+		if strings.Contains(errStr, "401") || strings.Contains(errStr, "Unauthorized") {
+			return nil, fmt.Errorf("%w: %v", ErrCredentialsExpired, err)
+		}
 		return nil, fmt.Errorf("TURN allocate: %w", err)
 	}
 

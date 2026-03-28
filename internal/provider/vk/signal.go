@@ -215,7 +215,11 @@ func ConnectSignaling(ctx context.Context, wsEndpoint string, deviceIdx int, log
 
 func (c *SignalingClient) readLoop() {
 	defer close(c.done)
+	// Read deadline detects stale connections: VK sends pings every ~30s,
+	// so 90s without any message means the connection is dead.
+	const readTimeout = 90 * time.Second
 	for {
+		c.conn.SetReadDeadline(time.Now().Add(readTimeout))
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			if ce, ok := err.(*websocket.CloseError); ok {

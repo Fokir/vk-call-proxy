@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -601,12 +602,25 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 
 	s.cfg.Logger.Info("waiting for client session...")
 
+	// Proactive credential refresh: rejoin before TURN credentials expire.
+	// Credentials use username format "expiry:userId"; check periodically.
+	credRefresh := turn.CredentialRefreshTimer(&jr.Credentials, s.cfg.Logger)
+	defer credRefresh.Stop()
+
 	// Inner loop: accept client sessions on the same VK signaling.
 	// If too many consecutive errors occur (e.g. credentials expired but
 	// signaling still alive), force a VK rejoin to get fresh credentials.
 	const maxConsecErrors = 3
 	consecErrors := 0
 	for {
+		// Check if credential refresh timer fired while we were idle.
+		select {
+		case <-credRefresh.C:
+			s.cfg.Logger.Warn("TURN credentials approaching expiry, rejoining VK proactively")
+			return fmt.Errorf("proactive credential refresh")
+		default:
+		}
+
 		err := s.acceptOneClient(ctx, sigClient, svc, s.cfg.VKTokens, &jr.Credentials)
 		if ctx.Err() != nil {
 			return nil
@@ -616,6 +630,11 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 			return fmt.Errorf("signaling connection lost")
 		}
 		if err != nil {
+			// Expired credentials: rejoin immediately, don't waste retries.
+			if errors.Is(err, turn.ErrCredentialsExpired) {
+				s.cfg.Logger.Warn("TURN credentials expired, rejoining VK immediately")
+				return fmt.Errorf("credentials expired, need rejoin")
+			}
 			consecErrors++
 			s.cfg.Logger.Warn("client session failed", "err", err, "consec_errors", consecErrors)
 			if consecErrors >= maxConsecErrors {
@@ -723,6 +742,12 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 			anonAllocs, err := mgr.Allocate(ctx, remaining)
 			if err != nil {
 				s.cfg.Logger.Error("anonymous allocate failed", "err", err)
+				// If credentials expired, immediately signal caller to rejoin VK.
+				if errors.Is(err, turn.ErrCredentialsExpired) {
+					_ = sigClient.SendRelayBatch(ctx, nil, "server", clientNonce, totalPairs, isFinal)
+					punchCancel()
+					return fmt.Errorf("credentials expired during allocation: %w", turn.ErrCredentialsExpired)
+				}
 				if len(allocs) == 0 {
 					_ = sigClient.SendRelayBatch(ctx, nil, "server", clientNonce, totalPairs, isFinal)
 					if isFinal {
