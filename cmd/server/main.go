@@ -22,7 +22,12 @@ type stringSlice []string
 
 func (s *stringSlice) String() string { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error {
-	*s = append(*s, v)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			*s = append(*s, part)
+		}
+	}
 	return nil
 }
 
@@ -52,7 +57,12 @@ func main() {
 	}
 	if len(callLinks) == 0 {
 		if env := os.Getenv("VK_CALL_LINK"); env != "" {
-			callLinks = []string{env}
+			for _, link := range strings.Split(env, ",") {
+				link = strings.TrimSpace(link)
+				if link != "" {
+					callLinks = append(callLinks, link)
+				}
+			}
 		}
 	}
 	if len(vkTokens) == 0 {
