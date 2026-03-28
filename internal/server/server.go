@@ -444,7 +444,38 @@ func (s *Server) runTelemostSession(ctx context.Context, svc *telemost.Service, 
 // --- Relay mode ---
 
 // runMultiRelayMode handles multi-call pool relay mode (N parallel VK calls → shared MUX).
+// Wraps each session in a retry loop with exponential backoff.
 func (s *Server) runMultiRelayMode(ctx context.Context) {
+	logger := s.cfg.Logger
+	backoff := 3 * time.Second
+	const maxBackoff = 5 * time.Minute
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.runMultiRelaySession(ctx)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		logger.Warn("multi-relay session ended, restarting", "retry_in", backoff)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		backoff = min(backoff*2, maxBackoff)
+	}
+}
+
+// runMultiRelaySession runs a single multi-relay pool session.
+// Returns when all connections die or context is cancelled.
+func (s *Server) runMultiRelaySession(ctx context.Context) {
 	logger := s.cfg.Logger
 	logger.Info("starting multi-relay mode", "calls", len(s.cfg.Services), "conns_per_call", s.cfg.NumConns)
 
