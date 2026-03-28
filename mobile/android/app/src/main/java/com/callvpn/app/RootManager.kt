@@ -92,7 +92,27 @@ class RootManager(context: Context) {
         // Clean up stale rules from a possible previous crash
         executeRootCommands(buildCleanupCommands(tunName))
 
-        return executeRootCommands(buildSetupCommands(tunName))
+        // Run all setup commands (no set -e: some interface patterns may not
+        // exist on this device, which is fine — we only need the active one).
+        executeRootCommands(buildSetupCommands(tunName))
+
+        // Verify the critical route is in place. Android netd can flush custom
+        // routing tables, and some su implementations don't fully process piped
+        // commands. Retry the route in a separate su session if missing.
+        for (attempt in 1..3) {
+            val hasRoute = executeRootCommand("ip route show table 200")
+                .contains("dev $tunName")
+            if (hasRoute) return true
+
+            // Route missing — re-add it
+            Thread.sleep(200L * attempt)
+            executeRootCommands(listOf(
+                "ip route replace default dev $tunName table 200"
+            ))
+        }
+
+        lastError = "route in table 200 did not persist after 3 attempts"
+        return false
     }
 
     /**
@@ -117,7 +137,7 @@ class RootManager(context: Context) {
 
         // 3. Policy routing: marked packets → VPN TUN
         cmds += "ip rule add fwmark 2 table 200 pref 100"
-        cmds += "ip route add default dev $tunName table 200"
+        cmds += "ip route replace default dev $tunName table 200"
 
         // 4. NAT tethered traffic through TUN
         cmds += "iptables -t nat -I POSTROUTING -o $tunName -j MASQUERADE"
@@ -172,24 +192,45 @@ class RootManager(context: Context) {
         return cmds
     }
 
+    /** Last stderr output from executeRootCommands (for diagnostics). */
+    var lastError: String = ""
+        private set
+
     /**
-     * Executes all commands in a single su session by piping them to stdin.
-     * This is more reliable than `su -c "script"` across different su
-     * implementations (Magisk, KernelSU, SuperSU) and avoids issues with
-     * shell redirection and multi-line argument parsing.
+     * Executes commands via su by writing a temp script file and running it.
+     * More reliable than piping to stdin: avoids buffering/timing issues
+     * across Magisk, KernelSU, SuperSU implementations.
      */
     private fun executeRootCommands(commands: List<String>): Boolean {
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("su"))
-            val stdin = process.outputStream
-            val script = commands.joinToString("\n") + "\nexit\n"
-            stdin.write(script.toByteArray())
-            stdin.flush()
-            stdin.close()
+            val scriptFile = File.createTempFile("cvpn_", ".sh")
+            scriptFile.writeText(commands.joinToString("\n") + "\n")
+            scriptFile.setReadable(true, false)
+            val path = scriptFile.absolutePath
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "sh $path"))
+            val stderr = process.errorStream.bufferedReader().readText()
             val exitCode = process.waitFor()
+            scriptFile.delete()
+            lastError = stderr.trim()
             exitCode == 0
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            lastError = e.message ?: e.toString()
             false
+        }
+    }
+
+    /**
+     * Executes a single command via su and returns its stdout.
+     * Used for verification (e.g. `ip route show table 200`).
+     */
+    private fun executeRootCommand(command: String): String {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
+            val stdout = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            stdout.trim()
+        } catch (_: Exception) {
+            ""
         }
     }
 

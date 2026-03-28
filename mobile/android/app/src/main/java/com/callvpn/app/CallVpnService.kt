@@ -151,6 +151,18 @@ class CallVpnService : VpnService() {
                             mgr.notify(NOTIFICATION_ID, buildNotification(stage))
                         }
 
+                        // Check for fatal error — reconnect loop gave up.
+                        val fatal = tunnel?.fatalError() ?: ""
+                        if (fatal.isNotEmpty()) {
+                            val logIntent2 = Intent(ACTION_LOG).apply {
+                                putExtra(EXTRA_LOG_TEXT, "FATAL: $fatal")
+                            }
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(logIntent2)
+                            stopVpn()
+                            break
+                        }
+
                         val isConnected = tunnel?.isConnected ?: false
                         if (!isConnected && lastBroadcastState == "connected") {
                             broadcastState("connecting")
@@ -252,7 +264,8 @@ class CallVpnService : VpnService() {
             if (tunName != null && rm.hotspotRoutingEnabled) {
                 val ok = rm.setupHotspotRouting(tunName)
                 val logMsg = if (ok) "Hotspot routing: enabled (TTL=64)"
-                             else "Hotspot routing: FAILED to apply iptables rules"
+                             else "Hotspot routing: FAILED to apply iptables rules" +
+                                  (if (rm.lastError.isNotEmpty()) "\n${rm.lastError}" else "")
                 val logIntent = Intent(ACTION_LOG).apply {
                     putExtra(EXTRA_LOG_TEXT, logMsg)
                 }
@@ -343,13 +356,17 @@ class CallVpnService : VpnService() {
         stopSelf()
     }
 
-    /** Detects the VPN TUN interface name by scanning /sys/class/net/ */
+    /** Detects the VPN TUN interface name via root (app lacks sysfs access). */
     private fun detectTunName(): String? {
-        val tunRegex = Regex("^tun\\d+$")
-        val netDir = java.io.File("/sys/class/net/")
-        return netDir.listFiles()
-            ?.map { it.name }
-            ?.firstOrNull { tunRegex.matches(it) }
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "ls /sys/class/net/"))
+            val output = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            val tunRegex = Regex("^tun\\d+$")
+            output.lines().firstOrNull { tunRegex.matches(it.trim()) }?.trim()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     override fun onDestroy() {

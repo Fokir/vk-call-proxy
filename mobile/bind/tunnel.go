@@ -134,6 +134,9 @@ type Tunnel struct {
 
 	// connection stage (for UI display)
 	stage atomic.Value // string
+
+	// fatal error — set when reconnect gives up permanently
+	fatalErr atomic.Value // string
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -196,6 +199,21 @@ func (t *Tunnel) Stage() string {
 func (t *Tunnel) setStage(s string) {
 	t.stage.Store(s)
 	t.logger.Info("stage: " + s)
+}
+
+// FatalError returns the fatal error message if the tunnel has permanently
+// failed (e.g. reconnect exhausted). Returns empty string while healthy.
+func (t *Tunnel) FatalError() string {
+	v := t.fatalErr.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+func (t *Tunnel) setFatalError(msg string) {
+	t.fatalErr.Store(msg)
+	t.logger.Error("fatal: " + msg)
 }
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
@@ -935,6 +953,7 @@ func (t *Tunnel) teardownMux() {
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 20 * time.Second
+	const maxConsecutiveFailures = 10 // give up after ~5 min of failures
 	backoff := time.Second
 
 	for {
@@ -972,6 +991,7 @@ func (t *Tunnel) reconnectLoop() {
 		}
 
 		firstAttempt := true
+		consecutiveFailures := 0
 		for {
 			if !firstAttempt {
 				select {
@@ -995,12 +1015,21 @@ func (t *Tunnel) reconnectLoop() {
 			attemptCancel()
 
 			if err != nil {
-				t.logger.Warn("reconnect attempt failed", "err", err, "backoff", backoff)
+				consecutiveFailures++
+				t.logger.Warn("reconnect attempt failed", "err", err, "attempt", consecutiveFailures, "backoff", backoff)
+
+				if consecutiveFailures >= maxConsecutiveFailures {
+					t.setFatalError(fmt.Sprintf("reconnect failed after %d attempts: %v", consecutiveFailures, err))
+					t.teardownMux()
+					return
+				}
+
 				backoff = min(backoff*2, maxBackoff)
 				select {
 				case <-force:
 					t.logger.Info("network changed during reconnect, resetting backoff")
 					backoff = time.Second
+					consecutiveFailures = 0
 				default:
 				}
 				continue
