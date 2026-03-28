@@ -274,6 +274,7 @@ func (p *CallPool) monitorSlots(ctx context.Context) {
 			p.mu.Lock()
 			slots := make([]*CallSlot, len(p.slots))
 			copy(slots, p.slots)
+			m := p.m
 			p.mu.Unlock()
 
 			for _, slot := range slots {
@@ -281,9 +282,17 @@ func (p *CallPool) monitorSlots(ctx context.Context) {
 					continue
 				}
 
+				// Check 1: signaling death
 				sc := slot.SignalingClient()
 				if sc != nil && !sc.IsAlive() {
 					p.logger.Warn("slot signaling died, queuing reconnect", "slot", slot.index)
+					p.queueReconnect(slot.index)
+					continue
+				}
+
+				// Check 2: all DTLS connections dead
+				if m != nil && m.ActiveConns() == 0 {
+					p.logger.Warn("slot all DTLS conns dead, queuing reconnect", "slot", slot.index)
 					p.queueReconnect(slot.index)
 				}
 			}
