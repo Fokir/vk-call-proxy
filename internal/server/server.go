@@ -705,13 +705,36 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
 	// Receive client relay batches and allocate matching server connections.
+	// Use a timeout so we don't block forever if the client sends batch 0
+	// (final=false) and then disconnects before sending the final batch.
 	var clientNonce string
 	totalPairs := 0
 
+	batchTimeout := 30 * time.Second
 	for {
-		clientAddrs, _, isFinal, batchNonce, err := sigClient.RecvRelayBatch(ctx, "server", clientNonce)
+		batchCtx, batchCancel := context.WithTimeout(ctx, batchTimeout)
+		clientAddrs, _, isFinal, batchNonce, err := sigClient.RecvRelayBatch(batchCtx, "server", clientNonce)
+		batchCancel()
 		if err != nil {
 			punchCancel()
+			// A new client sent disconnect-req while we're still waiting
+			// for batches from the previous (dead) client. Ack and abort
+			// so the caller can accept the new client immediately.
+			var de *provider.DisconnectError
+			if errors.As(err, &de) {
+				s.cfg.Logger.Info("new client sent disconnect during batch exchange, aborting session",
+					"nonce", de.Nonce, "received_pairs", totalPairs)
+				_ = sigClient.SendDisconnectAck(ctx, de.Nonce)
+				return fmt.Errorf("aborted by new client disconnect: %w", err)
+			}
+			if clientNonce != "" && ctx.Err() == nil {
+				// We already received at least one batch — the client likely
+				// disconnected before sending the final one. Continue with
+				// whatever pairs we have.
+				s.cfg.Logger.Warn("timed out waiting for next relay batch, proceeding with existing pairs",
+					"received_pairs", totalPairs, "err", err)
+				break
+			}
 			return fmt.Errorf("recv relay batch: %w", err)
 		}
 		if clientNonce == "" {

@@ -9,6 +9,19 @@ import (
 	"log/slog"
 )
 
+// ErrDisconnectReceived is returned when a disconnect signal is received
+// from a new client while waiting for relay data. The Nonce field identifies
+// the requesting session so the server can send an ack.
+var ErrDisconnectReceived = errors.New("disconnect signal received")
+
+// DisconnectError wraps ErrDisconnectReceived with the session nonce.
+type DisconnectError struct {
+	Nonce string
+}
+
+func (e *DisconnectError) Error() string { return "disconnect signal received (nonce=" + e.Nonce + ")" }
+func (e *DisconnectError) Unwrap() error { return ErrDisconnectReceived }
+
 // TURNServer is a single TURN server address.
 type TURNServer struct {
 	Host string

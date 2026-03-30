@@ -406,6 +406,10 @@ func (c *SignalingClient) recvRelayData(ctx context.Context, skipRole string, fi
 				c.logger.Warn("parse inner data", "err", err)
 				continue
 			}
+			if data.Type == wireDisconnect {
+				c.logger.Info("disconnect signal received during relay exchange", "nonce", data.Nonce)
+				return nil, &provider.DisconnectError{Nonce: data.Nonce}
+			}
 			if data.Type != wireType {
 				continue
 			}
