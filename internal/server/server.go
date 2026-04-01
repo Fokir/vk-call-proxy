@@ -639,42 +639,42 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 	credRefresh := turn.CredentialRefreshTimer(&jr.Credentials, s.cfg.Logger)
 	defer credRefresh.Stop()
 
-	// Inner loop: accept client sessions on the same VK signaling.
-	// If too many consecutive errors occur (e.g. credentials expired but
-	// signaling still alive), force a VK rejoin to get fresh credentials.
-	const maxConsecErrors = 3
-	consecErrors := 0
-	for {
-		// Check if credential refresh timer fired while we were idle.
+	// Wrap ctx so it cancels when credentials need refreshing.
+	// This unblocks acceptOneClient's indefinite first-batch wait.
+	credCtx, credCancel := context.WithCancel(ctx)
+	go func() {
 		select {
 		case <-credRefresh.C:
-			s.cfg.Logger.Warn("TURN credentials approaching expiry, rejoining VK proactively")
-			return fmt.Errorf("proactive credential refresh")
-		default:
+			credCancel()
+		case <-credCtx.Done():
 		}
+	}()
+	defer credCancel()
 
-		err := s.acceptOneClient(ctx, sigClient, svc, s.cfg.VKTokens, &jr.Credentials)
+	// Inner loop: accept client sessions on the same VK signaling.
+	// Keep waiting for clients until credentials expire, signaling dies,
+	// or context is cancelled — never leave the call voluntarily.
+	for {
+		err := s.acceptOneClient(credCtx, sigClient, svc, s.cfg.VKTokens, &jr.Credentials)
 		if ctx.Err() != nil {
 			return nil
+		}
+		if credCtx.Err() != nil && ctx.Err() == nil {
+			s.cfg.Logger.Warn("TURN credentials approaching expiry, rejoining VK proactively")
+			return fmt.Errorf("proactive credential refresh")
 		}
 		if !sigClient.IsAlive() {
 			s.cfg.Logger.Warn("signaling died, will rejoin VK")
 			return fmt.Errorf("signaling connection lost")
 		}
 		if err != nil {
-			// Expired credentials: rejoin immediately, don't waste retries.
+			// Expired credentials: rejoin immediately.
 			if errors.Is(err, turn.ErrCredentialsExpired) {
 				s.cfg.Logger.Warn("TURN credentials expired, rejoining VK immediately")
 				return fmt.Errorf("credentials expired, need rejoin")
 			}
-			consecErrors++
-			s.cfg.Logger.Warn("client session failed", "err", err, "consec_errors", consecErrors)
-			if consecErrors >= maxConsecErrors {
-				s.cfg.Logger.Warn("too many consecutive failures, rejoining VK to refresh credentials")
-				return fmt.Errorf("consecutive client session failures: %d", consecErrors)
-			}
+			s.cfg.Logger.Warn("client session failed, still waiting", "err", err)
 		} else {
-			consecErrors = 0
 			s.cfg.Logger.Info("client session ended, waiting for next client...")
 		}
 	}
@@ -711,9 +711,17 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	var clientNonce string
 	totalPairs := 0
 
-	batchTimeout := 30 * time.Second
+	const batchFollowUpTimeout = 30 * time.Second
 	for {
-		batchCtx, batchCancel := context.WithTimeout(ctx, batchTimeout)
+		// First batch: wait indefinitely for a client (ctx controls lifetime).
+		// Follow-up batches: 30s timeout since client already started sending.
+		var batchCtx context.Context
+		var batchCancel context.CancelFunc
+		if clientNonce == "" {
+			batchCtx, batchCancel = context.WithCancel(ctx)
+		} else {
+			batchCtx, batchCancel = context.WithTimeout(ctx, batchFollowUpTimeout)
+		}
 		clientAddrs, _, isFinal, batchNonce, err := sigClient.RecvRelayBatch(batchCtx, "server", clientNonce)
 		batchCancel()
 		if err != nil {
