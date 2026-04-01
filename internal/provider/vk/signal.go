@@ -504,19 +504,26 @@ func (c *SignalingClient) SendDisconnectAck(ctx context.Context, nonce string) e
 	return c.sendInner(ctx, relayData{Type: wireDisconnectAck, Nonce: nonce})
 }
 
-// WaitDisconnectAck subscribes to disconnect-ack messages and waits for one
-// matching the given nonce. Returns nil on match, ctx.Err() on timeout.
+// WaitDisconnectAck reads directly from incoming notifications and waits for a
+// disconnect-ack matching the given nonce. Reads from c.incoming because during
+// allocation phase no dispatch loop (WaitForSessionEnd/DrainAndRoute) is running
+// to route messages to subscribers.
 func (c *SignalingClient) WaitDisconnectAck(ctx context.Context, nonce string) error {
-	ch, unsub := c.Subscribe(wireDisconnectAck, 4)
-	defer unsub()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.done:
 			return fmt.Errorf("signaling connection closed")
-		case msg := <-ch:
-			if msg.Nonce == nonce {
+		case notif := <-c.incoming:
+			if notif.Name != "custom-data" {
+				continue
+			}
+			tag, data, ok := c.extractTag(notif)
+			if !ok {
+				continue
+			}
+			if tag == wireDisconnectAck && data.Nonce == nonce {
 				return nil
 			}
 		}

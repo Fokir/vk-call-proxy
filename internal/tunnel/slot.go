@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -307,6 +308,14 @@ func (s *CallSlot) allocateServer(ctx context.Context, m *mux.Mux, _ *SignalingR
 		// Subsequent receives filter by learned client nonce.
 		clientAddrs, _, final, recvNonce, err := sigClient.RecvRelayBatch(ctx, "server", clientNonce)
 		if err != nil {
+			var de *provider.DisconnectError
+			if errors.As(err, &de) && clientNonce == "" {
+				// Session init: client sends disconnect-req to clear previous session.
+				// Ack and keep waiting for batches.
+				_ = sigClient.SendDisconnectAck(ctx, de.Nonce)
+				s.logger.Info("client session init disconnect, acked and waiting", "nonce", de.Nonce)
+				continue
+			}
 			return m, fmt.Errorf("slot %d: recv client batch %d: %w", s.index, batch, err)
 		}
 		if clientNonce == "" {
