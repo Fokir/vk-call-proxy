@@ -50,6 +50,9 @@ services:
       - VK_CALL_LINK=${VK_CALL_LINK:-}
       - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
+      - CAPTCHA_ENDPOINT=http://captcha:8090
+    depends_on:
+      - captcha
     restart: unless-stopped
     deploy:
       resources:
@@ -61,6 +64,15 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  captcha:
+    image: ghcr.io/fokir/vk-call-proxy-captcha:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${CAPTCHA_MEMORY_LIMIT:-512M}
+          cpus: "${CAPTCHA_CPU_LIMIT:-1.0}"
 ```
 
 **3. Создайте `.env` и запустите**
@@ -106,6 +118,22 @@ docker compose up -d
 5. Сервер принимает DTLS-подключения, группирует по session ID, проксирует трафик в интернет
 
 **Для внешнего наблюдателя трафик выглядит как обычный ██████████.**
+
+### Captcha-сервис
+
+██ может требовать прохождения капчи при анонимном подключении к звонку. Docker Compose автоматически запускает **captcha-сервис** — отдельный контейнер с headless Chrome, который решает капчу за ~10-15 секунд без участия человека.
+
+```
+Сервер → error_code 14 (Captcha needed)
+    ↓
+HTTP POST /solve → captcha-сервис
+    ↓
+Headless Chrome: открыть страницу → кликнуть чекбокс → перехватить success_token
+    ↓
+Сервер: повторить запрос с success_token → успех
+```
+
+Captcha-сервис использует ~200-500 MB RAM на время решения (Chrome), после чего процесс завершается. Решение кешируется на время жизни сессии.
 
 ---
 
@@ -178,8 +206,12 @@ TURN_CONNS=4
 | `VK_CALL_LINK` | *(пусто)* | ID ссылки ██-звонка. Если задан — включается relay-to-relay mode |
 | `TURN_CONNS` | `4` | Количество TURN-соединений (только relay mode) |
 | `SIREN_SLACK_WEBHOOK` | *(пусто)* | URL Slack webhook для алертов мониторинга |
-| `MEMORY_LIMIT` | `256M` | Лимит оперативной памяти контейнера |
-| `CPU_LIMIT` | `1.0` | Лимит CPU (количество ядер) |
+| `CAPTCHA_ENDPOINT` | `http://captcha:8090` | URL captcha-сервиса (auto-configured в docker-compose) |
+| `CAPTCHA_MAX_CONCURRENT` | `1` | Макс. одновременных Chrome-инстансов для решения капчи |
+| `MEMORY_LIMIT` | `256M` | Лимит оперативной памяти контейнера сервера |
+| `CPU_LIMIT` | `1.0` | Лимит CPU сервера (количество ядер) |
+| `CAPTCHA_MEMORY_LIMIT` | `512M` | Лимит RAM для captcha-сервиса (Chrome ~200MB) |
+| `CAPTCHA_CPU_LIMIT` | `1.0` | Лимит CPU captcha-сервиса |
 
 ### Минимальный .env (direct mode)
 

@@ -58,6 +58,7 @@ App → MUX → DTLS → TURN(client) ↔ TURN(server) → DTLS → MUX → Inte
 | Компонент | Описание | Платформы |
 |:----------|:---------|:----------|
 | **Сервер** | DTLS/UDP listener, группировка сессий, проксирование | Linux (Docker) |
+| **Captcha-сервис** | Автоматическое решение ██ капчи через headless Chrome | Linux (Docker) |
 | **Desktop-клиент** | SOCKS5 + HTTP прокси, TURN + DTLS туннель | Windows, macOS |
 | **Android** | Нативное приложение с gomobile | Android 7+ |
 | **iOS** | Нативное приложение с PacketTunnel | iOS 15+ |
@@ -97,6 +98,9 @@ docker compose up -d
 
 > При указании `VK_CALL_LINK` сервер автоматически переключается в relay-to-relay mode.
 > Открытый UDP-порт **не нужен** — всё проходит через ██-инфраструктуру.
+
+> Docker Compose автоматически запускает **captcha-сервис** для решения ██ капчи.
+> Подробнее: [deploy/docker/README.md](deploy/docker/README.md).
 
 > Подробная инструкция по деплою, мониторингу и устранению проблем: **[deploy/docker/README.md](deploy/docker/README.md)**
 

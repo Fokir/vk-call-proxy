@@ -8,12 +8,31 @@ services:
       - VK_CALL_LINK=${VK_CALL_LINK:-}
       - TURN_CONNS=${TURN_CONNS:-16}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
+      - CAPTCHA_ENDPOINT=${CAPTCHA_ENDPOINT:-http://captcha:8090}
+    depends_on:
+      - captcha
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: ${MEMORY_LIMIT:-256M}
           cpus: "${CPU_LIMIT:-1.0}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  captcha:
+    image: ghcr.io/fokir/vk-call-proxy-captcha:${IMAGE_TAG:-latest}
+    environment:
+      - MAX_CONCURRENT=${CAPTCHA_MAX_CONCURRENT:-1}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${CAPTCHA_MEMORY_LIMIT:-512M}
+          cpus: "${CAPTCHA_CPU_LIMIT:-1.0}"
     logging:
       driver: json-file
       options:
