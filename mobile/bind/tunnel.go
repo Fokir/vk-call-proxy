@@ -153,7 +153,8 @@ type TunnelConfig struct {
 	UseTCP      bool   // TCP vs UDP for TURN
 	Token       string // auth token for server (empty = no auth)
 	Fingerprint string // server DTLS certificate SHA-256 fingerprint (hex, empty = no pinning)
-	VKTokens    string // comma-separated VK tokens (0-16), passed from Android UI
+	VKTokens    string          // comma-separated VK tokens (0-16), passed from Android UI
+	Captcha     CaptchaCallback // optional: captcha solver callback for WebView
 }
 
 // ValidateNumConns returns a warning message if NumConns exceeds the
@@ -261,7 +262,11 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	if telemost.IsTelemostLink(cleanLinks[0]) {
 		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
-		t.svc = vk.NewService(cleanLinks[0])
+		var vkOpts []vk.Option
+		if cfg.Captcha != nil {
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: cfg.Captcha}))
+		}
+		t.svc = vk.NewService(cleanLinks[0], vkOpts...)
 	}
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})

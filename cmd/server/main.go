@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/call-vpn/call-vpn/internal/captcha"
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
@@ -41,6 +42,7 @@ func main() {
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
+	captchaEndpoint := flag.String("captcha-endpoint", "", "captcha-service URL (e.g. http://captcha:8090, env: CAPTCHA_ENDPOINT)")
 	flag.Parse()
 
 	if *verbose {
@@ -73,6 +75,9 @@ func main() {
 	if len(vkTokens) > 16 {
 		log.Fatal("maximum 16 VK tokens allowed")
 	}
+	if *captchaEndpoint == "" {
+		*captchaEndpoint = os.Getenv("CAPTCHA_ENDPOINT")
+	}
 
 	logLevel := slog.LevelInfo
 	if *verbose {
@@ -91,12 +96,16 @@ func main() {
 
 	// Enable relay-to-relay mode with the appropriate service(s).
 	if len(callLinks) > 0 {
+		var vkOpts []vk.Option
+		if *captchaEndpoint != "" {
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(captcha.NewRemoteSolver(*captchaEndpoint)))
+		}
 		services := make([]provider.Service, len(callLinks))
 		for i, link := range callLinks {
 			if telemost.IsTelemostLink(link) {
 				services[i] = telemost.NewService(link, *authToken)
 			} else {
-				services[i] = vk.NewService(link)
+				services[i] = vk.NewService(link, vkOpts...)
 			}
 		}
 		cfg.Service = services[0]

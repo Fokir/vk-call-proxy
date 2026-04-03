@@ -38,8 +38,12 @@ func TestVK_CheckVKRateLimit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			body, _ := json.Marshal(vkErrorResponse{
 				Error: &struct {
-					Code int    `json:"error_code"`
-					Msg  string `json:"error_msg"`
+					Code        int     `json:"error_code"`
+					Msg         string  `json:"error_msg"`
+					RedirectURI string  `json:"redirect_uri"`
+					CaptchaSID  string  `json:"captcha_sid"`
+					CaptchaTS   float64 `json:"captcha_ts"`
+					CaptchaImg  string  `json:"captcha_img"`
 				}{Code: tt.code, Msg: tt.msg},
 			})
 

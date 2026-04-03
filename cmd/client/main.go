@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/call-vpn/call-vpn/internal/bypass"
+	"github.com/call-vpn/call-vpn/internal/captcha"
 	"github.com/call-vpn/call-vpn/internal/client"
 	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
@@ -50,6 +51,7 @@ func main() {
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
+	captchaEndpoint := flag.String("captcha-endpoint", "", "captcha-service URL, empty = open system browser")
 
 	flag.Parse()
 
@@ -94,13 +96,21 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	siren := monitoring.New(logger)
 
+	// Create captcha solver.
+	var solver provider.CaptchaSolver
+	if *captchaEndpoint != "" {
+		solver = captcha.NewRemoteSolver(*captchaEndpoint)
+	} else {
+		solver = captcha.NewBrowserSolver()
+	}
+
 	// Create call service providers (auto-detect from link).
 	services := make([]provider.Service, len(callLinks))
 	for i, link := range callLinks {
 		if telemost.IsTelemostLink(link) {
 			services[i] = telemost.NewService(link, *authToken)
 		} else {
-			services[i] = vk.NewService(link)
+			services[i] = vk.NewService(link, vk.WithCaptchaSolver(solver))
 		}
 	}
 

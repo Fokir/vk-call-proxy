@@ -19,11 +19,14 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/call-vpn/call-vpn/internal/captcha"
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
+
+var chromedpCaptcha = captcha.NewChromedpSolver()
 
 //go:embed index.html
 var indexHTML []byte
@@ -326,7 +329,7 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if telemost.IsTelemostLink(link) {
 		svc = telemost.NewService(link, authToken)
 	} else {
-		svc = vk.NewService(link)
+		svc = vk.NewService(link, vk.WithCaptchaSolver(chromedpCaptcha))
 	}
 
 	srvCfg := server.Config{
