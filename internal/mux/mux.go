@@ -104,6 +104,7 @@ type connStats struct {
 	errors    atomic.Int64
 	lastUsed  atomic.Int64 // unix nano
 	prevSent  atomic.Int64 // bytesSent snapshot at last throughput measurement
+	createdAt atomic.Int64 // unix nano, set once at AddConn time
 }
 
 // Mux multiplexes framed streams over multiple underlying connections,
@@ -735,7 +736,9 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 		writeCh:   make(chan writeReq, 256),
 		writeDone: make(chan struct{}),
 	}
-	mc.stats.lastUsed.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	mc.stats.lastUsed.Store(now)
+	mc.stats.createdAt.Store(now)
 
 	m.mu.Lock()
 	idx := -1
@@ -864,6 +867,42 @@ func (m *Mux) ConnStats() []ConnStat {
 		}
 	}
 	return stats
+}
+
+// CloseOldestConn closes the oldest connection if its age exceeds maxAge
+// and at least minAlive connections would remain alive. Returns true if
+// a connection was closed (it will trigger ConnDied asynchronously).
+func (m *Mux) CloseOldestConn(maxAge time.Duration, minAlive int) bool {
+	now := time.Now().UnixNano()
+
+	m.mu.Lock()
+	var oldest *muxConn
+	oldestAge := int64(0)
+	alive := 0
+	for _, mc := range m.conns {
+		if mc == nil {
+			continue
+		}
+		alive++
+		age := now - mc.stats.createdAt.Load()
+		if age > oldestAge {
+			oldestAge = age
+			oldest = mc
+		}
+	}
+	m.mu.Unlock()
+
+	if oldest == nil || alive <= minAlive || oldestAge < int64(maxAge) {
+		return false
+	}
+
+	m.logger.Info("closing oldest connection for rotation",
+		"index", oldest.index,
+		"age", time.Duration(oldestAge).Round(time.Second),
+		"alive", alive,
+	)
+	oldest.conn.Close()
+	return true
 }
 
 // RemoveConn sets the connection at the given index to nil.

@@ -675,8 +675,8 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 			return nil
 		}
 		if credCtx.Err() != nil && ctx.Err() == nil {
-			s.cfg.Logger.Warn("TURN credentials approaching expiry, rejoining VK proactively")
-			return fmt.Errorf("proactive credential refresh")
+			s.cfg.Logger.Warn("session refresh triggered, rejoining VK proactively")
+			return fmt.Errorf("proactive session refresh")
 		}
 		if !sigClient.IsAlive() {
 			s.cfg.Logger.Warn("signaling died, will rejoin VK")
@@ -1029,6 +1029,27 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	}()
 
 	go s.handleReconnections(sessCtx, sigClient, mgr, m)
+
+	// Rolling connection rotation: close the oldest connection every
+	// rotationInterval if it exceeds maxConnAge. The client's ReconnectManager
+	// automatically replaces it with a fresh TURN allocation, so the MUX
+	// stays alive with at most 1 connection briefly missing.
+	go func() {
+		const maxConnAge = 3*time.Hour + 30*time.Minute
+		const rotationInterval = 5 * time.Minute
+		minAlive := max(s.cfg.NumConns/2, 2)
+
+		ticker := time.NewTicker(rotationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				m.CloseOldestConn(maxConnAge, minAlive)
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
 
 	go func() {
 		reason, disconnectNonce := sigClient.WaitForSessionEnd(sessCtx)

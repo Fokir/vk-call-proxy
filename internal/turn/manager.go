@@ -36,31 +36,49 @@ func credentialsExpired(creds *provider.Credentials) bool {
 	return time.Now().Unix()+60 > expiry // expired or expiring within 60s
 }
 
-// CredentialRefreshTimer returns a timer that fires 5 minutes before the TURN
-// credentials expire (based on the username timestamp). If the expiry cannot
-// be parsed or is already past, the timer fires in 1 minute.
+// CredentialRefreshTimer returns a timer that fires at the earlier of:
+// - 5 minutes before TURN credentials expire (based on the username timestamp)
+// - maxAllocationAge (4h) to preempt TURN relay allocation limits
+// If the expiry cannot be parsed, the timer fires after maxAllocationAge.
 func CredentialRefreshTimer(creds *provider.Credentials, logger *slog.Logger) *time.Timer {
 	const margin = 5 * time.Minute
+	const maxAllocationAge = 4 * time.Hour
 
 	parts := strings.SplitN(creds.Username, ":", 2)
 	if len(parts) < 2 {
-		return time.NewTimer(30 * time.Minute) // unknown format, fallback
+		logger.Info("session refresh scheduled",
+			"refresh_in", maxAllocationAge,
+			"reason", "max_allocation_age",
+			"note", "unknown credential format, using max age")
+		return time.NewTimer(maxAllocationAge)
 	}
 	expiry, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return time.NewTimer(30 * time.Minute)
+		logger.Info("session refresh scheduled",
+			"refresh_in", maxAllocationAge,
+			"reason", "max_allocation_age",
+			"note", "unparseable expiry, using max age")
+		return time.NewTimer(maxAllocationAge)
 	}
 
 	expiryTime := time.Unix(expiry, 0)
 	refreshAt := expiryTime.Add(-margin)
-	delay := time.Until(refreshAt)
-	if delay < time.Minute {
-		delay = time.Minute
+	credDelay := time.Until(refreshAt)
+	if credDelay < time.Minute {
+		credDelay = time.Minute
 	}
 
-	logger.Info("credential refresh scheduled",
+	delay := credDelay
+	reason := "credential_expiry"
+	if maxAllocationAge < delay {
+		delay = maxAllocationAge
+		reason = "max_allocation_age"
+	}
+
+	logger.Info("session refresh scheduled",
 		"expiry", expiryTime.Format(time.RFC3339),
-		"refresh_in", delay.Round(time.Second))
+		"refresh_in", delay.Round(time.Second),
+		"reason", reason)
 	return time.NewTimer(delay)
 }
 
@@ -167,8 +185,18 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 		// Reuse credentials from initial join — avoids re-joining the conference.
 		c := *m.initialCreds
 		creds = &c
+	} else if m.initialCreds != nil && m.creds != nil {
+		// Initial credentials expired but we have a credentials provider —
+		// fetch fresh ones. This happens during connection rotation when
+		// the original credentials have expired but the session is still alive.
+		m.logger.Info("initial credentials expired, fetching fresh ones for reconnect")
+		var err error
+		creds, err = m.creds.FetchCredentials(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%w: fetch fresh credentials: %v", ErrCredentialsExpired, err)
+		}
 	} else if m.initialCreds != nil {
-		// Initial credentials expired — signal caller to rejoin.
+		// Initial credentials expired and no provider — signal caller to rejoin.
 		return nil, fmt.Errorf("%w: username %s", ErrCredentialsExpired, m.initialCreds.Username)
 	} else {
 		// Each allocation gets fresh credentials (different anonymous identity).
