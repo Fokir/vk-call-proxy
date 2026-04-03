@@ -138,6 +138,9 @@ type Tunnel struct {
 
 	// fatal error — set when reconnect gives up permanently
 	fatalErr atomic.Value // string
+
+	// captcha callback (set via SetCaptchaCallback before Start)
+	captchaCb CaptchaCallback
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -153,8 +156,7 @@ type TunnelConfig struct {
 	UseTCP      bool   // TCP vs UDP for TURN
 	Token       string // auth token for server (empty = no auth)
 	Fingerprint string // server DTLS certificate SHA-256 fingerprint (hex, empty = no pinning)
-	VKTokens    string          // comma-separated VK tokens (0-16), passed from Android UI
-	Captcha     CaptchaCallback // optional: captcha solver callback for WebView
+	VKTokens    string // comma-separated VK tokens (0-16), passed from Android UI
 }
 
 // ValidateNumConns returns a warning message if NumConns exceeds the
@@ -175,6 +177,12 @@ func NewTunnel() *Tunnel {
 		logBuf: lb,
 		logger: slog.New(slog.NewTextHandler(io.MultiWriter(lb, os.Stderr), &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
+}
+
+// SetCaptchaCallback sets the callback for solving VK captchas via WebView.
+// Must be called before Start(). If not set, captcha errors are propagated.
+func (t *Tunnel) SetCaptchaCallback(cb CaptchaCallback) {
+	t.captchaCb = cb
 }
 
 // ReadLogs returns all buffered log lines as a single string
@@ -263,8 +271,8 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
 		var vkOpts []vk.Option
-		if cfg.Captcha != nil {
-			vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: cfg.Captcha}))
+		if t.captchaCb != nil {
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: t.captchaCb}))
 		}
 		t.svc = vk.NewService(cleanLinks[0], vkOpts...)
 	}
