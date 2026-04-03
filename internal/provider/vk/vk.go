@@ -44,6 +44,15 @@ func classifyToken(token string) string {
 // Service implements provider.Service for VK Calls.
 type Service struct {
 	callLink string
+	captcha  provider.CaptchaSolver
+}
+
+// Option configures a VK Service.
+type Option func(*Service)
+
+// WithCaptchaSolver sets a captcha solver for automatic captcha resolution.
+func WithCaptchaSolver(s provider.CaptchaSolver) Option {
+	return func(svc *Service) { svc.captcha = s }
 }
 
 // Compile-time checks.
@@ -51,8 +60,12 @@ var _ provider.Service = (*Service)(nil)
 var _ provider.TokenAuthProvider = (*Service)(nil)
 
 // NewService creates a VK call service provider.
-func NewService(callLink string) *Service {
-	return &Service{callLink: callLink}
+func NewService(callLink string, opts ...Option) *Service {
+	s := &Service{callLink: callLink}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *Service) Name() string { return "vk" }
@@ -105,7 +118,7 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 	}
 
 	// Step 2: Get join token (call-specific)
-	joinToken, err := vkJoinToken(ctx, client, ua, s.callLink, messagesToken)
+	joinToken, err := s.vkJoinToken(ctx, client, ua, s.callLink, messagesToken)
 	if err != nil {
 		wg.Wait()
 		return nil, fmt.Errorf("step2 join token: %w", err)
@@ -220,17 +233,57 @@ func vkMessagesToken(ctx context.Context, client *http.Client, ua string) (strin
 	return resp.Data.AccessToken, nil
 }
 
-func vkJoinToken(ctx context.Context, client *http.Client, ua string, link, token3 string) (string, error) {
+func (s *Service) vkJoinToken(ctx context.Context, client *http.Client, ua string, link, token3 string) (string, error) {
 	data := url.Values{
 		"vk_join_link": {fmt.Sprintf("https://vk.com/call/join/%s", link)},
 		"name":         {provider.RandomDisplayName()},
 		"access_token": {token3},
 	}
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
-	body, err := vkAPIPost(ctx, client, ua, endpoint, data)
+
+	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
+
+	// Check for captcha (error 14) before generic rate limit check.
+	var errResp vkErrorResponse
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != nil && errResp.Error.Code == 14 {
+		if s.captcha == nil {
+			slog.Warn("VK API captcha required, no solver configured", "endpoint", endpoint)
+			return "", &provider.RateLimitError{Code: 14, Message: errResp.Error.Msg}
+		}
+
+		slog.Info("captcha required, solving...", "captcha_sid", errResp.Error.CaptchaSID)
+		start := time.Now()
+
+		result, solveErr := s.captcha.SolveCaptcha(ctx, &provider.CaptchaChallenge{
+			RedirectURI: errResp.Error.RedirectURI,
+			CaptchaSID:  errResp.Error.CaptchaSID,
+			CaptchaTS:   errResp.Error.CaptchaTS,
+			CaptchaImg:  errResp.Error.CaptchaImg,
+		})
+		if solveErr != nil {
+			slog.Warn("captcha solve failed", "err", solveErr, "duration", time.Since(start))
+			return "", fmt.Errorf("captcha solve: %w", solveErr)
+		}
+		slog.Info("captcha solved", "duration", time.Since(start))
+
+		// Retry with captcha solution.
+		data.Set("success_token", result.SuccessToken)
+		data.Set("captcha_sid", errResp.Error.CaptchaSID)
+		data.Set("captcha_ts", fmt.Sprintf("%.2f", errResp.Error.CaptchaTS))
+		data.Set("captcha_attempt", "1")
+
+		body, err = vkAPIPost(ctx, client, ua, endpoint, data)
+		if err != nil {
+			return "", fmt.Errorf("retry after captcha: %w", err)
+		}
+	} else if rle := checkVKRateLimit(body); rle != nil {
+		slog.Warn("VK API rate limit", "code", rle.Code, "msg", rle.Message, "endpoint", endpoint)
+		return "", rle
+	}
+
 	var resp struct {
 		Response struct {
 			Token string `json:"token"`
@@ -396,8 +449,12 @@ func okJoinConference(ctx context.Context, client *http.Client, ua string, link,
 // vkErrorResponse represents a VK API JSON error envelope.
 type vkErrorResponse struct {
 	Error *struct {
-		Code int    `json:"error_code"`
-		Msg  string `json:"error_msg"`
+		Code        int     `json:"error_code"`
+		Msg         string  `json:"error_msg"`
+		RedirectURI string  `json:"redirect_uri"`
+		CaptchaSID  string  `json:"captcha_sid"`
+		CaptchaTS   float64 `json:"captcha_ts"`
+		CaptchaImg  string  `json:"captcha_img"`
 	} `json:"error"`
 }
 
