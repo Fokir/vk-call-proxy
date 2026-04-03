@@ -426,8 +426,9 @@ echo "[$(ts)] Starting captcha-service on port $CAPTCHA_PORT..."
 ./callvpn-captcha${EXE} \
   --port="$CAPTCHA_PORT" \
   --max-concurrent=1 \
-  --solve-timeout=30s \
+  --solve-timeout=90s \
   --request-timeout=2m \
+  $VERBOSE \
   2>&1 | sed "s/^/  [captcha] /" &
 CAPTCHA_PID=$!
 sleep 2

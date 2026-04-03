@@ -53,7 +53,12 @@ func main() {
 	solveTimeout := flag.Duration("solve-timeout", 30*time.Second, "timeout for Chrome captcha solving")
 	requestTimeout := flag.Duration("request-timeout", 2*time.Minute, "total request timeout including queue wait")
 	verbose := flag.Bool("verbose", false, "verbose logging")
+	noHeadless := flag.Bool("no-headless", false, "show Chrome window (for debugging)")
 	flag.Parse()
+
+	if *noHeadless {
+		captcha.Headless = false
+	}
 
 	s := &server{
 		sem:            make(chan struct{}, *maxConcurrent),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
@@ -43,8 +45,13 @@ func (s *ChromedpSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaC
 // movement, and intercepts the captchaNotRobot.check XHR response to
 // extract the success_token. It is exported so that external callers
 // (e.g. captcha-service) can use it directly with their own concurrency.
+// Headless controls whether Chrome runs in headless mode.
+// Set to false for debugging (shows browser window).
+var Headless = true
+
 func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", Headless),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.NoSandbox,
@@ -66,16 +73,33 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 		if !ok {
 			return
 		}
-		if resp.Response == nil || !strings.Contains(resp.Response.URL, "captchaNotRobot.check") {
+		if resp.Response == nil {
+			return
+		}
+		url := resp.Response.URL
+		// Log ALL captcha-related API calls for debugging.
+		if strings.Contains(url, "captchaNotRobot") || strings.Contains(url, "api.vk") {
+			slog.Info("captcha network", "url", url, "status", resp.Response.Status)
+		}
+		if !strings.Contains(url, "captchaNotRobot.check") {
 			return
 		}
 		reqID := resp.RequestID
-		// Read body in a goroutine to avoid blocking the event loop.
+		// Read body in a goroutine. Use allocCtx (longer-lived) instead of taskCtx
+		// to avoid "invalid context" race when taskCtx is cancelled.
 		go func() {
-			body, err := network.GetResponseBody(reqID).Do(taskCtx)
-			if err != nil {
+			// Small delay to let the response body arrive.
+			time.Sleep(200 * time.Millisecond)
+			var body []byte
+			if err := chromedp.Run(taskCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+				var err error
+				body, err = network.GetResponseBody(reqID).Do(ctx)
+				return err
+			})); err != nil {
+				slog.Debug("captcha: failed to read response body", "err", err)
 				return
 			}
+			slog.Info("captchaNotRobot.check response", "body", string(body))
 			var result struct {
 				Response struct {
 					SuccessToken string `json:"success_token"`
@@ -93,17 +117,70 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 		}()
 	})
 
-	// Run browser actions: enable network events, navigate, wait, move mouse.
+	// Inject anti-detection script BEFORE any page JS runs.
 	if err := chromedp.Run(taskCtx,
 		network.Enable(),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, err := page.AddScriptToEvaluateOnNewDocument(`
+				Object.defineProperty(navigator, 'webdriver', {get: () => false});
+				window.chrome = {runtime: {}};
+			`).Do(ctx)
+			return err
+		}),
 		chromedp.Navigate(redirectURI),
 		chromedp.WaitReady("body"),
-		simulateMouse(),
+		chromedp.Sleep(3*time.Second),
 	); err != nil {
 		return "", fmt.Errorf("chromedp run: %w", err)
 	}
 
-	// Wait for the success token or context cancellation.
+	// Dump page structure for debugging.
+	var debugHTML string
+	if err := chromedp.Run(taskCtx, chromedp.Evaluate(
+		`(function(){
+			var els = document.querySelectorAll('input, button, label, [role="checkbox"], [class*="heck"], [class*="aptcha"]');
+			var info = [];
+			els.forEach(function(el){
+				var r = el.getBoundingClientRect();
+				info.push(el.tagName + ' class=' + el.className + ' type=' + el.type + ' rect=' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height));
+			});
+			return info.join('\\n');
+		})()`,
+		&debugHTML,
+	)); err == nil && debugHTML != "" {
+		slog.Info("captcha page elements", "elements", debugHTML)
+	}
+
+	// Try to find and click the captcha checkbox, with mouse movement leading to it.
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := chromedp.Run(taskCtx, clickCaptchaCheckbox()); err != nil {
+			slog.Info("captcha click attempt failed", "attempt", attempt, "err", err)
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			continue
+		}
+		slog.Info("captcha click sent", "attempt", attempt)
+
+		// After clicking, keep moving mouse — VK JS collects sensor data.
+		if err := chromedp.Run(taskCtx, postClickMouseMovement()); err != nil {
+			slog.Debug("post-click mouse movement failed", "err", err)
+		}
+
+		// Wait for token after clicking + mouse movement.
+		select {
+		case token := <-tokenCh:
+			return token, nil
+		case <-time.After(10 * time.Second):
+			// Token not arrived yet, try clicking again.
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	// Final wait for token.
 	select {
 	case token := <-tokenCh:
 		return token, nil
@@ -112,35 +189,23 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	}
 }
 
-// simulateMouse returns a chromedp action that generates realistic mouse
-// movement events along a roughly straight line with random jitter.
-func simulateMouse() chromedp.ActionFunc {
+// postClickMouseMovement generates natural mouse movement after clicking
+// the checkbox. VK captcha JS collects cursor sensor data for several seconds
+// before sending captchaNotRobot.check.
+func postClickMouseMovement() chromedp.ActionFunc {
 	return func(ctx context.Context) error {
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		x := 600.0 + r.Float64()*50
+		y := 400.0 + r.Float64()*30
 
-		// Random start point in the center area of the viewport.
-		x0 := 400.0 + r.Float64()*200.0
-		y0 := 300.0 + r.Float64()*100.0
-
-		// Random end point offset.
-		dx := 200.0 + r.Float64()*200.0 // 200-400px right
-		dy := 30.0 + r.Float64()*30.0   // 30-60px down
-		x1 := x0 + dx
-		y1 := y0 + dy
-
-		steps := 10 + r.Intn(6) // 10-15 intermediate points
-
-		for i := 0; i <= steps; i++ {
-			t := float64(i) / float64(steps)
-			x := x0 + t*(x1-x0) + (r.Float64()*30.0 - 15.0) // jitter +/-15px horizontal
-			y := y0 + t*(y1-y0) + (r.Float64()*10.0 - 5.0)   // jitter +/-5px vertical
-
+		// Move mouse naturally for ~5 seconds.
+		for i := 0; i < 20; i++ {
+			x += (r.Float64() - 0.5) * 40
+			y += (r.Float64() - 0.5) * 20
 			if err := input.DispatchMouseEvent(input.MouseMoved, x, y).Do(ctx); err != nil {
-				return fmt.Errorf("mouse move step %d: %w", i, err)
+				return err
 			}
-
-			// Random delay between 50-200ms.
-			delay := time.Duration(50+r.Intn(151)) * time.Millisecond
+			delay := time.Duration(200+r.Intn(300)) * time.Millisecond
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -148,5 +213,41 @@ func simulateMouse() chromedp.ActionFunc {
 			}
 		}
 		return nil
+	}
+}
+
+// clickCaptchaCheckbox finds the captcha checkbox on the page,
+// moves the mouse toward it with natural movement, and clicks via DOM.
+func clickCaptchaCheckbox() chromedp.ActionFunc {
+	return func(ctx context.Context) error {
+		// VK captcha checkbox selectors — prefer the visible LABEL over hidden INPUT.
+		selectors := []string{
+			`[class*="Checkbox-module__Checkbox"]`,
+			`label[class*="Checkbox"]`,
+			`label`,
+			`[role="checkbox"]`,
+			`input[type="checkbox"]`,
+		}
+
+		// Move mouse naturally first (VK collects cursor data before click).
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		x0 := 300.0 + r.Float64()*200
+		y0 := 200.0 + r.Float64()*100
+		for i := 0; i < 8; i++ {
+			x0 += (r.Float64() - 0.3) * 40
+			y0 += (r.Float64() - 0.3) * 20
+			input.DispatchMouseEvent(input.MouseMoved, x0, y0).Do(ctx)
+			time.Sleep(time.Duration(60+r.Intn(100)) * time.Millisecond)
+		}
+
+		// Click via chromedp.Click (DOM click — same as human click).
+		for _, sel := range selectors {
+			if err := chromedp.Click(sel, chromedp.NodeVisible).Do(ctx); err == nil {
+				slog.Info("captcha checkbox clicked", "selector", sel)
+				return nil
+			}
+		}
+
+		return fmt.Errorf("no clickable checkbox found")
 	}
 }
