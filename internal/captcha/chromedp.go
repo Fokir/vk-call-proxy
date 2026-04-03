@@ -102,6 +102,7 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 			slog.Info("captchaNotRobot.check response", "body", string(body))
 			var result struct {
 				Response struct {
+					Status       string `json:"status"`
 					SuccessToken string `json:"success_token"`
 				} `json:"response"`
 			}
@@ -113,6 +114,12 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 				case tokenCh <- result.Response.SuccessToken:
 				default:
 				}
+			} else if result.Response.Status == "BOT" {
+				slog.Warn("captcha: VK detected bot")
+				select {
+				case tokenCh <- "": // signal failure
+				default:
+				}
 			}
 		}()
 	})
@@ -121,10 +128,7 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	if err := chromedp.Run(taskCtx,
 		network.Enable(),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(`
-				Object.defineProperty(navigator, 'webdriver', {get: () => false});
-				window.chrome = {runtime: {}};
-			`).Do(ctx)
+			_, err := page.AddScriptToEvaluateOnNewDocument(stealthJS).Do(ctx)
 			return err
 		}),
 		chromedp.Navigate(redirectURI),
@@ -152,7 +156,7 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	}
 
 	// Try to find and click the captcha checkbox, with mouse movement leading to it.
-	for attempt := 0; attempt < 8; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if err := chromedp.Run(taskCtx, clickCaptchaCheckbox()); err != nil {
 			slog.Info("captcha click attempt failed", "attempt", attempt, "err", err)
 			select {
@@ -172,6 +176,9 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 		// Wait for token after clicking + mouse movement.
 		select {
 		case token := <-tokenCh:
+			if token == "" {
+				return "", fmt.Errorf("VK detected bot (status=BOT)")
+			}
 			return token, nil
 		case <-time.After(10 * time.Second):
 			// Token not arrived yet, try clicking again.
@@ -183,6 +190,9 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	// Final wait for token.
 	select {
 	case token := <-tokenCh:
+		if token == "" {
+			return "", fmt.Errorf("VK detected bot (status=BOT)")
+		}
 		return token, nil
 	case <-ctx.Done():
 		return "", ctx.Err()
