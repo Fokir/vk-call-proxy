@@ -34,6 +34,7 @@ DOWNLOAD_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-6.12.xz"
 USE_VK_TOKEN=""    # empty=anonymous, "env"=from .env, "vk1.a.X"=explicit
 VERBOSE=""
 STRIPING=""
+CAPTCHA_PORT=18090
 
 for arg in "$@"; do
   case $arg in
@@ -371,18 +372,23 @@ cleanup() {
     # Kill the actual binaries (pipe makes $PID point to `sed`, not .exe).
     taskkill //F //IM "callvpn-client${EXE}" >/dev/null 2>&1 || true
     taskkill //F //IM "callvpn-server${EXE}" >/dev/null 2>&1 || true
+    taskkill //F //IM "callvpn-captcha${EXE}" >/dev/null 2>&1 || true
     # Kill the sed pipe processes so `wait` doesn't hang.
     kill -9 $CLIENT_PID 2>/dev/null || true
     kill -9 $SERVER_PID 2>/dev/null || true
+    kill -9 $CAPTCHA_PID 2>/dev/null || true
   else
     kill -INT $CLIENT_PID 2>/dev/null || true
     kill -INT $SERVER_PID 2>/dev/null || true
+    kill -INT $CAPTCHA_PID 2>/dev/null || true
     sleep 3
     kill -9 $CLIENT_PID 2>/dev/null || true
     kill -9 $SERVER_PID 2>/dev/null || true
+    kill -9 $CAPTCHA_PID 2>/dev/null || true
   fi
   wait $CLIENT_PID 2>/dev/null || true
   wait $SERVER_PID 2>/dev/null || true
+  wait $CAPTCHA_PID 2>/dev/null || true
   echo "[$(ts)] Done."
 }
 # --- Platform detection ---
@@ -400,17 +406,39 @@ trap cleanup EXIT
 echo "[$(ts)] Building binaries..."
 go build -o "callvpn-server${EXE}" ./cmd/server
 go build -o "callvpn-client${EXE}" ./cmd/client
+go build -o "callvpn-captcha${EXE}" ./cmd/captcha-service
 echo "[$(ts)] Build OK"
 
 # --- Kill stale processes ---
 if $IS_WINDOWS; then
   taskkill //F //IM "callvpn-server${EXE}" >/dev/null 2>&1 || true
   taskkill //F //IM "callvpn-client${EXE}" >/dev/null 2>&1 || true
+  taskkill //F //IM "callvpn-captcha${EXE}" >/dev/null 2>&1 || true
 else
   pkill -f "callvpn-server" 2>/dev/null || true
   pkill -f "callvpn-client" 2>/dev/null || true
+  pkill -f "callvpn-captcha" 2>/dev/null || true
 fi
 sleep 1
+
+# --- Start captcha-service ---
+echo "[$(ts)] Starting captcha-service on port $CAPTCHA_PORT..."
+./callvpn-captcha${EXE} \
+  --port="$CAPTCHA_PORT" \
+  --max-concurrent=1 \
+  --solve-timeout=30s \
+  --request-timeout=2m \
+  2>&1 | sed "s/^/  [captcha] /" &
+CAPTCHA_PID=$!
+sleep 2
+
+if ! kill -0 $CAPTCHA_PID 2>/dev/null; then
+  echo "FATAL: captcha-service died"
+  exit 1
+fi
+echo "[$(ts)] Captcha-service running (PID $CAPTCHA_PID)"
+
+CAPTCHA_ENDPOINT="http://127.0.0.1:$CAPTCHA_PORT"
 
 # --- Start server ---
 echo ""
@@ -421,6 +449,7 @@ ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
   --tcp=true \
   --n="$CONNS" \
   --token="$VPN_TOKEN" \
+  --captcha-endpoint="$CAPTCHA_ENDPOINT" \
   $VK_TOKEN_ARGS_SERVER \
   $VERBOSE \
   2>&1 | sed "s/^/  [server] /" &
@@ -443,6 +472,7 @@ ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
   --token="$VPN_TOKEN" \
   --socks5-port=$SOCKS_PORT \
   --http-port=$HTTP_PORT \
+  --captcha-endpoint="$CAPTCHA_ENDPOINT" \
   $VK_TOKEN_ARGS_CLIENT \
   $VERBOSE \
   2>&1 | sed "s/^/  [client] /" &
