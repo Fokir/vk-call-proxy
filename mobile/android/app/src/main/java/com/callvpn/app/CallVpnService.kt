@@ -161,6 +161,7 @@ class CallVpnService : VpnService() {
             }
 
             val t = Tunnel()
+            t.setCaptchaCallback(CaptchaSolverCallback(this@CallVpnService))
             tunnel = t
 
             // Start stage+log poller BEFORE t.start() so UI sees connection stages.

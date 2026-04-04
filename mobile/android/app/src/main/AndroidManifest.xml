@@ -58,5 +58,10 @@
             </intent-filter>
         </receiver>
 
+        <activity
+            android:name=".CaptchaActivity"
+            android:theme="@android:style/Theme.NoTitleBar"
+            android:exported="false" />
+
     </application>
 </manifest>

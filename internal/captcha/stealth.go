@@ -1,3 +1,5 @@
+//go:build !android
+
 package captcha
 
 // stealthJS is injected before any page JavaScript runs.
