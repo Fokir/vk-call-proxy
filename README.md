@@ -61,7 +61,7 @@ App → MUX → DTLS → TURN(client) ↔ TURN(server) → DTLS → MUX → Inte
 | **Captcha-сервис** | Автоматическое решение ██ капчи через headless Chrome | Linux (Docker) |
 | **Desktop-клиент** | SOCKS5 + HTTP прокси, TURN + DTLS туннель | Windows, macOS |
 | **Android** | Нативное приложение с gomobile | Android 7+ |
-| **iOS** | Нативное приложение с PacketTunnel | iOS 15+ |
+| **iOS** | Нативное приложение с PacketTunnel | iOS 15+ [не реализованно полноценно] |
 
 ---
 
