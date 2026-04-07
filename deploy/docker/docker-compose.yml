@@ -6,6 +6,7 @@ services:
     environment:
       - VPN_TOKEN=${VPN_TOKEN:-}
       - VK_CALL_LINK=${VK_CALL_LINK:-}
+      - ALSO_DIRECT=${ALSO_DIRECT:-}
       - TURN_CONNS=${TURN_CONNS:-16}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=${CAPTCHA_ENDPOINT:-http://captcha:8090}

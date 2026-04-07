@@ -32,6 +32,7 @@ type Config struct {
 	VKTokens   []string           // VK account tokens for authenticated TURN credential flow
 	Service    provider.Service   // Call service (VK, MAX, etc.) for relay-to-relay mode; nil = direct only
 	Services   []provider.Service // Multi-call pool: multiple services (nil = single link via Service)
+	AlsoDirect bool               // Also run direct DTLS listener alongside relay mode
 	UseTCP     bool               // Use TCP for TURN connections
 	NumConns   int                // Number of parallel connections (Telemost mode)
 	Logger     *slog.Logger
@@ -102,6 +103,29 @@ func (s *Server) Start(ctx context.Context) {
 	ctx, s.cancel = context.WithCancel(ctx)
 	go func() {
 		defer close(s.done)
+
+		// When AlsoDirect is set and we have relay config, run both modes in parallel.
+		if s.cfg.AlsoDirect && s.cfg.Service != nil {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				s.runDirectMode(ctx)
+			}()
+			go func() {
+				defer wg.Done()
+				if len(s.cfg.Services) > 1 {
+					s.runMultiRelayMode(ctx)
+				} else if _, ok := s.cfg.Service.(*telemost.Service); ok {
+					s.runTelemostMode(ctx)
+				} else {
+					s.runRelayMode(ctx)
+				}
+			}()
+			wg.Wait()
+			return
+		}
+
 		if len(s.cfg.Services) > 1 {
 			s.runMultiRelayMode(ctx)
 		} else if s.cfg.Service != nil {

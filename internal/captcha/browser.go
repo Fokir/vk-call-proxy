@@ -3,17 +3,23 @@ package captcha
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 )
 
-// BrowserSolver opens the captcha redirect_uri in the user's system browser
-// and listens on a local HTTP server for the success_token callback.
+// BrowserSolver opens the captcha in a Chrome window with a built-in forward
+// proxy so that VK domains are accessible even when blocked at the network level.
+// It injects a postMessage listener to capture the success_token automatically.
 type BrowserSolver struct{}
 
 func NewBrowserSolver() *BrowserSolver {
@@ -67,14 +73,28 @@ func (b *BrowserSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaCh
 		fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Captcha solved. You can close this tab.</h2></body></html>`)
 	})
 
-	srv := &http.Server{Handler: mux}
+	// Handler that supports both normal HTTP requests (captcha page, callback)
+	// and CONNECT tunneling (forward proxy for HTTPS to VK domains).
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			handleConnect(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	srv := &http.Server{Handler: handler}
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	url := fmt.Sprintf("http://%s/", addr)
-	slog.Info("opening captcha in system browser", "url", url)
-	if err := openBrowser(url); err != nil {
-		slog.Warn("failed to open browser, please open manually", "url", url, "err", err)
+	pageURL := fmt.Sprintf("http://%s/", addr)
+	proxyAddr := addr
+	slog.Info("opening captcha in browser with proxy", "url", pageURL, "proxy", proxyAddr)
+
+	if err := openChrome(pageURL, proxyAddr); err != nil {
+		// Fall back to system default browser without proxy.
+		slog.Warn("Chrome not found, opening default browser (VK may be unreachable)", "err", err)
+		openBrowser(pageURL)
 	}
 
 	select {
@@ -83,6 +103,105 @@ func (b *BrowserSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaCh
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// handleConnect implements HTTP CONNECT tunneling for the forward proxy.
+func handleConnect(w http.ResponseWriter, r *http.Request) {
+	target := r.Host
+	if !strings.Contains(target, ":") {
+		target += ":443"
+	}
+
+	dest, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		dest.Close()
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	client, _, err := hj.Hijack()
+	if err != nil {
+		dest.Close()
+		return
+	}
+
+	go func() {
+		defer dest.Close()
+		defer client.Close()
+		io.Copy(dest, client)
+	}()
+	go func() {
+		defer dest.Close()
+		defer client.Close()
+		io.Copy(client, dest)
+	}()
+}
+
+// openChrome tries to launch Chrome with the given proxy and URL.
+func openChrome(url, proxyAddr string) error {
+	chromePath, err := findChrome()
+	if err != nil {
+		return err
+	}
+
+	args := []string{
+		"--proxy-server=http://" + proxyAddr,
+		"--no-first-run",
+		"--disable-default-apps",
+		"--user-data-dir=" + chromeUserDataDir(),
+		url,
+	}
+
+	cmd := exec.Command(chromePath, args...)
+	return cmd.Start()
+}
+
+// findChrome locates the Chrome executable on the system.
+func findChrome() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		paths := []string{
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		}
+		for _, p := range paths {
+			if fileExists(p) {
+				return p, nil
+			}
+		}
+		return "", fmt.Errorf("chrome not found")
+	case "darwin":
+		p := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+		if fileExists(p) {
+			return p, nil
+		}
+		return "", fmt.Errorf("chrome not found")
+	case "linux":
+		for _, name := range []string{"google-chrome", "google-chrome-stable", "chromium-browser", "chromium"} {
+			if p, err := exec.LookPath(name); err == nil {
+				return p, nil
+			}
+		}
+		return "", fmt.Errorf("chrome not found")
+	default:
+		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+func chromeUserDataDir() string {
+	return filepath.Join(os.TempDir(), "callvpn-captcha-chrome")
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func openBrowser(url string) error {

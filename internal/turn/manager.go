@@ -135,9 +135,29 @@ func (m *Manager) SetInitialCredentials(creds *provider.Credentials) {
 	m.initialCreds = creds
 }
 
-// Allocate creates n new TURN allocations, each with independently fetched
-// credentials. Returns the successfully created allocations.
+// Allocate creates n new TURN allocations. Credentials are fetched once and
+// reused across all allocations (round-robin across TURN servers), so only
+// one captcha is triggered at most. TURN connections are created in parallel.
 func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
+	// Fetch credentials once — all N allocations reuse the same creds
+	// on different TURN servers (round-robin in createAllocationWithCreds).
+	baseCreds, err := m.fetchCredsForAllocation(ctx, 0)
+	if err != nil {
+		return nil, fmt.Errorf("all allocations failed, first error: %w", err)
+	}
+
+	// Create per-allocation creds with round-robin server selection.
+	credsList := make([]*provider.Credentials, n)
+	for i := 0; i < n; i++ {
+		c := *baseCreds
+		if len(baseCreds.Servers) > 1 {
+			srv := baseCreds.Servers[i%len(baseCreds.Servers)]
+			c.Host = srv.Host
+			c.Port = srv.Port
+		}
+		credsList[i] = &c
+	}
+
 	var (
 		mu     sync.Mutex
 		allocs []*Allocation
@@ -145,12 +165,12 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 		wg     sync.WaitGroup
 	)
 
-	for i := 0; i < n; i++ {
+	for i, creds := range credsList {
 		wg.Add(1)
-		go func(idx int) {
+		go func(idx int, creds *provider.Credentials) {
 			defer wg.Done()
 
-			alloc, err := m.createAllocation(ctx, idx)
+			alloc, err := m.createAllocationWithCreds(ctx, idx, creds)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -158,7 +178,7 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 				return
 			}
 			allocs = append(allocs, alloc)
-		}(i)
+		}(i, creds)
 	}
 	wg.Wait()
 
@@ -179,38 +199,38 @@ func (m *Manager) Allocate(ctx context.Context, n int) ([]*Allocation, error) {
 	return allocs, nil
 }
 
-func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
-	var creds *provider.Credentials
+// fetchCredsForAllocation returns credentials for allocation.
+func (m *Manager) fetchCredsForAllocation(ctx context.Context, _ int) (*provider.Credentials, error) {
 	if m.initialCreds != nil && !credentialsExpired(m.initialCreds) {
-		// Reuse credentials from initial join — avoids re-joining the conference.
 		c := *m.initialCreds
-		creds = &c
+		return &c, nil
 	} else if m.initialCreds != nil && m.creds != nil {
-		// Initial credentials expired but we have a credentials provider —
-		// fetch fresh ones. This happens during connection rotation when
-		// the original credentials have expired but the session is still alive.
 		m.logger.Info("initial credentials expired, fetching fresh ones for reconnect")
-		var err error
-		creds, err = m.creds.FetchCredentials(ctx)
+		creds, err := m.creds.FetchCredentials(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("%w: fetch fresh credentials: %v", ErrCredentialsExpired, err)
 		}
+		return creds, nil
 	} else if m.initialCreds != nil {
-		// Initial credentials expired and no provider — signal caller to rejoin.
 		return nil, fmt.Errorf("%w: username %s", ErrCredentialsExpired, m.initialCreds.Username)
-	} else {
-		// Each allocation gets fresh credentials (different anonymous identity).
-		var err error
-		creds, err = m.creds.FetchCredentials(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("fetch credentials: %w", err)
-		}
 	}
-	// Round-robin across available TURN servers to distribute load.
-	if len(creds.Servers) > 1 {
-		srv := creds.Servers[idx%len(creds.Servers)]
-		creds.Host = srv.Host
-		creds.Port = srv.Port
+	creds, err := m.creds.FetchCredentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetch credentials: %w", err)
+	}
+	return creds, nil
+}
+
+// createAllocationWithCreds creates a TURN allocation using pre-fetched credentials.
+func (m *Manager) createAllocationWithCreds(ctx context.Context, _ int, creds *provider.Credentials) (*Allocation, error) {
+	return m.dialAndAllocate(ctx, creds)
+}
+
+// createAllocation fetches credentials and creates a TURN allocation (used by AllocateGradual).
+func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, error) {
+	creds, err := m.fetchCredsForAllocation(ctx, idx)
+	if err != nil {
+		return nil, err
 	}
 	return m.dialAndAllocate(ctx, creds)
 }

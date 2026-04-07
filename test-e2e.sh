@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# E2E test script for call-vpn relay-to-relay mode
+# E2E test script for call-vpn relay-to-relay and direct modes
 #
-# Usage: ./test-e2e.sh [--n=4] [--links=1] [--monitor=5] [--download-url=URL] [--vk-token[=TOKEN]]
+# Usage: ./test-e2e.sh [--n=4] [--links=1] [--monitor=5] [--download-url=URL] [--vk-token[=TOKEN]] [--direct[=HOST:PORT]]
 #
 # Options:
 #   --n=N             Number of parallel connections per call (default: 4)
@@ -11,14 +11,20 @@
 #   --download-url=U  URL for large file download test (default: https://linkmeter.net)
 #   --vk-token        Use VK tokens from .env (VK_TOKEN_1, VK_TOKEN_2)
 #   --vk-token=TOKEN  Use specified VK token for both server and client
+#   --direct          Direct mode: server listens on UDP, client connects via TURN.
+#                     Uses DIRECT_SERVER from .env (e.g. 85.198.85.223:9000)
+#   --direct=H:P      Direct mode with explicit server address
+#   --listen=ADDR     Server listen address for direct mode (default: 0.0.0.0:9000)
 #
 # Examples:
-#   ./test-e2e.sh --n=1                     # anonymous: 1 call × 1 conn
-#   ./test-e2e.sh --n=4                     # anonymous: 1 call × 4 conns
-#   ./test-e2e.sh --n=1 --vk-token          # token from .env: 1 call × 1 conn
-#   ./test-e2e.sh --n=4 --vk-token=vk1.a.X  # explicit token: 1 call × 4 conns
-#   ./test-e2e.sh --n=4 --monitor=5         # anonymous + 5 min monitoring
-#   ./test-e2e.sh --n=2 --links=2           # 2 calls × 2 conns = 4 total
+#   ./test-e2e.sh --n=1                     # relay: 1 call × 1 conn
+#   ./test-e2e.sh --n=4                     # relay: 1 call × 4 conns
+#   ./test-e2e.sh --n=1 --vk-token          # relay + token from .env
+#   ./test-e2e.sh --n=4 --vk-token=vk1.a.X  # relay + explicit token
+#   ./test-e2e.sh --n=4 --monitor=5         # relay + 5 min monitoring
+#   ./test-e2e.sh --n=2 --links=2           # relay: 2 calls × 2 conns
+#   ./test-e2e.sh --direct                  # direct: server on :9000, addr from .env
+#   ./test-e2e.sh --direct=85.198.85.223:9000 --n=2  # direct: explicit addr
 #   ./test-e2e.sh --download-url=http://example.com/100MB.bin
 
 set -euo pipefail
@@ -35,6 +41,8 @@ USE_VK_TOKEN=""    # empty=anonymous, "env"=from .env, "vk1.a.X"=explicit
 VERBOSE=""
 STRIPING=""
 CAPTCHA_PORT=18090
+DIRECT_MODE=""         # empty=relay, "env"=from .env, "host:port"=explicit
+LISTEN_ADDR="0.0.0.0:9000"
 
 for arg in "$@"; do
   case $arg in
@@ -44,6 +52,9 @@ for arg in "$@"; do
     --download-url=*) DOWNLOAD_URL="${arg#*=}" ;;
     --vk-token=*) USE_VK_TOKEN="${arg#*=}" ;;
     --vk-token) USE_VK_TOKEN="env" ;;
+    --direct=*) DIRECT_MODE="${arg#*=}" ;;
+    --direct) DIRECT_MODE="env" ;;
+    --listen=*) LISTEN_ADDR="${arg#*=}" ;;
     --verbose) VERBOSE="--verbose" ;;
     --striping) STRIPING=1 ;;
   esac
@@ -62,7 +73,21 @@ while IFS='=' read -r key val; do
   export "$key=$val"
 done < <(grep -v '^\s*#' .env | grep '=')
 
-# Build link args based on --links=N
+# Resolve direct mode server address
+DIRECT_SERVER=""
+if [[ -n "$DIRECT_MODE" ]]; then
+  if [[ "$DIRECT_MODE" == "env" ]]; then
+    if [[ -z "${DIRECT_SERVER_ADDR:-}" ]]; then
+      echo "FATAL: --direct requires DIRECT_SERVER_ADDR in .env (e.g. 85.198.85.223:9000)"
+      exit 1
+    fi
+    DIRECT_SERVER="$DIRECT_SERVER_ADDR"
+  else
+    DIRECT_SERVER="$DIRECT_MODE"
+  fi
+fi
+
+# Build link args based on --links=N (needed for both relay and direct modes — client uses TURN)
 LINK_ARGS=""
 if [[ "$LINKS" -gt 1 ]]; then
   for i in $(seq 1 "$LINKS"); do
@@ -109,8 +134,14 @@ if [[ -n "$USE_VK_TOKEN" ]]; then
   fi
 fi
 
+TUNNEL_MODE="relay-to-relay"
+if [[ -n "$DIRECT_SERVER" ]]; then
+  TUNNEL_MODE="direct → $DIRECT_SERVER (listen $LISTEN_ADDR)"
+fi
+
 echo "=== E2E Test ==="
-echo "  Mode:        $AUTH_MODE"
+echo "  Tunnel:       $TUNNEL_MODE"
+echo "  Auth:         $AUTH_MODE"
 echo "  Connections:  $CONNS"
 echo "  Links:        $LINKS"
 echo "  Monitor:      ${MONITOR_MIN}m"
@@ -365,6 +396,10 @@ run_builtin_speedtest() {
   echo "================================="
 }
 
+SERVER_PID=""
+CLIENT_PID=""
+CAPTCHA_PID=""
+
 cleanup() {
   echo ""
   echo "[$(ts)] Shutting down gracefully..."
@@ -421,69 +456,112 @@ else
 fi
 sleep 1
 
-# --- Start captcha-service ---
-echo "[$(ts)] Starting captcha-service on port $CAPTCHA_PORT..."
-./callvpn-captcha${EXE} \
-  --port="$CAPTCHA_PORT" \
-  --max-concurrent=1 \
-  --solve-timeout=90s \
-  --request-timeout=2m \
-  $VERBOSE \
-  2>&1 | sed "s/^/  [captcha] /" &
-CAPTCHA_PID=$!
-sleep 2
+# --- Start captcha-service (not needed in direct mode — client uses interactive solver) ---
+CAPTCHA_ENDPOINT=""
+if [[ -z "$DIRECT_SERVER" ]]; then
+  echo "[$(ts)] Starting captcha-service on port $CAPTCHA_PORT..."
+  ./callvpn-captcha${EXE} \
+    --port="$CAPTCHA_PORT" \
+    --max-concurrent=1 \
+    --solve-timeout=90s \
+    --request-timeout=2m \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [captcha] /" &
+  CAPTCHA_PID=$!
+  sleep 2
 
-if ! kill -0 $CAPTCHA_PID 2>/dev/null; then
-  echo "FATAL: captcha-service died"
-  exit 1
+  if ! kill -0 $CAPTCHA_PID 2>/dev/null; then
+    echo "FATAL: captcha-service died"
+    exit 1
+  fi
+  echo "[$(ts)] Captcha-service running (PID $CAPTCHA_PID)"
+  CAPTCHA_ENDPOINT="http://127.0.0.1:$CAPTCHA_PORT"
 fi
-echo "[$(ts)] Captcha-service running (PID $CAPTCHA_PID)"
-
-CAPTCHA_ENDPOINT="http://127.0.0.1:$CAPTCHA_PORT"
 
 # --- Start server ---
 echo ""
 TOTAL_CONNS=$((CONNS * LINKS))
-echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
-  $LINK_ARGS \
-  --tcp=true \
-  --n="$CONNS" \
-  --token="$VPN_TOKEN" \
-  --captcha-endpoint="$CAPTCHA_ENDPOINT" \
-  $VK_TOKEN_ARGS_SERVER \
-  $VERBOSE \
-  2>&1 | sed "s/^/  [server] /" &
-SERVER_PID=$!
-sleep 12
+if [[ -n "$DIRECT_SERVER" ]]; then
+  echo "[$(ts)] Starting server in DIRECT mode (listen=$LISTEN_ADDR)..."
+  VK_CALL_LINK="" ./callvpn-server${EXE} \
+    --listen="$LISTEN_ADDR" \
+    --token="$VPN_TOKEN" \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [server] /" &
+  SERVER_PID=$!
+  sleep 3
+else
+  echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
+  ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
+    $LINK_ARGS \
+    --tcp=true \
+    --n="$CONNS" \
+    --token="$VPN_TOKEN" \
+    --captcha-endpoint="$CAPTCHA_ENDPOINT" \
+    $VK_TOKEN_ARGS_SERVER \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [server] /" &
+  SERVER_PID=$!
+  sleep 12
+fi
 
-if ! kill -0 $SERVER_PID 2>/dev/null; then
-  echo "FATAL: server died"
-  exit 1
+if $IS_WINDOWS; then
+  # On Windows/MSYS, kill -0 is unreliable with piped processes.
+  # Check by process name instead.
+  if ! tasklist //FI "IMAGENAME eq callvpn-server${EXE}" 2>/dev/null | grep -qi "callvpn-server"; then
+    echo "FATAL: server died"
+    exit 1
+  fi
+else
+  if ! kill -0 $SERVER_PID 2>/dev/null; then
+    echo "FATAL: server died"
+    exit 1
+  fi
 fi
 echo "[$(ts)] Server running (PID $SERVER_PID)"
 
 # --- Start client ---
 echo ""
-echo "[$(ts)] Starting client (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
-  $LINK_ARGS \
-  --n="$CONNS" \
-  --tcp=true \
-  --token="$VPN_TOKEN" \
-  --socks5-port=$SOCKS_PORT \
-  --http-port=$HTTP_PORT \
-  --captcha-endpoint="$CAPTCHA_ENDPOINT" \
-  $VK_TOKEN_ARGS_CLIENT \
-  $VERBOSE \
-  2>&1 | sed "s/^/  [client] /" &
-CLIENT_PID=$!
+if [[ -n "$DIRECT_SERVER" ]]; then
+  echo "[$(ts)] Starting client in DIRECT mode (server=$DIRECT_SERVER, n=$CONNS)..."
+  echo "[$(ts)] Captcha will open in browser for manual solving"
+  ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
+    $LINK_ARGS \
+    --server="$DIRECT_SERVER" \
+    --n="$CONNS" \
+    --tcp=true \
+    --token="$VPN_TOKEN" \
+    --socks5-port=$SOCKS_PORT \
+    --http-port=$HTTP_PORT \
+    $VK_TOKEN_ARGS_CLIENT \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [client] /" &
+  CLIENT_PID=$!
+else
+  echo "[$(ts)] Starting client (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
+  ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
+    $LINK_ARGS \
+    --n="$CONNS" \
+    --tcp=true \
+    --token="$VPN_TOKEN" \
+    --socks5-port=$SOCKS_PORT \
+    --http-port=$HTTP_PORT \
+    --captcha-endpoint="$CAPTCHA_ENDPOINT" \
+    $VK_TOKEN_ARGS_CLIENT \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [client] /" &
+  CLIENT_PID=$!
+fi
 
 # --- Wait for proxy ---
 echo ""
+PROXY_ATTEMPTS=90
+if [[ -n "$DIRECT_SERVER" ]]; then
+  PROXY_ATTEMPTS=180  # 6 min — allow time for manual captcha solving
+fi
 echo "[$(ts)] Waiting for proxy (socks5://127.0.0.1:$SOCKS_PORT)..."
 READY=0
-for i in $(seq 1 90); do
+for i in $(seq 1 $PROXY_ATTEMPTS); do
   if ! kill -0 $CLIENT_PID 2>/dev/null; then
     echo "FATAL: client died"
     exit 1
@@ -499,7 +577,7 @@ for i in $(seq 1 90); do
 done
 
 if [[ $READY -ne 1 ]]; then
-  echo "FATAL: proxy not ready after 3 minutes"
+  echo "FATAL: proxy not ready after $((PROXY_ATTEMPTS*2))s"
   exit 1
 fi
 
@@ -512,8 +590,10 @@ run_download_test
 # --- Max throughput test ---
 run_max_throughput_test
 
-# --- Built-in speed test ---
-run_builtin_speedtest
+# --- Built-in speed test (skip in direct mode — protocol mismatch) ---
+if [[ -z "$DIRECT_SERVER" ]]; then
+  run_builtin_speedtest
+fi
 
 # --- Monitoring (optional) ---
 if [[ $MONITOR_MIN -gt 0 ]]; then

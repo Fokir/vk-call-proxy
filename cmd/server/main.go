@@ -38,6 +38,7 @@ func main() {
 	var callLinks stringSlice
 	flag.Var(&callLinks, "link", "call link ID for relay mode (repeatable for multi-call pool, env: VK_CALL_LINK)")
 	useTCP := flag.Bool("tcp", true, "use TCP for TURN connections (relay mode)")
+	alsoDirect := flag.Bool("direct", false, "also accept direct DTLS connections on --listen addr alongside relay mode (env: ALSO_DIRECT=1)")
 	numConns := flag.Int("n", 1, "number of parallel connections per call")
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
@@ -78,6 +79,11 @@ func main() {
 	if *captchaEndpoint == "" {
 		*captchaEndpoint = os.Getenv("CAPTCHA_ENDPOINT")
 	}
+	if !*alsoDirect {
+		if v := os.Getenv("ALSO_DIRECT"); v == "1" || v == "true" {
+			*alsoDirect = true
+		}
+	}
 
 	logLevel := slog.LevelInfo
 	if *verbose {
@@ -89,6 +95,7 @@ func main() {
 		ListenAddr: *listenAddr,
 		AuthToken:  *authToken,
 		VKTokens:   []string(vkTokens),
+		AlsoDirect: *alsoDirect,
 		UseTCP:     *useTCP,
 		NumConns:   *numConns,
 		Logger:     logger,
