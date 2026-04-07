@@ -11,8 +11,8 @@ android {
         applicationId = "com.callvpn.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.19.8"
+        versionCode = 5
+        versionName = "0.21.1"
     }
 
     buildTypes {
