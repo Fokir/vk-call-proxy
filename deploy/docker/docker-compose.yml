@@ -25,6 +25,7 @@ services:
 
   captcha:
     image: ghcr.io/fokir/vk-call-proxy-captcha:${IMAGE_TAG:-latest}
+    init: true
     environment:
       - MAX_CONCURRENT=${CAPTCHA_MAX_CONCURRENT:-1}
     restart: unless-stopped

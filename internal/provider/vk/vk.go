@@ -422,7 +422,39 @@ func okJoinConference(ctx context.Context, client *http.Client, ua string, link,
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	if len(resp.TurnServer.URLs) == 0 {
-		return nil, fmt.Errorf("no TURN URLs in response: %s", string(body))
+		const maxRetries = 10
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			slog.Warn("no TURN URLs in response, retrying...", "attempt", attempt, "max", maxRetries)
+			delay := min(time.Duration(attempt)*5*time.Second, 15*time.Second)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("no TURN URLs in response (cancelled after %d retries): %s", attempt-1, string(body))
+			case <-time.After(delay):
+			}
+			body, err = httpPost(ctx, client, ua, "https://calls.okcdn.ru/fb.do", data)
+			if err != nil {
+				return nil, err
+			}
+			resp = struct {
+				TurnServer struct {
+					Username   string   `json:"username"`
+					Credential string   `json:"credential"`
+					URLs       []string `json:"urls"`
+				} `json:"turn_server"`
+				Endpoint  string `json:"endpoint"`
+				ID        string `json:"id"`
+				DeviceIdx int    `json:"device_idx"`
+			}{}
+			if err := json.Unmarshal(body, &resp); err != nil {
+				return nil, fmt.Errorf("parse response: %w", err)
+			}
+			if len(resp.TurnServer.URLs) > 0 {
+				break
+			}
+		}
+		if len(resp.TurnServer.URLs) == 0 {
+			return nil, fmt.Errorf("no TURN URLs in response after %d retries: %s", maxRetries, string(body))
+		}
 	}
 
 	slog.Info("TURN server URLs from VK", "urls", resp.TurnServer.URLs, "count", len(resp.TurnServer.URLs))

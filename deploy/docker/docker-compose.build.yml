@@ -30,6 +30,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.captcha
+    init: true
     restart: unless-stopped
     deploy:
       resources:
