@@ -5,10 +5,20 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 
 class ExcludedAppsManager(context: Context) {
+    enum class Mode { BLACKLIST, WHITELIST }
     private val prefs: SharedPreferences =
         context.getSharedPreferences("callvpn", Context.MODE_PRIVATE)
 
-    fun getExcludedPackages(): Set<String> {
+    fun getMode(): Mode {
+        val v = prefs.getString(KEY_MODE, null)
+        return if (v == "whitelist") Mode.WHITELIST else Mode.BLACKLIST
+    }
+
+    fun setMode(mode: Mode) {
+        prefs.edit().putString(KEY_MODE, if (mode == Mode.WHITELIST) "whitelist" else "blacklist").apply()
+    }
+
+    fun getSelectedPackages(): Set<String> {
         val json = prefs.getString(KEY_EXCLUDED, null)
             ?: return DEFAULT_PACKAGES.toSet()
         return try {
@@ -17,24 +27,29 @@ class ExcludedAppsManager(context: Context) {
             for (i in 0 until arr.length()) {
                 set.add(arr.getString(i))
             }
-            // Always include forced packages
-            set + FORCED_PACKAGES
+            if (getMode() == Mode.BLACKLIST) set + FORCED_PACKAGES else set - FORCED_PACKAGES
         } catch (_: Exception) {
             DEFAULT_PACKAGES.toSet()
         }
     }
 
-    fun setExcludedPackages(packages: Set<String>) {
+    /** Backward-compatible alias used by CallVpnService. */
+    fun getExcludedPackages(): Set<String> = getSelectedPackages()
+
+    fun setSelectedPackages(packages: Set<String>) {
         val arr = JSONArray()
-        // Always include forced packages
-        (packages + FORCED_PACKAGES).forEach { arr.put(it) }
+        val adjusted = if (getMode() == Mode.BLACKLIST) packages + FORCED_PACKAGES else packages - FORCED_PACKAGES
+        adjusted.forEach { arr.put(it) }
         prefs.edit().putString(KEY_EXCLUDED, arr.toString()).apply()
     }
+
+    fun setExcludedPackages(packages: Set<String>) = setSelectedPackages(packages)
 
     fun isInitialized(): Boolean = prefs.contains(KEY_EXCLUDED)
 
     companion object {
         private const val KEY_EXCLUDED = "excluded_packages_json"
+        private const val KEY_MODE = "apps_filter_mode"
 
         /** Apps that MUST always be excluded — user cannot include them in VPN. */
         val FORCED_PACKAGES = setOf(

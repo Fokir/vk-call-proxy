@@ -277,12 +277,23 @@ class CallVpnService : VpnService() {
                 .setMtu(1280)
                 .setBlocking(true)
 
-            // Exclude apps selected by the user from VPN routing.
-            val excludedApps = ExcludedAppsManager(this@CallVpnService).getExcludedPackages()
-            for (pkg in excludedApps) {
-                try {
-                    builder.addDisallowedApplication(pkg)
-                } catch (_: Exception) { /* package not installed, skip */ }
+            // Apply per-app VPN routing (blacklist or whitelist mode).
+            val appsManager = ExcludedAppsManager(this@CallVpnService)
+            val selectedApps = appsManager.getSelectedPackages()
+            if (appsManager.getMode() == ExcludedAppsManager.Mode.WHITELIST) {
+                // Whitelist: only selected apps go through VPN.
+                for (pkg in selectedApps) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                    } catch (_: Exception) { /* package not installed, skip */ }
+                }
+            } else {
+                // Blacklist: selected apps are excluded from VPN.
+                for (pkg in selectedApps) {
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                    } catch (_: Exception) { /* package not installed, skip */ }
+                }
             }
 
             val vpn = builder.establish()

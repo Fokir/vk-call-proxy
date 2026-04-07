@@ -1153,8 +1153,9 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
 
     var allApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
-    var excludedPackages by remember { mutableStateOf(excludedAppsManager.getExcludedPackages()) }
+    var selectedPackages by remember { mutableStateOf(excludedAppsManager.getSelectedPackages()) }
     var searchQuery by remember { mutableStateOf("") }
+    var isWhitelist by remember { mutableStateOf(excludedAppsManager.getMode() == ExcludedAppsManager.Mode.WHITELIST) }
 
     // Load installed apps in background
     LaunchedEffect(Unit) {
@@ -1206,20 +1207,48 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
             Column(modifier = Modifier.fillMaxSize()) {
                 // Header
                 Text(
-                    text = "Исключённые приложения",
+                    text = if (isWhitelist) "Разрешённые приложения" else "Исключённые приложения",
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.padding(start = 24.dp, top = 24.dp, end = 24.dp, bottom = 8.dp)
                 )
                 Text(
-                    text = "Отмеченные приложения не используют VPN",
+                    text = if (isWhitelist) "Только отмеченные приложения используют VPN"
+                           else "Отмеченные приложения не используют VPN",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 24.dp)
                 )
 
-                Spacer(modifier = Modifier.height(12.dp))
+                // Mode toggle
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (isWhitelist) "Белый список" else "Чёрный список",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = isWhitelist,
+                        onCheckedChange = {
+                            isWhitelist = it
+                            selectedPackages = emptySet()
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = Color(0xFF4CAF50)
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
 
                 // Search field
                 OutlinedTextField(
@@ -1258,16 +1287,23 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
                     ) {
                         items(filteredApps, key = { it.packageName }) { app ->
                             val isForced = app.packageName in ExcludedAppsManager.FORCED_PACKAGES
-                            val isExcluded = app.packageName in excludedPackages
+                            // In blacklist: forced apps are always checked (excluded) and disabled.
+                            // In whitelist: forced apps are always unchecked (not allowed) and disabled.
+                            val isLocked = isForced
+                            val isSelected = if (isForced) {
+                                !isWhitelist // blacklist → checked, whitelist → unchecked
+                            } else {
+                                app.packageName in selectedPackages
+                            }
 
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable(enabled = !isForced) {
-                                        excludedPackages = if (isExcluded) {
-                                            excludedPackages - app.packageName
+                                    .clickable(enabled = !isLocked) {
+                                        selectedPackages = if (isSelected) {
+                                            selectedPackages - app.packageName
                                         } else {
-                                            excludedPackages + app.packageName
+                                            selectedPackages + app.packageName
                                         }
                                     }
                                     .padding(horizontal = 16.dp, vertical = 4.dp),
@@ -1287,15 +1323,15 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
                                     )
                                 }
                                 Checkbox(
-                                    checked = isExcluded,
-                                    onCheckedChange = if (isForced) null else { checked ->
-                                        excludedPackages = if (checked) {
-                                            excludedPackages + app.packageName
+                                    checked = isSelected,
+                                    onCheckedChange = if (isLocked) null else { checked ->
+                                        selectedPackages = if (checked) {
+                                            selectedPackages + app.packageName
                                         } else {
-                                            excludedPackages - app.packageName
+                                            selectedPackages - app.packageName
                                         }
                                     },
-                                    enabled = !isForced,
+                                    enabled = !isLocked,
                                     colors = CheckboxDefaults.colors(
                                         checkedColor = Color(0xFF4CAF50),
                                         checkmarkColor = Color.White
@@ -1318,7 +1354,11 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
                     }
                     Button(
                         onClick = {
-                            excludedAppsManager.setExcludedPackages(excludedPackages)
+                            excludedAppsManager.setMode(
+                                if (isWhitelist) ExcludedAppsManager.Mode.WHITELIST
+                                else ExcludedAppsManager.Mode.BLACKLIST
+                            )
+                            excludedAppsManager.setSelectedPackages(selectedPackages)
                             onDismiss()
                         },
                         colors = ButtonDefaults.buttonColors(
