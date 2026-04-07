@@ -428,7 +428,7 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	t.logger.Info("tunnel connected (direct)",
 		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
-	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
+	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups, sessionID: sessionID}, nil
 }
 
 // deduplicateTokens removes duplicate VK tokens, logging a warning for each duplicate.
