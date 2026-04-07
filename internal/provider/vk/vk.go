@@ -24,7 +24,7 @@ import (
 const (
 	vkClientID     = "6287487"
 	vkClientSecret = "QbYic1K3lEV5kTGiqlq2"
-	vkAPIVersion   = "5.274"
+	vkAPIVersion   = "5.275"
 	okAppKey       = "CGMMEJLGDIHBABABA"
 	httpTimeout    = 20 * time.Second
 )
@@ -211,7 +211,7 @@ func vkMessagesToken(ctx context.Context, client *http.Client, ua string) (strin
 		"version":       {"1"},
 		"app_id":        {vkClientID},
 	}
-	body, err := httpPost(ctx, client, ua, "https://login.vk.ru/?act=get_anonym_token", data)
+	body, err := httpPost(ctx, client, ua, "https://login.vk.com/?act=get_anonym_token", data)
 	if err != nil {
 		return "", err
 	}
@@ -513,7 +513,7 @@ func checkVKRateLimit(body []byte) *provider.RateLimitError {
 	return nil
 }
 
-// checkLoginRateLimit parses login.vk.ru response for auth flood errors.
+// checkLoginRateLimit parses login.vk.com response for auth flood errors.
 func checkLoginRateLimit(body []byte) *provider.RateLimitError {
 	var resp struct {
 		Error     string `json:"error"`

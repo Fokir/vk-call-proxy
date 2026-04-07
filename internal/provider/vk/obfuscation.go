@@ -3,15 +3,12 @@ package vk
 import (
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 )
 
-// joinParamTemplates contain the WebSocket query parameters VK expects.
-// %d is replaced with the actual deviceIdx from the VK join response.
-var joinParamTemplates = []string{
-	"platform=WEB&appVersion=2.8.9&version=5&device=browser&clientType=SDK_JS&deviceIdx=%d",
-	"platform=WEB&appVersion=2.8.7&version=5&device=browser&clientType=SDK_JS&deviceIdx=%d",
-	"platform=WEB&appVersion=2.7.4&version=5&device=browser&clientType=SDK_WEB&deviceIdx=%d",
-}
+// joinParamTemplate is the WebSocket query parameter string VK expects.
+// Placeholders: %d = deviceIdx, %s = URL-encoded user agent.
+const joinParamTemplate = "platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2F7F&clientType=VK&tgt=join&compression=deflate-raw&deviceIdx=%d&ua=%s"
 
 var userAgentPool = []string{
 	// Chrome 135 — Windows 10/11
@@ -31,8 +28,8 @@ var userAgentPool = []string{
 }
 
 func joinParamsWithDeviceIdx(deviceIdx int) string {
-	tmpl := joinParamTemplates[rand.IntN(len(joinParamTemplates))]
-	return fmt.Sprintf(tmpl, deviceIdx)
+	ua := randomUserAgent()
+	return fmt.Sprintf(joinParamTemplate, deviceIdx, url.QueryEscape(ua))
 }
 
 func randomUserAgent() string {
