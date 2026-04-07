@@ -22,7 +22,7 @@
 
 ### Как это работает
 
-Система поддерживает два режима:
+Система поддерживает три режима:
 
 **Direct mode** — клиент подключается к серверу через ██ ████ █████:
 
@@ -39,6 +39,13 @@
 3. Обмениваются relay-адресами через **██ WebSocket signaling** (зашифровано AES-256-GCM)
 4. Устанавливают DTLS relay-to-relay соединения между TURN-серверами ██
 5. Мультиплексор объединяет всё в туннель
+
+**Dual mode (direct + relay)** — сервер одновременно принимает оба типа подключений:
+
+1. Сервер слушает на UDP-порту **и** подключается к ██-звонку
+2. Direct-клиенты подключаются через TURN → `:9000/udp`
+3. Relay-клиенты подключаются через ██-инфраструктуру
+4. Включается флагом `--direct` или env `ALSO_DIRECT=1`
 
 ### Поток данных
 
@@ -98,6 +105,23 @@ docker compose up -d
 
 > При указании `VK_CALL_LINK` сервер автоматически переключается в relay-to-relay mode.
 > Открытый UDP-порт **не нужен** — всё проходит через ██-инфраструктуру.
+
+#### Dual mode — оба режима одновременно
+
+```env
+# .env
+IMAGE_TAG=latest
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
+ALSO_DIRECT=1
+LISTEN_PORT=9000
+```
+
+```bash
+docker compose up -d
+```
+
+> С `ALSO_DIRECT=1` сервер принимает и direct-подключения на `:9000/udp`, и relay-клиентов через ██-звонок.
 
 > Docker Compose автоматически запускает **captcha-сервис** для решения ██ капчи.
 > Подробнее: [deploy/docker/README.md](deploy/docker/README.md).
@@ -182,11 +206,12 @@ gomobile bind -target=ios -o mobile/ios/Bind.xcframework ./mobile/bind
 |:-----|:-------------|:---------|
 | `--listen` | `0.0.0.0:9000` | UDP-адрес DTLS listener (direct mode) |
 | `--link` | *(пусто)* | ID ссылки ██-звонка (relay-to-relay mode) |
+| `--direct` | `false` | Также слушать на `--listen` в relay mode (env: `ALSO_DIRECT=1`) |
 | `--token` | *(пусто)* | Токен аутентификации клиентов (env: `VPN_TOKEN`) |
 | `--n` | `4` | Количество TURN-соединений (relay mode) |
 | `--tcp` | `true` | TCP для TURN (relay mode) |
 
-Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `SIREN_SLACK_WEBHOOK` — Slack-алерты.
+Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `ALSO_DIRECT=1` — dual mode, `SIREN_SLACK_WEBHOOK` — Slack-алерты.
 
 ### Клиент
 

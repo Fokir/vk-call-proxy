@@ -48,6 +48,7 @@ services:
     environment:
       - VPN_TOKEN=${VPN_TOKEN:-}
       - VK_CALL_LINK=${VK_CALL_LINK:-}
+      - ALSO_DIRECT=${ALSO_DIRECT:-}
       - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=http://captcha:8090
@@ -139,7 +140,7 @@ Captcha-сервис использует ~200-500 MB RAM на время реш
 
 ## Режимы работы
 
-Сервер поддерживает два режима. Режим определяется автоматически по наличию переменной `VK_CALL_LINK`.
+Сервер поддерживает три режима. Режим определяется автоматически по наличию переменных `VK_CALL_LINK` и `ALSO_DIRECT`.
 
 ### Direct mode (по умолчанию)
 
@@ -163,6 +164,21 @@ VPN_TOKEN=your-secret-token
 Клиент и сервер join'ят один ██████████. Обмен адресами идёт через ██ WebSocket signaling (зашифрован AES-256-GCM при наличии `VPN_TOKEN`). Трафик проходит через два ██ ████ █████.
 
 **Требования:** ██ call link. Открытый порт **не нужен**.
+
+### Dual mode (direct + relay одновременно)
+
+Сервер одновременно слушает на UDP-порту и подключается к ██-звонку. Direct-клиенты подключаются через TURN → `:9000/udp`, relay-клиенты — через ██-инфраструктуру.
+
+**Требования:** открытый UDP-порт + ██ call link.
+
+```env
+# .env
+IMAGE_TAG=latest
+LISTEN_PORT=9000
+VK_CALL_LINK=AbCdEf123456
+VPN_TOKEN=your-secret-token
+ALSO_DIRECT=1
+```
 
 ```env
 # .env
@@ -204,6 +220,7 @@ TURN_CONNS=4
 | `LISTEN_PORT` | `9000` | UDP-порт, открытый на хост-машине (только direct mode) |
 | `VPN_TOKEN` | *(пусто)* | Токен аутентификации клиентов (рекомендуется) |
 | `VK_CALL_LINK` | *(пусто)* | ID ссылки ██-звонка. Если задан — включается relay-to-relay mode |
+| `ALSO_DIRECT` | *(пусто)* | `1` — также слушать на UDP-порту в relay mode (dual mode) |
 | `TURN_CONNS` | `4` | Количество TURN-соединений (только relay mode) |
 | `SIREN_SLACK_WEBHOOK` | *(пусто)* | URL Slack webhook для алертов мониторинга |
 | `CAPTCHA_ENDPOINT` | `http://captcha:8090` | URL captcha-сервиса (auto-configured в docker-compose) |
