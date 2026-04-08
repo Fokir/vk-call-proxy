@@ -104,8 +104,12 @@ func main() {
 	// Enable relay-to-relay mode with the appropriate service(s).
 	if len(callLinks) > 0 {
 		var vkOpts []vk.Option
-		if *captchaEndpoint != "" {
-			vkOpts = append(vkOpts, vk.WithCaptchaSolver(captcha.NewRemoteSolver(*captchaEndpoint)))
+		{
+			solvers := []provider.CaptchaSolver{captcha.NewDirectSolver()}
+			if *captchaEndpoint != "" {
+				solvers = append(solvers, captcha.NewRemoteSolver(*captchaEndpoint))
+			}
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(captcha.NewChainSolver(solvers...)))
 		}
 		services := make([]provider.Service, len(callLinks))
 		for i, link := range callLinks {
