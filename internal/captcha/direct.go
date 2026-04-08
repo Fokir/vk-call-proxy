@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,8 +60,8 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	adFp := randomAdFp(r)
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 
-	// Step 0: Fetch the captcha page to extract captcha_settings for slider.
-	captchaSettings, err := fetchSliderSettings(ctx, client, ua, redirectURI)
+	// Step 0: Fetch the captcha page to extract captcha_settings and PoW params.
+	pageData, err := fetchCaptchaPage(ctx, client, ua, redirectURI)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrNotSlider, err)
 	}
@@ -84,7 +85,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"session_token":    {sessionToken},
 		"domain":           {domain},
 		"adFp":             {adFp},
-		"captcha_settings": {captchaSettings},
+		"captcha_settings": {pageData.sliderSettings},
 		"access_token":     {""},
 	})
 	if err != nil {
@@ -146,8 +147,11 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	downlink := generateConnectionDownlink(r)
 	downlinkJSON, _ := json.Marshal(downlink)
 
-	// Proof-of-work hash.
-	hash, debugInfo := computeProofOfWork(sessionToken, r)
+	// Proof-of-work hash (SHA-256 with leading zeros, computed from HTML page params).
+	hash := computeProofOfWork(pageData.powInput, pageData.powDifficulty)
+
+	// debug_info is a hardcoded constant in VK's JS.
+	const debugInfo = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 
 	checkResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.check", url.Values{
 		"session_token":      {sessionToken},
@@ -207,38 +211,58 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	return checkResult.Response.SuccessToken, nil
 }
 
-// fetchSliderSettings fetches the captcha HTML page and extracts
-// the captcha_settings value for the slider type.
-func fetchSliderSettings(ctx context.Context, client *http.Client, ua, redirectURI string) (string, error) {
+// captchaPageData holds data extracted from the captcha HTML page.
+type captchaPageData struct {
+	sliderSettings string // captcha_settings for slider type
+	powInput       string // proof-of-work input string
+	powDifficulty  int    // number of leading hex zeros required
+}
+
+// fetchCaptchaPage fetches the captcha HTML page and extracts
+// slider settings and proof-of-work parameters.
+func fetchCaptchaPage(ctx context.Context, client *http.Client, ua, redirectURI string) (*captchaPageData, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", redirectURI, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", ua)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// Extract slider captcha_settings directly from the HTML.
-	// The JSON has: {"type":"slider","settings":"<value>"}
-	re := regexp.MustCompile(`"type"\s*:\s*"slider"\s*,\s*"settings"\s*:\s*"([^"]+)"`)
-	match := re.FindSubmatch(body)
-	if match == nil {
-		return "", fmt.Errorf("slider captcha_settings not found in captcha page")
+	data := &captchaPageData{powDifficulty: 2} // default difficulty
+
+	// Extract slider captcha_settings: {"type":"slider","settings":"<value>"}
+	reSettings := regexp.MustCompile(`"type"\s*:\s*"slider"\s*,\s*"settings"\s*:\s*"([^"]+)"`)
+	if match := reSettings.FindSubmatch(body); match != nil {
+		data.sliderSettings = strings.ReplaceAll(string(match[1]), `\/`, `/`)
+	} else {
+		return nil, fmt.Errorf("slider captcha_settings not found in captcha page")
 	}
 
-	settings := string(match[1])
-	// Unescape JSON string (e.g. \/ → /).
-	settings = strings.ReplaceAll(settings, `\/`, `/`)
-	return settings, nil
+	// Extract PoW input: const powInput = "...";
+	rePow := regexp.MustCompile(`powInput\s*=\s*"([^"]+)"`)
+	if match := rePow.FindSubmatch(body); match != nil {
+		data.powInput = string(match[1])
+	}
+
+	// Extract PoW difficulty: const difficulty = N;
+	reDiff := regexp.MustCompile(`difficulty\s*=\s*(\d+)`)
+	if match := reDiff.FindSubmatch(body); match != nil {
+		if d, err := strconv.Atoi(string(match[1])); err == nil {
+			data.powDifficulty = d
+		}
+	}
+
+	return data, nil
 }
 
 // generateSliderCursor generates realistic cursor movement for slider interaction.
@@ -280,7 +304,7 @@ func generateSliderCursor(r *rand.Rand) []cursorPoint {
 }
 
 func vkCaptchaPost(ctx context.Context, client *http.Client, ua, method string, data url.Values) ([]byte, error) {
-	endpoint := fmt.Sprintf("https://api.vk.ru/method/%s?v=5.275", method)
+	endpoint := fmt.Sprintf("https://api.vk.com/method/%s?v=5.131", method)
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
@@ -390,26 +414,22 @@ func randomAdFp(r *rand.Rand) string {
 	return string(b)
 }
 
-// computeProofOfWork finds a SHA-256 hash with 3 leading hex zeros (12-bit difficulty).
-// Based on HAR observation: hash starts with "0003..." (3 leading zero hex digits).
-func computeProofOfWork(sessionToken string, r *rand.Rand) (string, string) {
-	prefix := sessionToken
-	if len(prefix) > 64 {
-		prefix = prefix[:64]
+// computeProofOfWork computes SHA-256(powInput + nonce) until the hash
+// starts with `difficulty` leading hex zeros. Matches VK's JS implementation:
+//   hash = SHA-256(powInput + nonceString)
+//   while (!hash.startsWith("0".repeat(difficulty)))
+func computeProofOfWork(powInput string, difficulty int) string {
+	if powInput == "" || difficulty <= 0 {
+		return ""
 	}
-
-	for i := 0; i < 10_000_000; i++ {
-		nonce := fmt.Sprintf("%s:%d", prefix, i)
-		h := sha256.Sum256([]byte(nonce))
+	prefix := strings.Repeat("0", difficulty)
+	for nonce := 1; nonce < 100_000_000; nonce++ {
+		data := powInput + strconv.Itoa(nonce)
+		h := sha256.Sum256([]byte(data))
 		hexStr := hex.EncodeToString(h[:])
-		// Check for 3 leading hex zeros (like "000...")
-		if hexStr[:3] == "000" {
-			debugHash := sha256.Sum256([]byte(fmt.Sprintf("%d", i)))
-			return hexStr, hex.EncodeToString(debugHash[:])
+		if strings.HasPrefix(hexStr, prefix) {
+			return hexStr
 		}
 	}
-
-	// Fallback — unlikely to reach.
-	h := sha256.Sum256([]byte(prefix))
-	return hex.EncodeToString(h[:]), hex.EncodeToString(h[:])
+	return ""
 }
