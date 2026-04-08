@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/captcha"
+	"github.com/call-vpn/call-vpn/internal/provider"
 )
 
 type solveRequest struct {
@@ -34,6 +35,7 @@ type statsResponse struct {
 }
 
 type server struct {
+	solver         provider.CaptchaSolver
 	sem            chan struct{}
 	solveTimeout   time.Duration
 	requestTimeout time.Duration
@@ -61,6 +63,10 @@ func main() {
 	}
 
 	s := &server{
+		solver: captcha.NewChainSolver(
+			captcha.NewDirectSolver(),
+			captcha.NewChromedpSolver(),
+		),
 		sem:            make(chan struct{}, *maxConcurrent),
 		solveTimeout:   *solveTimeout,
 		requestTimeout: *requestTimeout,
@@ -136,7 +142,7 @@ func (s *server) handleSolve(w http.ResponseWriter, r *http.Request) {
 	defer solveCancel()
 
 	start := time.Now()
-	token, err := captcha.SolveCaptchaURI(solveCtx, req.RedirectURI)
+	result, err := s.solver.SolveCaptcha(solveCtx, &provider.CaptchaChallenge{RedirectURI: req.RedirectURI})
 	dur := time.Since(start)
 
 	if err != nil {
@@ -151,10 +157,10 @@ func (s *server) handleSolve(w http.ResponseWriter, r *http.Request) {
 	s.totalDurNs.Add(dur.Nanoseconds())
 
 	if s.verbose {
-		log.Printf("solved (%v): %s…", dur.Round(time.Millisecond), token[:min(16, len(token))])
+		log.Printf("solved (%v): %s…", dur.Round(time.Millisecond), result.SuccessToken[:min(16, len(result.SuccessToken))])
 	}
 
-	writeJSON(w, http.StatusOK, solveResponse{SuccessToken: token})
+	writeJSON(w, http.StatusOK, solveResponse{SuccessToken: result.SuccessToken})
 }
 
 func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
