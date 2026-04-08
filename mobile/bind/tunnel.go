@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/call-vpn/call-vpn/internal/captcha"
 	"github.com/call-vpn/call-vpn/internal/client"
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/mux"
@@ -271,8 +272,12 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
 		var vkOpts []vk.Option
-		if t.captchaCb != nil {
-			vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: t.captchaCb}))
+		{
+			solvers := []provider.CaptchaSolver{captcha.NewDirectSolver()}
+			if t.captchaCb != nil {
+				solvers = append(solvers, &callbackSolver{cb: t.captchaCb})
+			}
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(captcha.NewChainSolver(solvers...)))
 		}
 		t.svc = vk.NewService(cleanLinks[0], vkOpts...)
 	}
