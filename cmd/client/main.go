@@ -99,9 +99,15 @@ func main() {
 	// Create captcha solver.
 	var solver provider.CaptchaSolver
 	if *captchaEndpoint != "" {
-		solver = captcha.NewRemoteSolver(*captchaEndpoint)
+		solver = captcha.NewChainSolver(
+			captcha.NewDirectSolver(),
+			captcha.NewRemoteSolver(*captchaEndpoint),
+		)
 	} else {
-		solver = captcha.NewInteractiveSolver()
+		solver = captcha.NewChainSolver(
+			captcha.NewDirectSolver(),
+			captcha.NewInteractiveSolver(),
+		)
 	}
 
 	// Create call service providers (auto-detect from link).
