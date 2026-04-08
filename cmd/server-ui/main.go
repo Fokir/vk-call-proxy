@@ -29,7 +29,10 @@ import (
 var (
 	captchaMu       sync.Mutex
 	captchaHeadless bool
-	captchaSolver   provider.CaptchaSolver = captcha.NewInteractiveSolver()
+	captchaSolver   provider.CaptchaSolver = captcha.NewChainSolver(
+		captcha.NewDirectSolver(),
+		captcha.NewInteractiveSolver(),
+	)
 )
 
 //go:embed index.html
@@ -520,9 +523,15 @@ func handleCaptchaMode(w http.ResponseWriter, r *http.Request) {
 		captchaMu.Lock()
 		captchaHeadless = req.Headless
 		if captchaHeadless {
-			captchaSolver = captcha.NewChromedpSolver()
+			captchaSolver = captcha.NewChainSolver(
+				captcha.NewDirectSolver(),
+				captcha.NewChromedpSolver(),
+			)
 		} else {
-			captchaSolver = captcha.NewInteractiveSolver()
+			captchaSolver = captcha.NewChainSolver(
+				captcha.NewDirectSolver(),
+				captcha.NewInteractiveSolver(),
+			)
 		}
 		captchaMu.Unlock()
 	}
