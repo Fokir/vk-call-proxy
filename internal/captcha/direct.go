@@ -7,15 +7,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 )
+
+// ErrNotSlider is returned when the captcha is not a slider type.
+// ChainSolver uses this to fall back to the next solver.
+var ErrNotSlider = fmt.Errorf("captcha is not slider type")
 
 // DirectSolver solves VK captcha by making direct API calls,
 // mimicking the browser captchaNotRobot flow without actual browser.
@@ -51,7 +57,13 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	adFp := randomAdFp(r)
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+
+	// Step 0: Fetch the captcha page to extract captcha_settings for slider.
+	captchaSettings, err := fetchSliderSettings(ctx, client, ua, redirectURI)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrNotSlider, err)
+	}
 
 	// Step 1: captchaNotRobot.settings
 	slog.Debug("captcha direct: settings")
@@ -66,14 +78,40 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	}
 	slog.Debug("captcha direct: settings response", "resp", string(settingsResp))
 
-	// Wait a bit, mimicking sensor collection delay.
+	// Step 2: captchaNotRobot.getContent (slider puzzle).
+	slog.Debug("captcha direct: getContent (slider)")
+	contentResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.getContent", url.Values{
+		"session_token":    {sessionToken},
+		"domain":           {domain},
+		"adFp":             {adFp},
+		"captcha_settings": {captchaSettings},
+		"access_token":     {""},
+	})
+	if err != nil {
+		return "", fmt.Errorf("getContent: %w", err)
+	}
+
+	puzzle, err := parseSliderContent(contentResp)
+	if err != nil {
+		return "", fmt.Errorf("parse slider content: %w", err)
+	}
+
+	answer, err := solveSlider(puzzle)
+	if err != nil {
+		return "", fmt.Errorf("solve slider: %w", err)
+	}
+	sliderAnswer := encodeSliderAnswer(answer)
+	slog.Debug("captcha direct: slider solved", "position", len(answer)/2, "maxPos", len(puzzle.swapPairs)/2)
+
+	// Simulate delay (sensor collection + user solving).
+	delay := time.Duration(1500+r.Intn(2000)) * time.Millisecond
 	select {
-	case <-time.After(time.Duration(500+r.Intn(500)) * time.Millisecond):
+	case <-time.After(delay):
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
 
-	// Step 2: captchaNotRobot.componentDone
+	// Step 3: captchaNotRobot.componentDone
 	slog.Debug("captcha direct: componentDone")
 	device := generateDeviceInfo(r)
 	deviceJSON, _ := json.Marshal(device)
@@ -91,24 +129,24 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		return "", fmt.Errorf("componentDone: %w", err)
 	}
 
-	// Simulate sensor data collection period (1-2 seconds).
-	sensorsDelay := time.Duration(1000+r.Intn(1000)) * time.Millisecond
+	// Simulate slider interaction delay.
+	sliderDelay := time.Duration(500+r.Intn(1000)) * time.Millisecond
 	select {
-	case <-time.After(sensorsDelay):
+	case <-time.After(sliderDelay):
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
 
-	// Step 3: captchaNotRobot.check
+	// Step 4: captchaNotRobot.check
 	slog.Debug("captcha direct: check")
-	cursor := generateCursor(r)
+	cursor := generateSliderCursor(r)
 	cursorJSON, _ := json.Marshal(cursor)
 	rtt := generateConnectionRtt(r)
 	rttJSON, _ := json.Marshal(rtt)
 	downlink := generateConnectionDownlink(r)
 	downlinkJSON, _ := json.Marshal(downlink)
 
-	// Proof-of-work hash — find SHA-256 with leading zeros.
+	// Proof-of-work hash.
 	hash, debugInfo := computeProofOfWork(sessionToken, r)
 
 	checkResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.check", url.Values{
@@ -124,7 +162,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"connectionDownlink": {string(downlinkJSON)},
 		"browser_fp":         {browserFp},
 		"hash":               {hash},
-		"answer":             {"e30="}, // base64("{}")
+		"answer":             {sliderAnswer},
 		"debug_info":         {debugInfo},
 		"access_token":       {""},
 	})
@@ -152,12 +190,12 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	}
 	if checkResult.Response.SuccessToken == "" {
 		if checkResult.Response.ShowCaptcha != "" {
-			return "", fmt.Errorf("VK wants visual captcha (type=%s), direct solve not possible", checkResult.Response.ShowCaptcha)
+			return "", fmt.Errorf("captcha check failed (type=%s, status=%s)", checkResult.Response.ShowCaptcha, checkResult.Response.Status)
 		}
 		return "", fmt.Errorf("no success_token in check response: %s", string(checkResp))
 	}
 
-	// Step 4: endSession (best effort).
+	// Step 5: endSession (best effort).
 	slog.Debug("captcha direct: endSession")
 	vkCaptchaPost(ctx, client, ua, "captchaNotRobot.endSession", url.Values{
 		"session_token": {sessionToken},
@@ -167,6 +205,78 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	})
 
 	return checkResult.Response.SuccessToken, nil
+}
+
+// fetchSliderSettings fetches the captcha HTML page and extracts
+// the captcha_settings value for the slider type.
+func fetchSliderSettings(ctx context.Context, client *http.Client, ua, redirectURI string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", redirectURI, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", ua)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract slider captcha_settings directly from the HTML.
+	// The JSON has: {"type":"slider","settings":"<value>"}
+	re := regexp.MustCompile(`"type"\s*:\s*"slider"\s*,\s*"settings"\s*:\s*"([^"]+)"`)
+	match := re.FindSubmatch(body)
+	if match == nil {
+		return "", fmt.Errorf("slider captcha_settings not found in captcha page")
+	}
+
+	settings := string(match[1])
+	// Unescape JSON string (e.g. \/ → /).
+	settings = strings.ReplaceAll(settings, `\/`, `/`)
+	return settings, nil
+}
+
+// generateSliderCursor generates realistic cursor movement for slider interaction.
+// Simulates: mouse enters → moves to slider → drags right → releases.
+func generateSliderCursor(r *rand.Rand) []cursorPoint {
+	n := 20 + r.Intn(30)
+	points := make([]cursorPoint, 0, n)
+
+	// Start near the slider area.
+	x := 500 + r.Intn(200)
+	y := 400 + r.Intn(200)
+	points = append(points, cursorPoint{X: x, Y: y})
+
+	// Move towards slider handle.
+	targetX := 580 + r.Intn(40)
+	targetY := 830 + r.Intn(20)
+	steps := 5 + r.Intn(5)
+	for i := 1; i <= steps; i++ {
+		px := x + (targetX-x)*i/steps + r.Intn(6) - 3
+		py := y + (targetY-y)*i/steps + r.Intn(6) - 3
+		points = append(points, cursorPoint{X: px, Y: py})
+	}
+
+	// Drag slider right (increasing x).
+	dragSteps := 10 + r.Intn(15)
+	cx, cy := targetX, targetY
+	for i := 0; i < dragSteps; i++ {
+		cx += 5 + r.Intn(15)
+		cy += r.Intn(4) - 2
+		points = append(points, cursorPoint{X: cx, Y: cy})
+	}
+
+	// Final position (hold).
+	for i := 0; i < 2+r.Intn(3); i++ {
+		points = append(points, cursorPoint{X: cx + r.Intn(2), Y: cy + r.Intn(2)})
+	}
+
+	return points
 }
 
 func vkCaptchaPost(ctx context.Context, client *http.Client, ua, method string, data url.Values) ([]byte, error) {
@@ -245,20 +355,6 @@ type cursorPoint struct {
 	Y int `json:"y"`
 }
 
-func generateCursor(r *rand.Rand) []cursorPoint {
-	n := 8 + r.Intn(8)
-	points := make([]cursorPoint, n)
-	x := 600 + r.Intn(400)
-	y := 300 + r.Intn(200)
-	for i := range points {
-		x += r.Intn(60) - 30
-		y += r.Intn(40) - 20
-		if x < 0 { x = 50 }
-		if y < 0 { y = 50 }
-		points[i] = cursorPoint{X: x, Y: y}
-	}
-	return points
-}
 
 func generateConnectionRtt(r *rand.Rand) []int {
 	base := 50 + r.Intn(100)
