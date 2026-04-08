@@ -26,7 +26,11 @@ import (
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
-var chromedpCaptcha = captcha.NewChromedpSolver()
+var (
+	captchaMu       sync.Mutex
+	captchaHeadless bool
+	captchaSolver   provider.CaptchaSolver = captcha.NewInteractiveSolver()
+)
 
 //go:embed index.html
 var indexHTML []byte
@@ -329,7 +333,10 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if telemost.IsTelemostLink(link) {
 		svc = telemost.NewService(link, authToken)
 	} else {
-		svc = vk.NewService(link, vk.WithCaptchaSolver(chromedpCaptcha))
+		captchaMu.Lock()
+		solver := captchaSolver
+		captchaMu.Unlock()
+		svc = vk.NewService(link, vk.WithCaptchaSolver(solver))
 	}
 
 	srvCfg := server.Config{
@@ -503,6 +510,27 @@ func openBrowser(url string) {
 	cmd.Start()
 }
 
+func handleCaptchaMode(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodPost {
+		var req struct {
+			Headless bool `json:"headless"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		captchaMu.Lock()
+		captchaHeadless = req.Headless
+		if captchaHeadless {
+			captchaSolver = captcha.NewChromedpSolver()
+		} else {
+			captchaSolver = captcha.NewInteractiveSolver()
+		}
+		captchaMu.Unlock()
+	}
+	captchaMu.Lock()
+	json.NewEncoder(w).Encode(map[string]bool{"headless": captchaHeadless})
+	captchaMu.Unlock()
+}
+
 func main() {
 	cfg := loadConfig()
 	state := newAppState(len(cfg.Instances))
@@ -516,6 +544,7 @@ func main() {
 	mux.HandleFunc("/api/logs", state.handleLogs)
 	mux.HandleFunc("/api/instances/add", state.handleAddInstance)
 	mux.HandleFunc("/api/instances/remove", state.handleRemoveInstance)
+	mux.HandleFunc("/api/captcha-mode", handleCaptchaMode)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
