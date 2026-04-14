@@ -15,7 +15,10 @@ const (
 	sdpTimeout    = 15 * time.Second
 	dcOpenTimeout = 120 * time.Second
 	// Interval for sending keepalive VP8 frames to keep the SFU forwarding active.
-	videoKeepAliveInterval = 100 * time.Millisecond
+	// 40ms = 25 fps — совпадает с частотой официального web-клиента и
+	// whitelist-bypass. Более редкие кадры (например 100ms = 10fps) могут
+	// вызывать reshape/drop на стороне SFU, что заметно бьёт по стабильности.
+	videoKeepAliveInterval = 40 * time.Millisecond
 )
 
 // WebRTCTransport manages publisher and subscriber PeerConnections
@@ -153,7 +156,9 @@ func (t *WebRTCTransport) setupPublisher(ctx context.Context, api *webrtc.API, i
 	}
 	t.publisher = pc
 
-	// Add audio track (SFU expects audio from publisher).
+	// Add silent audio track (SFU expects audio from publisher).
+	// Audio как data channel невозможен: Goloom SFU транскодирует Opus,
+	// теряя произвольный payload (проверено MVP-экспериментом 2026-04-15).
 	if err := addSilentAudioTrack(pc); err != nil {
 		t.logger.Debug("failed to add silent audio track", "err", err)
 	}
@@ -263,6 +268,7 @@ func (t *WebRTCTransport) setupSubscriber(ctx context.Context, api *webrtc.API, 
 		t.logger.Info("subscriber received track",
 			"kind", track.Kind().String(),
 			"codec", track.Codec().MimeType,
+			"ssrc", uint32(track.SSRC()),
 		)
 		// Only handle video tracks — that's where VPN data arrives.
 		if track.Kind() == webrtc.RTPCodecTypeVideo {
@@ -420,6 +426,11 @@ func (t *WebRTCTransport) videoKeepAlive(ctx context.Context) {
 
 	t.logger.Debug("videoKeepAlive: publisher ICE connected, starting VP8 frames")
 
+	// Готовим пустой keepalive-кадр один раз: с частотой 25 fps пересчитывать
+	// XOR-обфускацию каждые 40ms — лишний CPU. Сам кадр stateless
+	// (не содержит seq/pktSeq), безопасно повторять.
+	keepAliveFrame := buildVP8Frame(nil, t.obfKey)
+
 	ticker := time.NewTicker(videoKeepAliveInterval)
 	defer ticker.Stop()
 	for {
@@ -430,9 +441,8 @@ func (t *WebRTCTransport) videoKeepAlive(ctx context.Context) {
 			if t.closed {
 				return
 			}
-			frame := buildVP8Frame(nil, t.obfKey)
 			t.pubVideo.WriteSample(media.Sample{
-				Data:     frame,
+				Data:     keepAliveFrame,
 				Duration: videoKeepAliveInterval,
 			})
 		}
@@ -508,6 +518,10 @@ func (t *WebRTCTransport) Close() error {
 }
 
 // addSilentAudioTrack adds a dummy Opus audio track to the PeerConnection.
+// SFU требует audio от publisher'ов для активации media forwarding.
+// Использовать audio как канал данных невозможно: Goloom транскодирует Opus
+// (проверено MVP-экспериментом 2026-04-15 — 205-байтный payload с magic
+// превращался в ~25-байтный «нормализованный» Opus без нашего content).
 func addSilentAudioTrack(pc *webrtc.PeerConnection) error {
 	track, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},

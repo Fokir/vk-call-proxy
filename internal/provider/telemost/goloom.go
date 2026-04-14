@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
@@ -56,6 +57,12 @@ type GoloomClient struct {
 
 	pubOfferUID string // UID of the last publisherSdpOffer sent
 
+	// ackWaiters: UUID → chan закрывается при получении ack с этим UID.
+	// Используется для graceful leave (ждём подтверждения от SFU, чтобы участник
+	// был удалён немедленно — иначе накапливаются ghost participants).
+	ackWaitersMu sync.Mutex
+	ackWaiters   map[string]chan struct{}
+
 	closeCh chan struct{}
 	once    sync.Once
 }
@@ -92,6 +99,7 @@ func ConnectGoloom(ctx context.Context, conf *conferenceInfo, logger *slog.Logge
 		peerUpdates:   make(chan []Participant, 8),
 		upsertUpdates: make(chan []Participant, 8),
 		newPeerCh:     make(chan string, 16),
+		ackWaiters:    make(map[string]chan struct{}),
 		closeCh:     make(chan struct{}),
 	}
 
@@ -110,9 +118,26 @@ func ConnectGoloom(ctx context.Context, conf *conferenceInfo, logger *slog.Logge
 	}
 	gc.serverHelloData = sh
 
+	// Устанавливаем pong handler — при получении pong сбрасываем read deadline.
+	// Без этого read залипнет на умершем TCP, пока не сработает OS keepalive (много минут).
+	gc.conn.SetPongHandler(func(string) error {
+		gc.conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+		return nil
+	})
+	gc.conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+
 	// Start background reader and ping loop.
 	go gc.readPump()
 	go gc.pingLoop(ctx)
+
+	// Запускаем XHR-телеметрию если SFU прислал конфигурацию. Имитирует
+	// официальный web-клиент, снижает риск серверной стороны реагировать
+	// на «тихих» участников reshape/drop'ом.
+	if sh.TelemetryConfiguration != nil && sh.TelemetryConfiguration.endpointURL() != "" {
+		displayName := provider.RandomDisplayName()
+		go telemetryLoop(ctx, sh.TelemetryConfiguration,
+			conf.RoomID, conf.PeerID, displayName, gc.closeCh)
+	}
 
 	return gc, sh, nil
 }
@@ -631,17 +656,47 @@ func (gc *GoloomClient) PinToPeer(participantID string) error {
 	return gc.writeJSON(msg)
 }
 
+// leaveAckTimeout — сколько ждём ack от SFU на leave перед тем как закрыть WS.
+// Без ожидания ack SFU может не успеть обработать leave и оставит ghost участника
+// на 30-60 секунд, что забивает 8 SFU-slots и ломает последующие pin'ы.
+const leaveAckTimeout = 1500 * time.Millisecond
+
 // Close sends a leave message and closes the Goloom WebSocket connection.
 // The leave message tells the SFU to immediately remove this participant,
 // preventing ghost participants from accumulating in the conference.
+//
+// Дожидаемся ack от SFU (макс leaveAckTimeout) — это гарантирует, что slot
+// освобождён до того, как мы начнём новый connect с тем же display name.
 func (gc *GoloomClient) Close() error {
 	gc.once.Do(func() {
 		close(gc.closeCh)
-		// Send leave before closing so the SFU removes participant immediately.
-		_ = gc.writeJSON(map[string]interface{}{
-			"uid":   uuid.New().String(),
+
+		// Регистрируем waiter ПЕРЕД отправкой leave, чтобы не упустить ранний ack.
+		leaveUID := uuid.New().String()
+		ackCh := make(chan struct{})
+		gc.ackWaitersMu.Lock()
+		gc.ackWaiters[leaveUID] = ackCh
+		gc.ackWaitersMu.Unlock()
+
+		writeErr := gc.writeJSON(map[string]interface{}{
+			"uid":   leaveUID,
 			"leave": map[string]interface{}{},
 		})
+
+		if writeErr == nil {
+			select {
+			case <-ackCh:
+				gc.logger.Debug("leave acked")
+			case <-time.After(leaveAckTimeout):
+				gc.logger.Warn("leave ack timeout", "uid", leaveUID)
+			}
+		}
+
+		// На всякий случай удаляем waiter (readPump мог не успеть).
+		gc.ackWaitersMu.Lock()
+		delete(gc.ackWaiters, leaveUID)
+		gc.ackWaitersMu.Unlock()
+
 		gc.conn.Close()
 	})
 	return nil
@@ -713,6 +768,8 @@ func (gc *GoloomClient) readPump() {
 			gc.Close()
 			return
 		}
+		// Продлеваем deadline — есть трафик, значит соединение живое.
+		gc.conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
 
 		gc.handleMessage(msg)
 	}
@@ -757,6 +814,15 @@ func (gc *GoloomClient) handleMessage(msg []byte) {
 			default:
 			}
 		}
+
+		// Резолвим ожидающего ack-waiter (например, leave).
+		gc.ackWaitersMu.Lock()
+		if ch, ok := gc.ackWaiters[env.UID]; ok {
+			close(ch)
+			delete(gc.ackWaiters, env.UID)
+		}
+		gc.ackWaitersMu.Unlock()
+
 		return // acks don't need further processing
 	}
 
@@ -806,22 +872,53 @@ func (gc *GoloomClient) handleMessage(msg []byte) {
 	}
 }
 
+// wsPingInterval — низкоуровневый WebSocket PING кадр (control frame).
+// Помогает быстрее детектить мёртвый TCP, особенно за NAT с коротким таймаутом.
+const wsPingInterval = 30 * time.Second
+
+// wsReadDeadline — deadline на читающий pump. Сбрасывается:
+//   - при успешном ReadMessage (есть трафик → живой)
+//   - при получении pong (наш ping достиг сервера и вернулся)
+// Значение > wsPingInterval × 2, чтобы одна потерянная пара ping/pong не вызывала
+// ложный disconnect.
+const wsReadDeadline = 75 * time.Second
+
+// pingLoop делает double keepalive:
+//   - application-level JSON ping каждые pingInterval (5s) — поддерживает livе на
+//     уровне SFU (SFU считает нас активным участником)
+//   - WebSocket control PING каждые wsPingInterval (30s) — быстрее ловит TCP halt
+//     через NAT/firewall, чем application-level
 func (gc *GoloomClient) pingLoop(ctx context.Context) {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
+	appTicker := time.NewTicker(pingInterval)
+	defer appTicker.Stop()
+	wsTicker := time.NewTicker(wsPingInterval)
+	defer wsTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-gc.closeCh:
 			return
-		case <-ticker.C:
+		case <-appTicker.C:
 			msg := map[string]interface{}{
 				"uid":  uuid.New().String(),
 				"ping": map[string]interface{}{},
 			}
 			if err := gc.writeJSON(msg); err != nil {
-				gc.logger.Debug("ping failed", "err", err)
+				gc.logger.Debug("app ping failed", "err", err)
+				return
+			}
+		case <-wsTicker.C:
+			// WriteControl требует отдельной синхронизации с обычными write'ами.
+			gc.mu.Lock()
+			err := gc.conn.WriteControl(
+				websocket.PingMessage,
+				nil,
+				time.Now().Add(2*time.Second),
+			)
+			gc.mu.Unlock()
+			if err != nil {
+				gc.logger.Debug("ws ping failed", "err", err)
 				return
 			}
 		}

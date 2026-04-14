@@ -90,14 +90,15 @@ func (lb *LogBuffer) ReadAndClear() string {
 // tunnelState holds the result of a connection attempt.
 // Returned by connectDirect/connectRelay for applyState to install.
 type tunnelState struct {
-	mgr       *turn.Manager
-	m         *mux.Mux
-	conns     []io.ReadWriteCloser       // connections to add after idle timeout is set
-	cleanups  []context.CancelFunc
-	sigClient provider.SignalingClient    // non-nil in relay mode; kept alive for reconnect signaling
-	sessionID uuid.UUID                  // session UUID for reconnect auth
-	joinInfo  *provider.JoinInfo         // cached for fast reconnect
-	pool      *tunnel.CallPool           // non-nil in multi-call pool mode
+	mgr          *turn.Manager
+	m            *mux.Mux
+	conns        []io.ReadWriteCloser       // connections to add after idle timeout is set
+	cleanups     []context.CancelFunc
+	sigClient    provider.SignalingClient    // non-nil in relay mode; kept alive for reconnect signaling
+	sessionID    uuid.UUID                  // session UUID for reconnect auth
+	joinInfo     *provider.JoinInfo         // cached for fast reconnect
+	pool         *tunnel.CallPool           // non-nil in multi-call pool mode
+	tmReconnect  *telemost.ReconnectManager // non-nil in Telemost mode; per-index reconnect
 }
 
 // Tunnel is the main gomobile-exported type for mobile platforms.
@@ -328,6 +329,7 @@ func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunne
 	sessionID := uuid.New()
 
 	var muxConns []io.ReadWriteCloser
+	var muxIndices []int
 	var cleanups []context.CancelFunc
 	for i := 0; i < cfg.NumConns; i++ {
 		conn, cleanup, err := tmSvc.ConnectPaired(ctx,
@@ -355,6 +357,7 @@ func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunne
 
 		cleanups = append(cleanups, cleanup)
 		muxConns = append(muxConns, conn)
+		muxIndices = append(muxIndices, i)
 	}
 
 	if len(muxConns) == 0 {
@@ -365,10 +368,30 @@ func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunne
 	}
 
 	m := mux.New(t.logger)
+
+	// ReconnectManager поднимает упавшие per-index соединения в фоне (applyState
+	// запускает Run()). Оборачиваем первичные conn'ы, чтобы manager знал о падении.
+	tmReconnect := telemost.NewReconnectManager(telemost.ReconnectConfig{
+		Service:     tmSvc,
+		TargetConns: cfg.NumConns,
+		AuthToken:   cfg.Token,
+		SessionID:   sessionID,
+		ServerNames: serverNames,
+		ClientNames: clientNames,
+		Logger:      t.logger,
+	}, m)
+	muxConns = tmReconnect.WrapInitial(muxConns, muxIndices)
+
 	t.logger.Info("tunnel connected (telemost)",
 		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
-	return &tunnelState{m: m, conns: muxConns, cleanups: cleanups, sessionID: sessionID}, nil
+	return &tunnelState{
+		m:           m,
+		conns:       muxConns,
+		cleanups:    cleanups,
+		sessionID:   sessionID,
+		tmReconnect: tmReconnect,
+	}, nil
 }
 
 // connectDirect creates TURN allocations and DTLS connections to a server
@@ -886,6 +909,11 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	// Add connections AFTER idle timeout and DispatchLoop are set up.
 	for _, conn := range state.conns {
 		state.m.AddConn(conn)
+	}
+
+	// Start per-connection reconnect for Telemost mode.
+	if state.tmReconnect != nil {
+		go state.tmReconnect.Run(muxCtx)
 	}
 
 	// Start per-connection reconnect for relay mode.

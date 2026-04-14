@@ -43,6 +43,7 @@ STRIPING=""
 CAPTCHA_PORT=18090
 DIRECT_MODE=""         # empty=relay, "env"=from .env, "host:port"=explicit
 LISTEN_ADDR="0.0.0.0:9000"
+USE_TELEMOST=""        # "1" = use TELEMOST_LINK from .env instead of VK_CALL_LINK
 
 for arg in "$@"; do
   case $arg in
@@ -57,6 +58,7 @@ for arg in "$@"; do
     --listen=*) LISTEN_ADDR="${arg#*=}" ;;
     --verbose) VERBOSE="--verbose" ;;
     --striping) STRIPING=1 ;;
+    --telemost) USE_TELEMOST=1 ;;
   esac
 done
 
@@ -89,7 +91,15 @@ fi
 
 # Build link args based on --links=N (needed for both relay and direct modes — client uses TURN)
 LINK_ARGS=""
-if [[ "$LINKS" -gt 1 ]]; then
+if [[ -n "$USE_TELEMOST" ]]; then
+  # Telemost режим: используем TELEMOST_LINK (провайдер сам определит
+  # через IsTelemostLink и переключится в WebRTC-SFU транспорт).
+  if [[ -z "${TELEMOST_LINK:-}" ]]; then
+    echo "FATAL: TELEMOST_LINK not set in .env (required for --telemost)"
+    exit 1
+  fi
+  LINK_ARGS="--link=$TELEMOST_LINK"
+elif [[ "$LINKS" -gt 1 ]]; then
   for i in $(seq 1 "$LINKS"); do
     varname="VK_CALL_LINK_$i"
     if [[ -z "${!varname:-}" ]]; then
@@ -137,6 +147,8 @@ fi
 TUNNEL_MODE="relay-to-relay"
 if [[ -n "$DIRECT_SERVER" ]]; then
   TUNNEL_MODE="direct → $DIRECT_SERVER (listen $LISTEN_ADDR)"
+elif [[ -n "$USE_TELEMOST" ]]; then
+  TUNNEL_MODE="telemost → $TELEMOST_LINK"
 fi
 
 echo "=== E2E Test ==="
@@ -456,9 +468,9 @@ else
 fi
 sleep 1
 
-# --- Start captcha-service (not needed in direct mode — client uses interactive solver) ---
+# --- Start captcha-service (not needed in direct/telemost modes) ---
 CAPTCHA_ENDPOINT=""
-if [[ -z "$DIRECT_SERVER" ]]; then
+if [[ -z "$DIRECT_SERVER" && -z "$USE_TELEMOST" ]]; then
   echo "[$(ts)] Starting captcha-service on port $CAPTCHA_PORT..."
   ./callvpn-captcha${EXE} \
     --port="$CAPTCHA_PORT" \
@@ -490,6 +502,16 @@ if [[ -n "$DIRECT_SERVER" ]]; then
     2>&1 | sed "s/^/  [server] /" &
   SERVER_PID=$!
   sleep 3
+elif [[ -n "$USE_TELEMOST" ]]; then
+  echo "[$(ts)] Starting server in TELEMOST mode (n=$CONNS)..."
+  ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
+    $LINK_ARGS \
+    --n="$CONNS" \
+    --token="$VPN_TOKEN" \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [server] /" &
+  SERVER_PID=$!
+  sleep 15
 else
   echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
   ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
@@ -534,6 +556,17 @@ if [[ -n "$DIRECT_SERVER" ]]; then
     --socks5-port=$SOCKS_PORT \
     --http-port=$HTTP_PORT \
     $VK_TOKEN_ARGS_CLIENT \
+    $VERBOSE \
+    2>&1 | sed "s/^/  [client] /" &
+  CLIENT_PID=$!
+elif [[ -n "$USE_TELEMOST" ]]; then
+  echo "[$(ts)] Starting client in TELEMOST mode (n=$CONNS)..."
+  ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
+    $LINK_ARGS \
+    --n="$CONNS" \
+    --token="$VPN_TOKEN" \
+    --socks5-port=$SOCKS_PORT \
+    --http-port=$HTTP_PORT \
     $VERBOSE \
     2>&1 | sed "s/^/  [client] /" &
   CLIENT_PID=$!

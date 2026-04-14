@@ -6,10 +6,13 @@ import (
 )
 
 const (
-	retxBufSize  = 512                // circular buffer for retransmission
+	// retxBufSize: при writePace ≈5ms и maxVP8Data=1100 это даёт ~2048×5ms = ~10s
+	// окна retransmit — согласовано с reassemblyTimeout=10s. На N=4 соединениях и
+	// payload ~1100б это ~9 MB RAM на клиенте, приемлемо.
+	retxBufSize  = 2048
 	nackDelay    = 30 * time.Millisecond  // initial wait before first NACK (give FEC time)
 	nackRetry    = 100 * time.Millisecond // re-NACK interval if packet still missing
-	maxNACKSeqs  = 32                 // max pktSeqs per NACK message
+	maxNACKSeqs  = 32                     // max pktSeqs per NACK message
 )
 
 // RetransmitBuffer stores recent sent chunkPayloads for retransmission on NACK.

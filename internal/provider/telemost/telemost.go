@@ -38,8 +38,16 @@ const (
 	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 	clientVersion = "183.3.0"
 	sdkVersion    = "5.24.1"
-	conferenceAPI = "https://cloud-api.yandex.com/telemost_front/v2/telemost/conferences"
 )
+
+// conferenceAPIHosts — кандидаты на API endpoint conference/connection.
+// getConferenceConnection пробует их по очереди при сетевой ошибке или >=500
+// от предыдущего хоста. Порядок: .com первым (основной), .ru как резерв при
+// DPI-блокировке международного домена.
+var conferenceAPIHosts = []string{
+	"https://cloud-api.yandex.com/telemost_front/v2/telemost/conferences",
+	"https://cloud-api.yandex.ru/telemost_front/v2/telemost/conferences",
+}
 
 // Service implements provider.Service for Yandex Telemost.
 type Service struct {
@@ -370,34 +378,57 @@ func getConferenceConnection(ctx context.Context, client *http.Client, meetingID
 	encodedURI := url.PathEscape(meetingURI)
 	displayName := url.QueryEscape(provider.RandomDisplayName())
 
-	endpoint := fmt.Sprintf("%s/%s/connection?next_gen_media_platform_allowed=true&display_name=%s&waiting_room_supported=true",
-		conferenceAPI, encodedURI, displayName)
+	var body []byte
+	var lastErr error
+	for _, host := range conferenceAPIHosts {
+		endpoint := fmt.Sprintf("%s/%s/connection?next_gen_media_platform_allowed=true&display_name=%s&waiting_room_supported=true",
+			host, encodedURI, displayName)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", "https://telemost.yandex.com/")
+		req.Header.Set("Origin", "https://telemost.yandex.com")
+		req.Header.Set("Client-Instance-Id", uuid.New().String())
+		req.Header.Set("X-Telemost-Client-Version", clientVersion)
+		req.Header.Set("Idempotency-Key", uuid.New().String())
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %w", host, err)
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("%s: read body: %w", host, readErr)
+			continue
+		}
+
+		// Retry на 5xx и сетевые проблемы. 4xx — клиентская ошибка, не рекавери'тся
+		// сменой хоста, прокидываем наружу как есть.
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s: HTTP %d: %s", host, resp.StatusCode, string(respBody))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		body = respBody
+		break
 	}
 
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", "https://telemost.yandex.com/")
-	req.Header.Set("Origin", "https://telemost.yandex.com")
-	req.Header.Set("Client-Instance-Id", uuid.New().String())
-	req.Header.Set("X-Telemost-Client-Version", clientVersion)
-	req.Header.Set("Idempotency-Key", uuid.New().String())
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	if body == nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no conference API hosts reachable")
+		}
+		return nil, lastErr
 	}
 
 	var data struct {
@@ -442,6 +473,39 @@ type serverHello struct {
 	RtcConfiguration struct {
 		IceServers []iceServer `json:"iceServers"`
 	} `json:"rtcConfiguration"`
+
+	// TelemetryConfiguration — опциональная конфигурация XHR-телеметрии,
+	// присылаемая SFU. Наличие endpoint'а активирует telemetryLoop().
+	TelemetryConfiguration *telemetryConfig `json:"telemetryConfiguration,omitempty"`
+}
+
+type telemetryConfig struct {
+	LogEndpoint     string  `json:"logEndpoint,omitempty"`
+	Endpoint        string  `json:"endpoint,omitempty"`
+	URL             string  `json:"url,omitempty"`
+	SendingInterval float64 `json:"sendingInterval,omitempty"` // миллисекунды
+}
+
+// endpointURL возвращает первый непустой URL из logEndpoint/endpoint/url.
+func (t *telemetryConfig) endpointURL() string {
+	if t == nil {
+		return ""
+	}
+	if t.LogEndpoint != "" {
+		return t.LogEndpoint
+	}
+	if t.Endpoint != "" {
+		return t.Endpoint
+	}
+	return t.URL
+}
+
+// interval возвращает период телеметрии. Default — 20с, как у официального клиента.
+func (t *telemetryConfig) interval() time.Duration {
+	if t != nil && t.SendingInterval > 0 {
+		return time.Duration(t.SendingInterval) * time.Millisecond
+	}
+	return 20 * time.Second
 }
 
 type iceServer struct {
@@ -490,6 +554,38 @@ func extractTURNCreds(sh *serverHello) (*provider.Credentials, error) {
 
 // --- hello message builder ---
 
+// telemostCapabilitiesOffer — полный набор поддерживаемых опций, который шлёт
+// официальный web/Android клиент. Скопирован из реверса
+// refs/whitelist-bypass/headless/telemost/main.go:30-56. Отправка неполного
+// набора раньше давала нестабильное поведение SFU на части конференций.
+var telemostCapabilitiesOffer = map[string][]string{
+	"offerAnswerMode":              {"SEPARATE"},
+	"initialSubscriberOffer":       {"ON_HELLO"},
+	"slotsMode":                    {"FROM_CONTROLLER"},
+	"simulcastMode":                {"DISABLED", "STATIC"},
+	"selfVadStatus":                {"FROM_SERVER", "FROM_CLIENT"},
+	"dataChannelSharing":           {"TO_RTP"},
+	"videoEncoderConfig":           {"NO_CONFIG", "ONLY_INIT_CONFIG", "RUNTIME_CONFIG"},
+	"dataChannelVideoCodec":        {"VP8", "UNIQUE_CODEC_FROM_TRACK_DESCRIPTION"},
+	"bandwidthLimitationReason":    {"BANDWIDTH_REASON_DISABLED", "BANDWIDTH_REASON_ENABLED"},
+	"sdkDefaultDeviceManagement":   {"SDK_DEFAULT_DEVICE_MANAGEMENT_DISABLED", "SDK_DEFAULT_DEVICE_MANAGEMENT_ENABLED"},
+	"joinOrderLayout":              {"JOIN_ORDER_LAYOUT_DISABLED", "JOIN_ORDER_LAYOUT_ENABLED"},
+	"pinLayout":                    {"PIN_LAYOUT_DISABLED"},
+	"sendSelfViewVideoSlot":        {"SEND_SELF_VIEW_VIDEO_SLOT_DISABLED", "SEND_SELF_VIEW_VIDEO_SLOT_ENABLED"},
+	"serverLayoutTransition":       {"SERVER_LAYOUT_TRANSITION_DISABLED"},
+	"sdkPublisherOptimizeBitrate":  {"SDK_PUBLISHER_OPTIMIZE_BITRATE_DISABLED", "SDK_PUBLISHER_OPTIMIZE_BITRATE_FULL", "SDK_PUBLISHER_OPTIMIZE_BITRATE_ONLY_SELF"},
+	"sdkNetworkLostDetection":      {"SDK_NETWORK_LOST_DETECTION_DISABLED"},
+	"sdkNetworkPathMonitor":        {"SDK_NETWORK_PATH_MONITOR_DISABLED"},
+	"publisherVp9":                 {"PUBLISH_VP9_DISABLED", "PUBLISH_VP9_ENABLED"},
+	"svcMode":                      {"SVC_MODE_DISABLED", "SVC_MODE_L3T3", "SVC_MODE_L3T3_KEY"},
+	"subscriberOfferAsyncAck":      {"SUBSCRIBER_OFFER_ASYNC_ACK_DISABLED", "SUBSCRIBER_OFFER_ASYNC_ACK_ENABLED"},
+	"androidBluetoothRoutingFix":   {"ANDROID_BLUETOOTH_ROUTING_FIX_DISABLED"},
+	"fixedIceCandidatesPoolSize":   {"FIXED_ICE_CANDIDATES_POOL_SIZE_DISABLED"},
+	"sdkAndroidTelecomIntegration": {"SDK_ANDROID_TELECOM_INTEGRATION_DISABLED"},
+	"setActiveCodecsMode":          {"SET_ACTIVE_CODECS_MODE_DISABLED", "SET_ACTIVE_CODECS_MODE_VIDEO_ONLY"},
+	"subscriberDtlsPassiveMode":    {"SUBSCRIBER_DTLS_PASSIVE_MODE_DISABLED", "SUBSCRIBER_DTLS_PASSIVE_MODE_ENABLED"},
+}
+
 func buildHello(conf *conferenceInfo) map[string]interface{} {
 	return map[string]interface{}{
 		"uid": uuid.New().String(),
@@ -511,25 +607,11 @@ func buildHello(conf *conferenceInfo) map[string]interface{} {
 				"userAgent":      userAgent,
 				"hwConcurrency":  4,
 			},
-			"capabilitiesOffer": map[string]interface{}{
-				"offerAnswerMode":         []string{"SEPARATE"},
-				"initialSubscriberOffer":  []string{"ON_HELLO"},
-				"dataChannelSharing":      []string{"TO_RTP"},
-				"dataChannelVideoCodec":   []string{"UNIQUE_CODEC_FROM_TRACK_DESCRIPTION"},
-				"slotsMode":              []string{"FROM_CONTROLLER"},
-				"simulcastMode":          []string{"DISABLED"},
-				"publisherSdpSemantics":  []string{"UNIFIED_PLAN"},
-				"publisherVp9":           []string{"PUBLISH_VP9_ENABLED"},
-				"svcMode":               []string{"SVC_MODE_L3T3_KEY"},
-				"iceProtocol":            []string{"ALL"},
-				"iceCandidateProtocol":   []string{"ALL"},
-				"audioBitrateMode":       []string{"VARIABLE"},
-				"sdpMLineOrder":          []string{"ANY"},
-				"opusDtxMode":            []string{"ENABLED"},
-				"audioRedMode":           []string{"DISABLED"},
-				"publisherIceLiteRemote": []string{"SUPPORTED"},
-				"videoEncoderConfig":     []string{"NO_CONFIG"},
-			},
+			// Расширенный набор capability flags, максимально близкий к набору
+			// официального web-клиента (из refs/whitelist-bypass/headless/telemost/main.go:30-56).
+			// SFU может менять поведение для «неполных» клиентов — отправляем
+			// максимум поддерживаемых вариантов, чтобы не выделяться.
+			"capabilitiesOffer":     telemostCapabilitiesOffer,
 			"sdkInitializationId":    uuid.New().String(),
 			"disablePublisher":       false,
 			"disableSubscriber":      false,

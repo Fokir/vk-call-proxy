@@ -1,3 +1,9 @@
 [submodule "refs/vk-turn-proxy"]
 	path = refs/vk-turn-proxy
 	url = https://github.com/cacggghp/vk-turn-proxy
+[submodule "refs/olcrtc"]
+	path = refs/olcrtc
+	url = https://github.com/openlibrecommunity/olcrtc
+[submodule "refs/whitelist-bypass"]
+	path = refs/whitelist-bypass
+	url = https://github.com/kulikov0/whitelist-bypass

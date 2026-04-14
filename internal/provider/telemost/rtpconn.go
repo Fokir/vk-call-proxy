@@ -29,7 +29,7 @@ import (
 // maxVP8Data is the maximum VPN data per VP8 frame to ensure each frame fits
 // in a single RTP packet. RTP MTU ~1200 bytes minus VP8 RTP descriptor (~5 bytes)
 // minus VP8 header (16 bytes) minus reliability header (3 bytes) minus chunk header (4 bytes).
-const maxVP8Data = 1100
+const maxVP8Data = 1300
 
 // Adaptive pacing constants (AIMD). The write pace between consecutive VP8
 // frames is dynamically adjusted based on the rate of incoming NACKs from
@@ -191,7 +191,7 @@ func (c *RTPConn) nextPktSeqNum() uint16 {
 // reassemblyTimeout is the maximum time to wait for a missing write-sequence.
 // If FEC + repeated NACKs can't recover the data within this window,
 // the connection is closed (MUX requires reliable delivery — skipping corrupts framing).
-const reassemblyTimeout = 3 * time.Second
+const reassemblyTimeout = 10 * time.Second
 
 // reassemblyLoop reads chunkPayloads from readCh, reassembles multi-chunk
 // messages, and delivers them in write-sequence order to orderedCh.
