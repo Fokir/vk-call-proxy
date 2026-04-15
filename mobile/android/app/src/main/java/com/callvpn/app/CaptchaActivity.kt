@@ -2,28 +2,36 @@ package com.callvpn.app
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.webkit.*
 import android.widget.LinearLayout
 
 /**
  * Full-screen Activity that shows VK captcha in a WebView.
  * Started by CaptchaSolverCallback, returns success_token via a static latch.
+ *
+ * The VK captcha widget (id.vk.com/not_robot_captcha) runs entirely in the top
+ * frame — the captchaNotRobot.check fetch is made from id.vk.com JavaScript
+ * directly, not from a cross-origin iframe — so patching window.fetch and
+ * XMLHttpRequest from the top-frame context is sufficient to capture the
+ * success_token.
  */
 class CaptchaActivity : Activity() {
 
-    private lateinit var webView: WebView
+    private var webView: WebView? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var delivered = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val redirectUri = intent.getStringExtra(EXTRA_REDIRECT_URI) ?: run {
-            resultToken = ""
-            latch?.countDown()
-            finish()
+            deliverToken("")
             return
         }
 
-        webView = WebView(this).apply {
+        val wv = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.MATCH_PARENT
@@ -33,53 +41,18 @@ class CaptchaActivity : Activity() {
             settings.userAgentString = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
             webViewClient = object : WebViewClient() {
+                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    // Inject as early as possible so the hook is in place
+                    // before the captcha SDK binds its handlers.
+                    view?.evaluateJavascript(INTERCEPT_JS, null)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    android.util.Log.d("CaptchaActivity", "onPageFinished: $url")
-                    // Start polling for success_token in the DOM after page loads.
-                    startTokenPolling(view)
-                    // Inject JS to intercept both XHR and fetch responses.
-                    view?.evaluateJavascript("""
-                        (function() {
-                            function checkResponse(url, text) {
-                                if (url && url.indexOf('captchaNotRobot.check') !== -1) {
-                                    try {
-                                        var resp = JSON.parse(text);
-                                        if (resp.response && resp.response.success_token) {
-                                            Android.onToken(resp.response.success_token);
-                                        }
-                                    } catch(e) {}
-                                }
-                            }
-                            // Intercept XMLHttpRequest
-                            var origOpen = XMLHttpRequest.prototype.open;
-                            var origSend = XMLHttpRequest.prototype.send;
-                            XMLHttpRequest.prototype.open = function(method, url) {
-                                this._captchaUrl = url;
-                                return origOpen.apply(this, arguments);
-                            };
-                            XMLHttpRequest.prototype.send = function() {
-                                var xhr = this;
-                                this.addEventListener('load', function() {
-                                    checkResponse(xhr._captchaUrl, xhr.responseText);
-                                });
-                                return origSend.apply(this, arguments);
-                            };
-                            // Intercept fetch
-                            var origFetch = window.fetch;
-                            window.fetch = function(input, init) {
-                                var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-                                return origFetch.apply(this, arguments).then(function(response) {
-                                    if (url.indexOf('captchaNotRobot.check') !== -1) {
-                                        response.clone().text().then(function(text) {
-                                            checkResponse(url, text);
-                                        });
-                                    }
-                                    return response;
-                                });
-                            };
-                        })();
-                    """.trimIndent(), null)
+                    // Re-inject in case the page replaced window.fetch after
+                    // onPageStarted (some SDKs do this during their own init).
+                    view?.evaluateJavascript(INTERCEPT_JS, null)
                 }
             }
 
@@ -93,58 +66,48 @@ class CaptchaActivity : Activity() {
             addJavascriptInterface(object {
                 @JavascriptInterface
                 fun onToken(token: String) {
-                    resultToken = token
-                    latch?.countDown()
-                    runOnUiThread { finish() }
+                    deliverToken(token)
                 }
             }, "Android")
         }
 
-        setContentView(webView)
-        webView.loadUrl(redirectUri)
+        webView = wv
+        setContentView(wv)
+        wv.loadUrl(redirectUri)
     }
 
-    private var polling = false
-
-    private fun startTokenPolling(view: WebView?) {
-        if (polling || view == null) return
-        polling = true
-        // Poll every 500ms: check if captcha was solved by looking for
-        // the checked checkbox state or by re-injecting XHR/fetch intercept.
-        val handler = android.os.Handler(mainLooper)
-        val runnable = object : Runnable {
-            override fun run() {
-                if (!polling) return
-                // Try to read success_token from VK captcha SDK's internal state.
-                view.evaluateJavascript("""
-                    (function() {
-                        // Method 1: Check if checkbox has 'checked' class (captcha passed)
-                        var cb = document.querySelector('input[type="checkbox"]');
-                        if (cb && cb.checked) {
-                            // Captcha was checked, now look for success indicator
-                            var ok = document.querySelector('[class*="checkboxBlock--success"], [class*="Success"], [class*="success"]');
-                            if (ok) return 'CHECKED_SUCCESS';
-                        }
-                        return '';
-                    })()
-                """.trimIndent()) { result ->
-                    android.util.Log.d("CaptchaActivity", "poll result: $result")
-                }
-                handler.postDelayed(this, 500)
-            }
+    private fun deliverToken(token: String) {
+        if (delivered) return
+        delivered = true
+        resultToken = token
+        latch?.countDown()
+        mainHandler.post {
+            if (!isFinishing) finish()
         }
-        handler.postDelayed(runnable, 1000)
     }
 
     override fun onBackPressed() {
-        // User cancelled — return empty token.
-        resultToken = ""
-        latch?.countDown()
+        deliverToken("")
         super.onBackPressed()
     }
 
     override fun onDestroy() {
-        webView.destroy()
+        mainHandler.removeCallbacksAndMessages(null)
+        // Ensure the Go thread unblocks even if the user dismissed the
+        // Activity without solving — otherwise the latch waits 2 full minutes.
+        if (!delivered) {
+            delivered = true
+            resultToken = ""
+            latch?.countDown()
+        }
+        webView?.let { wv ->
+            wv.stopLoading()
+            wv.webViewClient = WebViewClient()
+            wv.webChromeClient = null
+            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+            wv.destroy()
+        }
+        webView = null
         super.onDestroy()
     }
 
@@ -154,5 +117,54 @@ class CaptchaActivity : Activity() {
         // Communication between CaptchaSolverCallback (Go thread) and this Activity.
         @Volatile var resultToken: String = ""
         @Volatile var latch: java.util.concurrent.CountDownLatch? = null
+
+        private const val INTERCEPT_JS = """
+            (function() {
+                if (window.__captchaHookInstalled) return;
+                window.__captchaHookInstalled = true;
+
+                function reportToken(text) {
+                    try {
+                        var resp = JSON.parse(text);
+                        var token = resp && resp.response && resp.response.success_token;
+                        if (token && window.Android && window.Android.onToken) {
+                            window.Android.onToken(token);
+                        }
+                    } catch (e) {}
+                }
+
+                var origOpen = XMLHttpRequest.prototype.open;
+                var origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__captchaUrl = url || '';
+                    return origOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    var xhr = this;
+                    this.addEventListener('load', function() {
+                        if (xhr.__captchaUrl && xhr.__captchaUrl.indexOf('captchaNotRobot.check') !== -1) {
+                            reportToken(xhr.responseText);
+                        }
+                    });
+                    return origSend.apply(this, arguments);
+                };
+
+                if (window.fetch) {
+                    var origFetch = window.fetch;
+                    window.fetch = function(input, init) {
+                        var url = typeof input === 'string'
+                            ? input
+                            : (input && input.url ? input.url : '');
+                        var p = origFetch.apply(this, arguments);
+                        if (url && url.indexOf('captchaNotRobot.check') !== -1) {
+                            p.then(function(resp) {
+                                resp.clone().text().then(reportToken).catch(function(){});
+                            }).catch(function(){});
+                        }
+                        return p;
+                    };
+                }
+            })();
+        """
     }
 }
