@@ -21,8 +21,18 @@ import (
 )
 
 // ErrNotSlider is returned when the captcha is not a slider type.
-// ChainSolver uses this to fall back to the next solver.
+// Kept as a sentinel for ChainSolver fallback decisions made elsewhere.
 var ErrNotSlider = fmt.Errorf("captcha is not slider type")
+
+// checkboxAnswer is base64(JSON.stringify({})) — sent as `answer` for checkbox
+// captcha in captchaNotRobot.check. Mirrors not_robot_captcha.js (Ww(JSON.stringify({value: t}))
+// where t is undefined for checkbox, so JSON is "{}" → "e30=").
+const checkboxAnswer = "e30="
+
+// debugInfoFallback is the hardcoded fallback for `debug_info` inside
+// not_robot_captcha.js (window.vk.brlefapmjnpg || "8526f575..."). VK never sets
+// brlefapmjnpg in its own code paths, so the fallback is always sent.
+const debugInfoFallback = "8526f575cd75b95c7974b2ed50c7d67ed07f71048b48f88c64ed9cb498c0942d"
 
 // DirectSolver solves VK captcha by making direct API calls,
 // mimicking the browser captchaNotRobot flow without actual browser.
@@ -60,10 +70,10 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	adFp := randomAdFp(r)
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 
-	// Step 0: Fetch the captcha page to extract captcha_settings and PoW params.
+	// Step 0: Fetch the captcha page to extract PoW params (and slider settings if present).
 	pageData, err := fetchCaptchaPage(ctx, client, ua, redirectURI)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrNotSlider, err)
+		return "", fmt.Errorf("fetch captcha page: %w", err)
 	}
 
 	// Step 1: captchaNotRobot.settings
@@ -79,30 +89,36 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	}
 	slog.Debug("captcha direct: settings response", "resp", string(settingsResp))
 
-	// Step 2: captchaNotRobot.getContent (slider puzzle).
-	slog.Debug("captcha direct: getContent (slider)")
-	contentResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.getContent", url.Values{
-		"session_token":    {sessionToken},
-		"domain":           {domain},
-		"adFp":             {adFp},
-		"captcha_settings": {pageData.sliderSettings},
-		"access_token":     {""},
-	})
-	if err != nil {
-		return "", fmt.Errorf("getContent: %w", err)
-	}
+	// Step 2 (slider only): captchaNotRobot.getContent + puzzle solve.
+	// For checkbox captcha `answer` is the constant `e30=`; getContent is skipped.
+	sliderAnswer := checkboxAnswer
+	if pageData.captchaType == "slider" && pageData.sliderSettings != "" {
+		slog.Debug("captcha direct: getContent (slider)")
+		contentResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.getContent", url.Values{
+			"session_token":    {sessionToken},
+			"domain":           {domain},
+			"adFp":             {adFp},
+			"captcha_settings": {pageData.sliderSettings},
+			"access_token":     {""},
+		})
+		if err != nil {
+			return "", fmt.Errorf("getContent: %w", err)
+		}
 
-	puzzle, err := parseSliderContent(contentResp)
-	if err != nil {
-		return "", fmt.Errorf("parse slider content: %w", err)
-	}
+		puzzle, err := parseSliderContent(contentResp)
+		if err != nil {
+			return "", fmt.Errorf("parse slider content: %w", err)
+		}
 
-	answer, err := solveSlider(puzzle)
-	if err != nil {
-		return "", fmt.Errorf("solve slider: %w", err)
+		answer, err := solveSlider(puzzle)
+		if err != nil {
+			return "", fmt.Errorf("solve slider: %w", err)
+		}
+		sliderAnswer = encodeSliderAnswer(answer)
+		slog.Debug("captcha direct: slider solved", "position", len(answer)/2, "maxPos", len(puzzle.swapPairs)/2)
+	} else {
+		slog.Debug("captcha direct: checkbox mode (no getContent)", "captchaType", pageData.captchaType)
 	}
-	sliderAnswer := encodeSliderAnswer(answer)
-	slog.Debug("captcha direct: slider solved", "position", len(answer)/2, "maxPos", len(puzzle.swapPairs)/2)
 
 	// Simulate delay (sensor collection + user solving).
 	delay := time.Duration(1500+r.Intn(2000)) * time.Millisecond
@@ -122,7 +138,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"session_token": {sessionToken},
 		"domain":        {domain},
 		"adFp":          {adFp},
-		"browser_fp":    {""},
+		"browser_fp":    {browserFp},
 		"device":        {string(deviceJSON)},
 		"access_token":  {""},
 	})
@@ -130,10 +146,10 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		return "", fmt.Errorf("componentDone: %w", err)
 	}
 
-	// Simulate slider interaction delay.
-	sliderDelay := time.Duration(500+r.Intn(1000)) * time.Millisecond
+	// Simulate user interaction delay.
+	interactDelay := time.Duration(500+r.Intn(1000)) * time.Millisecond
 	select {
-	case <-time.After(sliderDelay):
+	case <-time.After(interactDelay):
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -150,9 +166,6 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	// Proof-of-work hash (SHA-256 with leading zeros, computed from HTML page params).
 	hash := computeProofOfWork(pageData.powInput, pageData.powDifficulty)
 
-	// debug_info is a hardcoded constant in VK's JS.
-	const debugInfo = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
-
 	checkResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.check", url.Values{
 		"session_token":      {sessionToken},
 		"domain":             {domain},
@@ -167,7 +180,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"browser_fp":         {browserFp},
 		"hash":               {hash},
 		"answer":             {sliderAnswer},
-		"debug_info":         {debugInfo},
+		"debug_info":         {debugInfoFallback},
 		"access_token":       {""},
 	})
 	if err != nil {
@@ -213,6 +226,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 
 // captchaPageData holds data extracted from the captcha HTML page.
 type captchaPageData struct {
+	captchaType    string // "checkbox" | "slider" | "sound" — from show_captcha_type
 	sliderSettings string // captcha_settings for slider type
 	powInput       string // proof-of-work input string
 	powDifficulty  int    // number of leading hex zeros required
@@ -240,12 +254,18 @@ func fetchCaptchaPage(ctx context.Context, client *http.Client, ua, redirectURI 
 
 	data := &captchaPageData{powDifficulty: 2} // default difficulty
 
-	// Extract slider captcha_settings: {"type":"slider","settings":"<value>"}
+	// Initial captcha variant chosen by VK for this session.
+	// The HTML always contains captcha_settings entries for slider+sound (so the
+	// user can switch), but show_captcha_type tells us which one is active.
+	reShow := regexp.MustCompile(`"show_captcha_type"\s*:\s*"([^"]+)"`)
+	if match := reShow.FindSubmatch(body); match != nil {
+		data.captchaType = string(match[1])
+	}
+
+	// Extract slider captcha_settings: {"type":"slider","settings":"<value>"}.
 	reSettings := regexp.MustCompile(`"type"\s*:\s*"slider"\s*,\s*"settings"\s*:\s*"([^"]+)"`)
 	if match := reSettings.FindSubmatch(body); match != nil {
 		data.sliderSettings = strings.ReplaceAll(string(match[1]), `\/`, `/`)
-	} else {
-		return nil, fmt.Errorf("slider captcha_settings not found in captcha page")
 	}
 
 	// Extract PoW input: const powInput = "...";
@@ -335,20 +355,20 @@ func vkCaptchaPost(ctx context.Context, client *http.Client, ua, method string, 
 }
 
 type deviceInfo struct {
-	ScreenWidth           int    `json:"screenWidth"`
-	ScreenHeight          int    `json:"screenHeight"`
-	ScreenAvailWidth      int    `json:"screenAvailWidth"`
-	ScreenAvailHeight     int    `json:"screenAvailHeight"`
-	InnerWidth            int    `json:"innerWidth"`
-	InnerHeight           int    `json:"innerHeight"`
-	DevicePixelRatio      int    `json:"devicePixelRatio"`
-	Language              string `json:"language"`
-	Languages             []string `json:"languages"`
-	Webdriver             bool   `json:"webdriver"`
-	HardwareConcurrency   int    `json:"hardwareConcurrency"`
-	DeviceMemory          int    `json:"deviceMemory"`
-	ConnectionEffType     string `json:"connectionEffectiveType"`
-	NotificationsPermission string `json:"notificationsPermission"`
+	ScreenWidth             int      `json:"screenWidth"`
+	ScreenHeight            int      `json:"screenHeight"`
+	ScreenAvailWidth        int      `json:"screenAvailWidth"`
+	ScreenAvailHeight       int      `json:"screenAvailHeight"`
+	InnerWidth              int      `json:"innerWidth"`
+	InnerHeight             int      `json:"innerHeight"`
+	DevicePixelRatio        int      `json:"devicePixelRatio"`
+	Language                string   `json:"language"`
+	Languages               []string `json:"languages"`
+	Webdriver               bool     `json:"webdriver"`
+	HardwareConcurrency     int      `json:"hardwareConcurrency"`
+	DeviceMemory            int      `json:"deviceMemory"`
+	ConnectionEffType       string   `json:"connectionEffectiveType"`
+	NotificationsPermission string   `json:"notificationsPermission"`
 }
 
 func generateDeviceInfo(r *rand.Rand) deviceInfo {
@@ -357,19 +377,19 @@ func generateDeviceInfo(r *rand.Rand) deviceInfo {
 	idx := r.Intn(len(widths))
 	w, h := widths[idx], heights[idx]
 	return deviceInfo{
-		ScreenWidth:           w,
-		ScreenHeight:          h,
-		ScreenAvailWidth:      w,
-		ScreenAvailHeight:     h - 48,
-		InnerWidth:            w/2 + r.Intn(200),
-		InnerHeight:           h - 100 - r.Intn(100),
-		DevicePixelRatio:      1,
-		Language:              "ru",
-		Languages:             []string{"ru"},
-		Webdriver:             false,
-		HardwareConcurrency:   []int{8, 12, 16, 24}[r.Intn(4)],
-		DeviceMemory:          []int{8, 16, 32}[r.Intn(3)],
-		ConnectionEffType:     "4g",
+		ScreenWidth:             w,
+		ScreenHeight:            h,
+		ScreenAvailWidth:        w,
+		ScreenAvailHeight:       h - 48,
+		InnerWidth:              w/2 + r.Intn(200),
+		InnerHeight:             h - 100 - r.Intn(100),
+		DevicePixelRatio:        1,
+		Language:                "ru",
+		Languages:               []string{"ru"},
+		Webdriver:               false,
+		HardwareConcurrency:     []int{8, 12, 16, 24}[r.Intn(4)],
+		DeviceMemory:            []int{8, 16, 32}[r.Intn(3)],
+		ConnectionEffType:       "4g",
 		NotificationsPermission: "denied",
 	}
 }
@@ -378,7 +398,6 @@ type cursorPoint struct {
 	X int `json:"x"`
 	Y int `json:"y"`
 }
-
 
 func generateConnectionRtt(r *rand.Rand) []int {
 	base := 50 + r.Intn(100)
@@ -416,8 +435,9 @@ func randomAdFp(r *rand.Rand) string {
 
 // computeProofOfWork computes SHA-256(powInput + nonce) until the hash
 // starts with `difficulty` leading hex zeros. Matches VK's JS implementation:
-//   hash = SHA-256(powInput + nonceString)
-//   while (!hash.startsWith("0".repeat(difficulty)))
+//
+//	hash = SHA-256(powInput + nonceString)
+//	while (!hash.startsWith("0".repeat(difficulty)))
 func computeProofOfWork(powInput string, difficulty int) string {
 	if powInput == "" || difficulty <= 0 {
 		return ""
