@@ -13,6 +13,8 @@ env:
   GO_VERSION: "1.25.7"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  SCRIPTS_URL: "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts"
+  SCRIPTS_PUBKEY: "KWlSq4jch/HU+xEsFrBHYCijc38o/Qc/CIJA51S9j80="
 
 jobs:
   build-desktop:
@@ -55,12 +57,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Sync bundled scripts
+        run: make bundle
+
       - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go build -ldflags="-s -w" -o ${{ matrix.output }} ${{ matrix.target }}
+        run: |
+          LDFLAGS="-s -w -X github.com/call-vpn/call-vpn/internal/scripts.DefaultURL=${SCRIPTS_URL} -X github.com/call-vpn/call-vpn/internal/scripts.DefaultPublicKey=${SCRIPTS_PUBKEY}"
+          go build -ldflags="$LDFLAGS" -o ${{ matrix.output }} ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -126,10 +133,14 @@ jobs:
           key: gobuild-android-${{ env.GO_VERSION }}-${{ hashFiles('go.sum', 'mobile/bind/**/*.go', 'internal/**/*.go') }}
           restore-keys: gobuild-android-${{ env.GO_VERSION }}-
 
+      - name: Sync bundled scripts
+        run: make bundle
+
       - name: Build Go AAR
         run: |
           mkdir -p mobile/android/app/libs
-          gomobile bind -ldflags="-checklinkname=0" -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
+          LDFLAGS="-checklinkname=0 -X github.com/call-vpn/call-vpn/internal/scripts.DefaultURL=${SCRIPTS_URL} -X github.com/call-vpn/call-vpn/internal/scripts.DefaultPublicKey=${SCRIPTS_PUBKEY}"
+          gomobile bind -ldflags="$LDFLAGS" -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
 
       - name: Build and sign APK
         env:
@@ -200,6 +211,51 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SCRIPTS_URL=${{ env.SCRIPTS_URL }}
+            SCRIPTS_PUBKEY=${{ env.SCRIPTS_PUBKEY }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-scripts-updater:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-scripts-updater
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push scripts-updater image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.scripts-updater
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SCRIPTS_URL=${{ env.SCRIPTS_URL }}
+            SCRIPTS_PUBKEY=${{ env.SCRIPTS_PUBKEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -239,11 +295,14 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SCRIPTS_URL=${{ env.SCRIPTS_URL }}
+            SCRIPTS_PUBKEY=${{ env.SCRIPTS_PUBKEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   release:
-    needs: [build-desktop, build-android, build-ios, build-server, build-captcha]
+    needs: [build-desktop, build-android, build-ios, build-server, build-captcha, build-scripts-updater]
     runs-on: ubuntu-latest
 
     steps:

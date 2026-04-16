@@ -91,7 +91,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 
 	// Step 2 (slider only): captchaNotRobot.getContent + puzzle solve.
 	// For checkbox captcha `answer` is the constant `e30=`; getContent is skipped.
-	sliderAnswer := checkboxAnswer
+	sliderAnswer := captchaCheckboxAnswer(checkboxAnswer)
 	if pageData.captchaType == "slider" && pageData.sliderSettings != "" {
 		slog.Debug("captcha direct: getContent (slider)")
 		contentResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.getContent", url.Values{
@@ -180,7 +180,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"browser_fp":         {browserFp},
 		"hash":               {hash},
 		"answer":             {sliderAnswer},
-		"debug_info":         {debugInfoFallback},
+		"debug_info":         {captchaDebugInfo(debugInfoFallback)},
 		"access_token":       {""},
 	})
 	if err != nil {
@@ -324,7 +324,7 @@ func generateSliderCursor(r *rand.Rand) []cursorPoint {
 }
 
 func vkCaptchaPost(ctx context.Context, client *http.Client, ua, method string, data url.Values) ([]byte, error) {
-	endpoint := fmt.Sprintf("https://api.vk.com/method/%s?v=5.131", method)
+	endpoint := fmt.Sprintf("https://api.vk.com/method/%s?v=%s", method, captchaAPIVersion("5.131"))
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err

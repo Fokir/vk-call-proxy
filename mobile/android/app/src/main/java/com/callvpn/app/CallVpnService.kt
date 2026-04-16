@@ -18,6 +18,7 @@ import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import bind.Tunnel
 import bind.TunnelConfig
+import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
@@ -162,6 +163,8 @@ class CallVpnService : VpnService() {
 
             val t = Tunnel()
             t.setCaptchaCallback(CaptchaSolverCallback(this@CallVpnService))
+            val scriptsDir = File(filesDir, "scripts").apply { mkdirs() }
+            t.initScripts("", "", scriptsDir.absolutePath)
             tunnel = t
 
             // Start stage+log poller BEFORE t.start() so UI sees connection stages.

@@ -20,6 +20,8 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/tunnel"
 )
 
@@ -52,6 +54,7 @@ func main() {
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
 	captchaEndpoint := flag.String("captcha-endpoint", "", "captcha-service URL, empty = open system browser")
+	scriptsFlags := scripts.RegisterFlags(flag.CommandLine)
 
 	flag.Parse()
 
@@ -95,6 +98,15 @@ func main() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	siren := monitoring.New(logger)
+
+	ctxRoot, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	scriptsMgr := scripts.NewManager(scriptsFlags.BuildConfig(scripts.NewSlogLogger(logger.With("component", "scripts"))))
+	if err := scriptsMgr.Start(ctxRoot); err != nil {
+		logger.Warn("scripts manager start failed", "err", err)
+	}
+	defer scriptsMgr.Stop()
+	scriptshook.Register(scriptsMgr)
 
 	// Create captcha solver.
 	var solver provider.CaptchaSolver

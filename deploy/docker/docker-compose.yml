@@ -1,4 +1,24 @@
 services:
+  scripts-updater:
+    image: ghcr.io/fokir/vk-call-proxy-scripts-updater:${IMAGE_TAG:-latest}
+    command:
+      - --scripts-interval=${SCRIPTS_INTERVAL:-1h}
+    environment:
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+    volumes:
+      - scripts:/var/lib/callvpn/scripts
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   server:
     image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-latest}
     ports:
@@ -10,8 +30,13 @@ services:
       - TURN_CONNS=${TURN_CONNS:-16}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=${CAPTCHA_ENDPOINT:-http://captcha:8090}
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
     depends_on:
       - captcha
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
@@ -29,6 +54,12 @@ services:
     init: true
     environment:
       - MAX_CONCURRENT=${CAPTCHA_MAX_CONCURRENT:-1}
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
+    depends_on:
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
@@ -40,3 +71,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  scripts:

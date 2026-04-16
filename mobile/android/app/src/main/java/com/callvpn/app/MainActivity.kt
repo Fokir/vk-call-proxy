@@ -49,7 +49,11 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 enum class VpnState { Disconnected, Connecting, Connected }
@@ -65,6 +69,9 @@ class MainActivity : ComponentActivity() {
     private var speedTestPhase = mutableStateOf("")
     private var speedTestProgress = mutableStateOf("")
     private var speedTestResult = mutableStateOf("")
+    private var availableUpdate = mutableStateOf<UpdateManager.Update?>(null)
+    private lateinit var updateTunnel: bind.Tunnel
+    private lateinit var updateManager: UpdateManager
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
@@ -176,6 +183,18 @@ class MainActivity : ComponentActivity() {
 
         handleQuickConnect(intent)
 
+        // Initialise hot-scripts manager (idempotent) — used here to check
+        // for APK updates and kept alive for the app lifetime.
+        val scriptsDir = java.io.File(filesDir, "scripts").apply { mkdirs() }
+        updateTunnel = bind.Tunnel().apply { initScripts("", "", scriptsDir.absolutePath) }
+        updateManager = UpdateManager(this)
+        lifecycleScope.launch {
+            while (isActive) {
+                availableUpdate.value = updateManager.check(updateTunnel)
+                delay(5 * 60 * 1000L)
+            }
+        }
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(
@@ -203,9 +222,27 @@ class MainActivity : ComponentActivity() {
                             startService(intent)
                         },
                         onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
-                        onDisconnect = { stopVpn() }
+                        onDisconnect = { stopVpn() },
+                        availableUpdate = availableUpdate.value,
+                        onInstallUpdate = { installAdvertisedUpdate() }
                     )
                 }
+            }
+        }
+    }
+
+    private fun installAdvertisedUpdate() {
+        Toast.makeText(this, "Скачивание обновления…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            try {
+                updateTunnel.triggerScriptsCheck()
+                val apk = updateManager.download(updateTunnel)
+                val ok = updateManager.install(apk)
+                if (!ok) {
+                    Toast.makeText(this@MainActivity, "Не удалось запустить установку", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Ошибка: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -322,7 +359,9 @@ fun CallVpnScreen(
     speedTestResult: String = "",
     onSpeedTestStart: () -> Unit = {},
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
-    onDisconnect: () -> Unit
+    onDisconnect: () -> Unit,
+    availableUpdate: UpdateManager.Update? = null,
+    onInstallUpdate: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val profileManager = remember { ProfileManager(context) }
@@ -579,12 +618,30 @@ fun CallVpnScreen(
             }
         }
 
-        // App version
-        Text(
-            text = "v${BuildConfig.VERSION_NAME}",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        // App version + optional update button
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "v${BuildConfig.VERSION_NAME}",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (availableUpdate != null) {
+                TextButton(
+                    onClick = onInstallUpdate,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = "Обновить до ${availableUpdate.version}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFF4CAF50)
+                    )
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(24.dp))
 

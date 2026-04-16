@@ -1,0 +1,47 @@
+{
+  "vk": {
+    "api_version": "5.275",
+    "ws": {
+      "app_version": "1.1",
+      "version": "5",
+      "capabilities": "2F7F",
+      "compression": "deflate-raw"
+    },
+    "user_agents": [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
+    ]
+  },
+  "captcha": {
+    "api_version": "5.131",
+    "checkbox_answer": "e30=",
+    "debug_info_fallback": "8526f575cd75b95c7974b2ed50c7d67ed07f71048b48f88c64ed9cb498c0942d",
+    "direct_solver": {
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "language": "ru",
+      "languages": ["ru-RU", "ru", "en-US", "en"]
+    },
+    "chromedp_solver": {
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "checkbox_selectors": [
+        "[class*=\"Checkbox-module__Checkbox\"]",
+        "label[class*=\"Checkbox\"]",
+        "label",
+        "[role=\"checkbox\"]",
+        "input[type=\"checkbox\"]"
+      ]
+    },
+    "stealth": {
+      "languages": ["ru-RU", "ru", "en-US", "en"],
+      "platform": "Win32",
+      "webgl_vendor": "Intel Inc.",
+      "webgl_renderer": "Intel Iris OpenGL Engine"
+    }
+  }
+}

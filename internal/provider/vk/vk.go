@@ -239,7 +239,7 @@ func (s *Service) vkJoinToken(ctx context.Context, client *http.Client, ua strin
 		"name":         {provider.RandomDisplayName()},
 		"access_token": {token3},
 	}
-	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
+	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", apiVersion())
 
 	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
@@ -328,7 +328,7 @@ func vkGetCallToken(ctx context.Context, client *http.Client, ua string, accessT
 		"env":          {"production"},
 		"access_token": {accessToken},
 	}
-	endpoint := fmt.Sprintf("https://api.vk.com/method/messages.getCallToken?v=%s&client_id=%s", vkAPIVersion, vkClientID)
+	endpoint := fmt.Sprintf("https://api.vk.com/method/messages.getCallToken?v=%s&client_id=%s", apiVersion(), vkClientID)
 	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", "", err

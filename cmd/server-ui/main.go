@@ -23,6 +23,8 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
@@ -543,6 +545,20 @@ func handleCaptchaMode(w http.ResponseWriter, r *http.Request) {
 func main() {
 	cfg := loadConfig()
 	state := newAppState(len(cfg.Instances))
+
+	logger := slog.Default()
+	ctxRoot, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	scriptsCfg := scripts.ResolveConfig(scripts.Config{
+		LocalDir: scripts.DefaultLocalDir(),
+		Logger:   scripts.NewSlogLogger(logger.With("component", "scripts")),
+	})
+	scriptsMgr := scripts.NewManager(scriptsCfg)
+	if err := scriptsMgr.Start(ctxRoot); err != nil {
+		logger.Warn("scripts manager start failed", "err", err)
+	}
+	defer scriptsMgr.Stop()
+	scriptshook.Register(scriptsMgr)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex)

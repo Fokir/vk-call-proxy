@@ -3,12 +3,18 @@ FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
 
+ARG SCRIPTS_URL=""
+ARG SCRIPTS_PUBKEY=""
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /captcha-service ./cmd/captcha-service/
+RUN go run ./tools/scripts-sign bundle -src hot-scripts -dst internal/scripts/bundled
+RUN CGO_ENABLED=0 go build \
+      -ldflags="-s -w -X github.com/call-vpn/call-vpn/internal/scripts.DefaultURL=${SCRIPTS_URL} -X github.com/call-vpn/call-vpn/internal/scripts.DefaultPublicKey=${SCRIPTS_PUBKEY}" \
+      -o /captcha-service ./cmd/captcha-service/
 
 # Runtime stage: full Chrome + virtual display (Xvfb)
 # This makes Chrome behave identically to a real desktop browser,

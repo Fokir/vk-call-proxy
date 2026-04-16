@@ -29,9 +29,14 @@ var userAgentPool = []string{
 
 func joinParamsWithDeviceIdx(deviceIdx int) string {
 	ua := randomUserAgent()
-	return fmt.Sprintf(joinParamTemplate, deviceIdx, url.QueryEscape(ua))
+	return fmt.Sprintf(
+		"platform=WEB&appVersion=%s&version=%s&device=browser&capabilities=%s&clientType=VK&tgt=join&compression=%s&deviceIdx=%d&ua=%s",
+		wsAppVersion(), wsVersion(), wsCapabilities(), wsCompression(),
+		deviceIdx, url.QueryEscape(ua),
+	)
 }
 
 func randomUserAgent() string {
-	return userAgentPool[rand.IntN(len(userAgentPool))]
+	pool := userAgents()
+	return pool[rand.IntN(len(pool))]
 }

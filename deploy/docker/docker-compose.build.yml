@@ -1,10 +1,28 @@
 ## Development: build from source
 ## Usage: docker compose -f docker-compose.build.yml up --build
 services:
+  scripts-updater:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.scripts-updater
+      args:
+        SCRIPTS_URL: ${SCRIPTS_URL:-https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts}
+        SCRIPTS_PUBKEY: ${SCRIPTS_PUBKEY:-KWlSq4jch/HU+xEsFrBHYCijc38o/Qc/CIJA51S9j80=}
+    command:
+      - --scripts-interval=${SCRIPTS_INTERVAL:-1h}
+    environment:
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+    volumes:
+      - scripts:/var/lib/callvpn/scripts
+    restart: unless-stopped
+
   server:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      args:
+        SCRIPTS_URL: ${SCRIPTS_URL:-https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts}
+        SCRIPTS_PUBKEY: ${SCRIPTS_PUBKEY:-KWlSq4jch/HU+xEsFrBHYCijc38o/Qc/CIJA51S9j80=}
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
@@ -13,8 +31,13 @@ services:
       - ALSO_DIRECT=${ALSO_DIRECT:-}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=${CAPTCHA_ENDPOINT:-http://captcha:8090}
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
     depends_on:
       - captcha
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
@@ -31,7 +54,17 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.captcha
+      args:
+        SCRIPTS_URL: ${SCRIPTS_URL:-https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts}
+        SCRIPTS_PUBKEY: ${SCRIPTS_PUBKEY:-KWlSq4jch/HU+xEsFrBHYCijc38o/Qc/CIJA51S9j80=}
     init: true
+    environment:
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
+    depends_on:
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
@@ -43,3 +76,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  scripts:

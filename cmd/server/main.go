@@ -16,6 +16,8 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 
@@ -44,6 +46,7 @@ func main() {
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
 	captchaEndpoint := flag.String("captcha-endpoint", "", "captcha-service URL (e.g. http://captcha:8090, env: CAPTCHA_ENDPOINT)")
+	scriptsFlags := scripts.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 
 	if *verbose {
@@ -91,6 +94,15 @@ func main() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
+	ctxRoot, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	scriptsMgr := scripts.NewManager(scriptsFlags.BuildConfig(scripts.NewSlogLogger(logger.With("component", "scripts"))))
+	if err := scriptsMgr.Start(ctxRoot); err != nil {
+		logger.Warn("scripts manager start failed", "err", err)
+	}
+	defer scriptsMgr.Stop()
+	scriptshook.Register(scriptsMgr)
+
 	cfg := server.Config{
 		ListenAddr: *listenAddr,
 		AuthToken:  *authToken,
@@ -125,11 +137,8 @@ func main() {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	srv := server.New(cfg)
-	srv.Start(ctx)
+	srv.Start(ctxRoot)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

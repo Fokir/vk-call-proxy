@@ -55,3 +55,14 @@ test/integration/.env
 .claude
 CLAUDE.md
 testdata/
+
+# Ed25519 signing keys
+secrets/
+/server
+/captcha-service
+/server-ui
+/client
+/scripts-updater
+/callvpn-server
+/callvpn-client
+/callvpn-captcha

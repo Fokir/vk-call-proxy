@@ -1,0 +1,72 @@
+name: Publish hot-scripts
+
+# Resigns hot-scripts/manifest.json whenever any script inside hot-scripts/
+# changes and commits the new signed manifest back to master. Clients polling
+# the raw.githubusercontent URL pick up the new bundle on their next manifest
+# check. The workflow skips itself by using [skip ci] in the commit message.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "hot-scripts/**"
+      - "!hot-scripts/manifest.json"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.25.7"
+  SCRIPTS_BASE_URL: "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Write signing key
+        env:
+          SCRIPTS_SIGNING_KEY: ${{ secrets.SCRIPTS_SIGNING_KEY }}
+        run: |
+          if [ -z "$SCRIPTS_SIGNING_KEY" ]; then
+            echo "::error::Secret SCRIPTS_SIGNING_KEY is not set. Generate keys with 'make keygen' and add the contents of secrets/scripts-signing.key to repo secrets." >&2
+            exit 1
+          fi
+          mkdir -p .tmp-scripts
+          printf "%s" "$SCRIPTS_SIGNING_KEY" > .tmp-scripts/signing.key
+          chmod 600 .tmp-scripts/signing.key
+
+      - name: Sign manifest
+        run: |
+          VERSION="$(date -u +'%Y.%m.%d-%H%M%S')-${GITHUB_SHA::7}"
+          go run ./tools/scripts-sign sign \
+            -dir hot-scripts \
+            -priv .tmp-scripts/signing.key \
+            -base-url "${SCRIPTS_BASE_URL}" \
+            -version "$VERSION"
+          echo "Signed manifest version: $VERSION"
+
+      - name: Clean up key
+        if: always()
+        run: rm -rf .tmp-scripts
+
+      - name: Commit & push signed manifest
+        run: |
+          if git diff --quiet hot-scripts/manifest.json; then
+            echo "manifest.json unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add hot-scripts/manifest.json
+          git commit -m "chore(scripts): resign manifest [skip ci]"
+          git push origin HEAD:master

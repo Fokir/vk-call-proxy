@@ -13,8 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"log/slog"
+
 	"github.com/call-vpn/call-vpn/internal/captcha"
 	"github.com/call-vpn/call-vpn/internal/provider"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 )
 
 type solveRequest struct {
@@ -56,11 +60,22 @@ func main() {
 	requestTimeout := flag.Duration("request-timeout", 2*time.Minute, "total request timeout including queue wait")
 	verbose := flag.Bool("verbose", false, "verbose logging")
 	noHeadless := flag.Bool("no-headless", false, "show Chrome window (for debugging)")
+	scriptsFlags := scripts.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 
 	if *noHeadless {
 		captcha.Headless = false
 	}
+
+	logger := slog.Default()
+	ctxRoot, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	scriptsMgr := scripts.NewManager(scriptsFlags.BuildConfig(scripts.NewSlogLogger(logger.With("component", "scripts"))))
+	if err := scriptsMgr.Start(ctxRoot); err != nil {
+		logger.Warn("scripts manager start failed", "err", err)
+	}
+	defer scriptsMgr.Stop()
+	scriptshook.Register(scriptsMgr)
 
 	s := &server{
 		solver: captcha.NewChainSolver(

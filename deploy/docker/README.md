@@ -10,6 +10,7 @@
 - [Быстрый старт](#-быстрый-старт)
 - [Как это работает](#-как-это-работает)
 - [Режимы работы](#-режимы-работы)
+- [Hot-update скриптов](#hot-update-скриптов)
 - [Конфигурация](#-конфигурация)
 - [Примеры docker-compose.yml](#-примеры-docker-composeyml)
 - [Подключение клиента](#-подключение-клиента)
@@ -41,6 +42,16 @@ mkdir call-vpn && cd call-vpn
 
 ```yaml
 services:
+  scripts-updater:
+    image: ghcr.io/fokir/vk-call-proxy-scripts-updater:${IMAGE_TAG:-latest}
+    command:
+      - --scripts-interval=${SCRIPTS_INTERVAL:-1h}
+    environment:
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+    volumes:
+      - scripts:/var/lib/callvpn/scripts
+    restart: unless-stopped
+
   server:
     image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-latest}
     ports:
@@ -52,8 +63,13 @@ services:
       - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=http://captcha:8090
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
     depends_on:
       - captcha
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
@@ -68,12 +84,22 @@ services:
 
   captcha:
     image: ghcr.io/fokir/vk-call-proxy-captcha:${IMAGE_TAG:-latest}
+    environment:
+      - CALLVPN_SCRIPTS_DIR=/var/lib/callvpn/scripts
+      - CALLVPN_SCRIPTS_URL=
+    volumes:
+      - scripts:/var/lib/callvpn/scripts:ro
+    depends_on:
+      - scripts-updater
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: ${CAPTCHA_MEMORY_LIMIT:-512M}
           cpus: "${CAPTCHA_CPU_LIMIT:-1.0}"
+
+volumes:
+  scripts:
 ```
 
 **3. Создайте `.env` и запустите**
@@ -208,6 +234,37 @@ TURN_CONNS=4
 
 ---
 
+## Hot-update скриптов
+
+Параметры VK (API-версии, User-Agent, captcha-константы, stealth-JS) меняются чаще, чем выходят релизы. Чтобы не пересобирать образы при каждом таком изменении, в compose входит отдельный контейнер **`scripts-updater`**, который:
+
+1. Периодически (по умолчанию раз в час, флаг `--scripts-interval`) скачивает `manifest.json` с `raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/`.
+2. Проверяет Ed25519-подпись манифеста встроенным публичным ключом (вшит в бинарь через ldflags в CI).
+3. Сверяет SHA-256 каждого файла, скачивает изменённые.
+4. Атомарно записывает всё в named volume `scripts`, подмонтированный к `server` и `captcha` read-only.
+5. `server` и `captcha` по mtime `manifest.json` видят обновление и перечитывают конфиг/скрипты без рестарта.
+
+**Каталог volume:** `/var/lib/callvpn/scripts/` внутри контейнеров.
+
+**Env-переопределения (если нужно использовать свой источник):**
+
+| Переменная | Назначение |
+|:-----------|:-----------|
+| `CALLVPN_SCRIPTS_URL` | Альтернативный базовый URL вместо ldflags-дефолта |
+| `CALLVPN_SCRIPTS_PUBKEY` | Альтернативный Ed25519 public key (base64) |
+| `CALLVPN_SCRIPTS_DIR` | Путь к локальному кэшу |
+| `SCRIPTS_INTERVAL` | Период проверки updater'а (формат Go duration: `30m`, `2h`) |
+
+В readers (`server`, `captcha`) оставь `CALLVPN_SCRIPTS_URL=` (пустой) — тогда они не делают собственных HTTP-запросов и доверяют updater'у через shared volume.
+
+**Надёжность:**
+
+- Если удалённый манифест недоступен или подпись битая — updater пропускает обновление, клиенты продолжают работать на bundled-копии из образа.
+- Если новая версия даёт 3 ошибки за 5 минут — автоматический откат на предыдущую и quarantine плохого manifest'а до следующего изменения.
+- `min_client_version` в манифесте предотвращает применение скриптов, требующих более новый Go-код.
+
+---
+
 ## Конфигурация
 
 Все параметры задаются через файл `.env` рядом с `docker-compose.yml`.
@@ -229,6 +286,10 @@ TURN_CONNS=4
 | `CPU_LIMIT` | `1.0` | Лимит CPU сервера (количество ядер) |
 | `CAPTCHA_MEMORY_LIMIT` | `512M` | Лимит RAM для captcha-сервиса (Chrome ~200MB) |
 | `CAPTCHA_CPU_LIMIT` | `1.0` | Лимит CPU captcha-сервиса |
+| `SCRIPTS_INTERVAL` | `1h` | Частота проверки hot-scripts manifest (updater) |
+| `CALLVPN_SCRIPTS_URL` | *(ldflags)* | Альтернативный URL источника hot-scripts |
+| `CALLVPN_SCRIPTS_PUBKEY` | *(ldflags)* | Альтернативный Ed25519 public key |
+| `CALLVPN_SCRIPTS_DIR` | `/var/lib/callvpn/scripts` | Каталог shared volume в контейнере |
 
 ### Минимальный .env (direct mode)
 
@@ -594,3 +655,4 @@ MEMORY_LIMIT=512M
 - Используется **distroless** runtime (минимальная поверхность атаки)
 - Трафик шифруется **DTLS 1.2** (AES-128-GCM)
 - Самоподписанные сертификаты генерируются автоматически при запуске
+- Hot-update скрипты защищены **Ed25519** подписью + SHA-256 каждого файла; неверная подпись или хеш → обновление отклоняется, остаётся работать предыдущая версия

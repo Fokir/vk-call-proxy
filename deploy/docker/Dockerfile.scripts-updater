@@ -1,4 +1,6 @@
-# Build stage
+# Sidecar that polls the scripts URL and writes the bundle into a shared
+# volume. Readers (server, captcha-service, server-ui) mount the same volume
+# and reload via the manager's store-watch goroutine.
 FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
@@ -14,16 +16,11 @@ COPY . .
 RUN go run ./tools/scripts-sign bundle -src hot-scripts -dst internal/scripts/bundled
 RUN CGO_ENABLED=0 go build \
       -ldflags="-s -w -X github.com/call-vpn/call-vpn/internal/scripts.DefaultURL=${SCRIPTS_URL} -X github.com/call-vpn/call-vpn/internal/scripts.DefaultPublicKey=${SCRIPTS_PUBKEY}" \
-      -o /server ./cmd/server
+      -o /scripts-updater ./cmd/scripts-updater
 
-# Runtime stage (distroless)
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /server /server
-
-EXPOSE 9000/udp
+COPY --from=builder /scripts-updater /scripts-updater
 
 USER nonroot:nonroot
-
-ENTRYPOINT ["/server"]
-CMD ["--listen=0.0.0.0:9000"]
+ENTRYPOINT ["/scripts-updater"]

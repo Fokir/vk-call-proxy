@@ -71,9 +71,63 @@ App → MUX → DTLS → TURN(client) ↔ TURN(server) → DTLS → MUX → Inte
 |:----------|:---------|:----------|
 | **Сервер** | DTLS/UDP listener, группировка сессий, проксирование | Linux (Docker) |
 | **Captcha-сервис** | Автоматическое решение ██ капчи через headless Chrome | Linux (Docker) |
+| **Scripts-updater** | Sidecar, качает подписанные hot-update скрипты в shared volume | Linux (Docker) |
 | **Desktop-клиент** | SOCKS5 + HTTP прокси, TURN + DTLS туннель | Windows, macOS |
-| **Android** | Нативное приложение с gomobile | Android 7+ |
+| **Android** | Нативное приложение с gomobile, self-update APK через `PackageInstaller` | Android 7+ |
 | **iOS** | Нативное приложение с PacketTunnel | iOS 15+ [не реализованно полноценно] |
+
+---
+
+## Hot-update скриптов
+
+VK-капча, параметры авторизации и User-Agent пулы меняются часто. Чтобы не перевыпускать релизы и не переустанавливать APK при каждом обновлении VK, критичные значения вынесены в отдельный каталог [`hot-scripts/`](hot-scripts/) и подгружаются клиентами в рантайме.
+
+**Что там хранится:**
+
+| Файл | Содержимое |
+|:-----|:-----------|
+| `hot-scripts/vk-config.json` | API-версии VK, endpoints, UA-pool, WS-параметры, captcha-константы (`checkbox_answer`, `debug_info`, селекторы) |
+| `hot-scripts/stealth.js` | JS-инъекция для headless Chrome (anti-detection) |
+| `hot-scripts/manifest.json` | Подписанный Ed25519 индекс: версия, SHA-256 каждого файла, опциональный блок `apk` для Android self-update |
+
+**Как это работает:**
+
+1. Все бинари имеют bundled-копию скриптов ([`internal/scripts/bundled/`](internal/scripts/bundled/)) через `//go:embed` — работает без сети при первом запуске.
+2. [`internal/scripts.Manager`](internal/scripts/) периодически (раз в час + по ошибкам) тянет `manifest.json` с `raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/`.
+3. Подпись Ed25519 проверяется встроенным публичным ключом (вшивается через ldflags в CI).
+4. При успехе скрипты сохраняются атомарно в локальный кэш, старая версия держится для rollback.
+5. Если новая версия вызвала 3 ошибки за 5 минут — автоматический откат + quarantine.
+6. В Docker `scripts-updater` работает sidecar'ом и пишет в shared volume; server + captcha-service читают оттуда через mtime-polling.
+7. На Android `Tunnel.initScripts()` поднимает manager; `UpdateManager` сверяет `manifest.apk.version` с `BuildConfig.VERSION_NAME` и показывает кнопку «Обновить» в UI.
+
+**Обновление без релиза:**
+
+```bash
+# 1. Отредактировать hot-scripts/vk-config.json или stealth.js
+# 2. Подписать и закоммитить
+make bundle                     # синхронизирует internal/scripts/bundled/
+git add hot-scripts/ internal/scripts/bundled/
+git commit -m "chore(scripts): bump VK API version"
+git push
+```
+
+GitHub Actions workflow [`scripts-publish.yml`](.github/workflows/scripts-publish.yml) пере-подписывает `manifest.json` и коммитит обратно с `[skip ci]`. Клиенты подтягивают изменения при следующей проверке.
+
+**Генерация ключей (один раз):**
+
+```bash
+make keygen                     # создаёт secrets/scripts-signing.{key,pub}
+# Приватный ключ → GitHub Secret SCRIPTS_SIGNING_KEY
+# Публичный → env SCRIPTS_PUBKEY в .github/workflows/release.yml
+```
+
+**Override URL источника:**
+
+- CLI: `--scripts-url=https://...` / `--scripts-pubkey=<base64>`
+- Env: `CALLVPN_SCRIPTS_URL`, `CALLVPN_SCRIPTS_PUBKEY`, `CALLVPN_SCRIPTS_DIR`
+- Compile-time: `-ldflags "-X github.com/call-vpn/call-vpn/internal/scripts.DefaultURL=... -X github.com/call-vpn/call-vpn/internal/scripts.DefaultPublicKey=..."`
+
+Подробнее: `internal/scripts/` + `tools/scripts-sign/` + `cmd/scripts-updater/`.
 
 ---
 
@@ -216,7 +270,16 @@ gomobile bind -target=ios -o mobile/ios/Bind.xcframework ./mobile/bind
 | `--n` | `4` | Количество TURN-соединений (relay mode) |
 | `--tcp` | `true` | TCP для TURN (relay mode) |
 
-Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `ALSO_DIRECT=1` — dual mode, `SIREN_SLACK_WEBHOOK` — Slack-алерты.
+Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `ALSO_DIRECT=1` — dual mode, `SIREN_SLACK_WEBHOOK` — Slack-алерты, `CALLVPN_SCRIPTS_URL` / `CALLVPN_SCRIPTS_PUBKEY` / `CALLVPN_SCRIPTS_DIR` — override источника hot-update скриптов.
+
+**Hot-update флаги (применимы ко всем бинарям, включая `scripts-updater`):**
+
+| Флаг | По умолчанию | Описание |
+|:-----|:-------------|:---------|
+| `--scripts-url` | *(ldflags / env)* | Базовый URL для `manifest.json` |
+| `--scripts-pubkey` | *(ldflags / env)* | Ed25519 public key (base64) для проверки подписи |
+| `--scripts-dir` | `./var/scripts` | Локальный каталог кэша |
+| `--scripts-interval` | `1h` | Период проверки manifest (updater) |
 
 ### Клиент
 
@@ -239,8 +302,20 @@ Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKE
 call-vpn/
 ├── cmd/
 │   ├── server/main.go          # VPN-сервер: DTLS listener, сессии, проксирование
-│   └── client/main.go          # Desktop-клиент: TURN + DTLS + прокси
+│   ├── client/main.go          # Desktop-клиент: TURN + DTLS + прокси
+│   ├── server-ui/              # GUI-обёртка сервера
+│   ├── captcha-service/        # HTTP API для решения ██ капчи
+│   └── scripts-updater/        # Sidecar: качает подписанные hot-update скрипты в shared volume
+├── hot-scripts/                # Hot-update контент (публикуется через GitHub raw)
+│   ├── vk-config.json          #   VK API версии, UA, WS params, captcha-константы
+│   ├── stealth.js              #   Anti-detection JS для headless Chrome
+│   └── manifest.json           #   Ed25519-подписанный индекс (автогенерация в CI)
+├── tools/
+│   └── scripts-sign/           # CLI: keygen / sign / verify / bundle
 ├── internal/
+│   ├── scripts/                # Manager: fetch + verify + atomic swap + rollback
+│   │   └── bundled/            #   //go:embed fallback на случай отсутствия сети
+│   ├── scriptshook/            # Регистрация Manager в captcha + vk пакетах
 │   ├── dtls/                   # DTLS шифрование
 │   │   ├── server.go           #   Listener (pion/dtls)
 │   │   ├── client.go           #   DialOverTURN + AsyncPacketPipe
@@ -271,10 +346,8 @@ call-vpn/
 │       ├── .env.example        # Шаблон конфигурации
 │       └── README.md           # Инструкция по деплою
 └── .github/workflows/
-    ├── build-server.yml        # Docker image → GHCR
-    ├── build-desktop.yml       # Бинарники: Windows, macOS
-    ├── build-mobile.yml        # Android APK, iOS IPA
-    └── release.yml             # GitHub Release при тэгах
+    ├── release.yml             # Desktop + Android + Docker + GitHub Release при тэгах
+    └── scripts-publish.yml     # Автоподпись hot-scripts/manifest.json при push в hot-scripts/**
 ```
 
 ---
@@ -329,10 +402,8 @@ call-vpn/
 
 | Workflow | Триггер | Результат |
 |:---------|:--------|:----------|
-| `build-server` | push/PR → main, tags `v*` | Docker image → `ghcr.io/fokir/vk-call-proxy` |
-| `build-desktop` | push/PR → main | `client-windows-amd64.exe`, `client-darwin-*` |
-| `build-mobile` | push/PR → main | `app-release.apk`, `CallVPN.ipa` |
-| `release` | tag `v*` | GitHub Release с артефактами |
+| `release` | tag `v*` | Desktop бинари + Android APK + Docker images (server, captcha, scripts-updater) + GitHub Release |
+| `scripts-publish` | push в `hot-scripts/**` | Переподпись `manifest.json` (Ed25519) и commit с `[skip ci]` |
 
 ---
 
@@ -343,6 +414,7 @@ call-vpn/
 - **Сертификаты:** самоподписанные, генерируются при каждом запуске
 - **Контейнер:** distroless runtime, непривилегированный пользователь `nonroot`
 - **Маскировка:** трафик неотличим от ██████████ для ███
+- **Hot-update:** Ed25519-подпись manifest + SHA-256 каждого файла, публичный ключ вшит через ldflags; неверная подпись игнорируется, 3 ошибки за 5 мин → автоматический rollback + quarantine
 
 ---
 

@@ -6,11 +6,13 @@ package bind
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +26,8 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/speedtest"
 	"github.com/call-vpn/call-vpn/internal/tunnel"
 	"github.com/call-vpn/call-vpn/internal/turn"
@@ -132,6 +136,11 @@ type Tunnel struct {
 	networkDebounce *time.Timer    // coalesces rapid network change events
 	networkForce    chan struct{}   // signals reconnectLoop to do immediate full reconnect
 
+	// hot-reload scripts manager (VK config, captcha scripts) — lifecycle tied to Tunnel
+	scripts       *scripts.Manager
+	scriptsCtx    context.Context
+	scriptsCancel context.CancelFunc
+
 	// multi-call pool (non-nil in pool mode)
 	pool *tunnel.CallPool
 
@@ -185,6 +194,147 @@ func NewTunnel() *Tunnel {
 // Must be called before Start(). If not set, captcha errors are propagated.
 func (t *Tunnel) SetCaptchaCallback(cb CaptchaCallback) {
 	t.captchaCb = cb
+}
+
+// InitScripts initialises the hot-reload scripts manager. Call once at app
+// start, before Start(). All parameters are optional: if url is empty the
+// manager relies on compile-time DefaultURL and bundled fallback; if localDir
+// is empty a writable cache under the process temp dir is used. Must be
+// balanced by ShutdownScripts() if you wish to stop background polling early;
+// otherwise Stop() will clean up.
+func (t *Tunnel) InitScripts(url, pubKey, localDir string) {
+	if t.scripts != nil {
+		return
+	}
+	cfg := scripts.ResolveConfig(scripts.Config{
+		URL:       url,
+		PublicKey: pubKey,
+		LocalDir:  localDir,
+		Logger:    scripts.NewSlogLogger(t.logger.With("component", "scripts")),
+	})
+	if cfg.LocalDir == "" {
+		cfg.LocalDir = scripts.DefaultLocalDir()
+	}
+	t.scripts = scripts.NewManager(cfg)
+	t.scriptsCtx, t.scriptsCancel = context.WithCancel(context.Background())
+	if err := t.scripts.Start(t.scriptsCtx); err != nil {
+		t.logger.Warn("scripts manager start failed", "err", err)
+	}
+	scriptshook.Register(t.scripts)
+}
+
+// TriggerScriptsCheck requests an immediate manifest check. Safe to call when
+// InitScripts has not been invoked (no-op).
+func (t *Tunnel) TriggerScriptsCheck() {
+	if t.scripts != nil {
+		t.scripts.TriggerCheck()
+	}
+}
+
+// ScriptsVersion returns the version of the currently loaded bundle, or an
+// empty string if no bundle is loaded.
+func (t *Tunnel) ScriptsVersion() string {
+	if t.scripts == nil {
+		return ""
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil {
+		return ""
+	}
+	return b.Manifest.Version
+}
+
+// ShutdownScripts stops the background polling loop. Idempotent.
+func (t *Tunnel) ShutdownScripts() {
+	if t.scriptsCancel != nil {
+		t.scriptsCancel()
+		t.scriptsCancel = nil
+	}
+	if t.scripts != nil {
+		t.scripts.Stop()
+		scriptshook.Register(nil)
+		t.scripts = nil
+	}
+}
+
+// APKUpdateVersion returns the APK version advertised in the current
+// manifest, or empty string if no APK entry is present.
+func (t *Tunnel) APKUpdateVersion() string {
+	if t.scripts == nil {
+		return ""
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil || b.Manifest.APK == nil {
+		return ""
+	}
+	return b.Manifest.APK.Version
+}
+
+// APKUpdateURL returns the download URL for the APK in the current manifest,
+// or empty string if no APK entry is present.
+func (t *Tunnel) APKUpdateURL() string {
+	if t.scripts == nil {
+		return ""
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil || b.Manifest.APK == nil {
+		return ""
+	}
+	return b.Manifest.APK.URL
+}
+
+// APKUpdateSHA256 returns the SHA-256 hex of the advertised APK, or empty.
+func (t *Tunnel) APKUpdateSHA256() string {
+	if t.scripts == nil {
+		return ""
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil || b.Manifest.APK == nil {
+		return ""
+	}
+	return b.Manifest.APK.SHA256
+}
+
+// DownloadAPK fetches the APK advertised in the current manifest, verifies
+// its sha256, writes it to destPath, and returns the absolute path. Blocks
+// for up to 10 minutes.
+func (t *Tunnel) DownloadAPK(destPath string) error {
+	if t.scripts == nil {
+		return fmt.Errorf("scripts manager not initialised")
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil || b.Manifest.APK == nil {
+		return fmt.Errorf("no APK entry in current manifest")
+	}
+	apk := b.Manifest.APK
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apk.URL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != apk.SHA256 {
+		return fmt.Errorf("apk sha256 mismatch")
+	}
+	if err := os.WriteFile(destPath, data, 0o644); err != nil {
+		return err
+	}
+	t.logger.Info("apk downloaded", "path", destPath, "version", apk.Version, "bytes", len(data))
+	return nil
 }
 
 // ReadLogs returns all buffered log lines as a single string

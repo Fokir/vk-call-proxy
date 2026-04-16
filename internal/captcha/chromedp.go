@@ -130,7 +130,7 @@ func SolveCaptchaURI(ctx context.Context, redirectURI string) (string, error) {
 	if err := chromedp.Run(taskCtx,
 		network.Enable(),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(stealthJS).Do(ctx)
+			_, err := page.AddScriptToEvaluateOnNewDocument(scriptsFile("stealth.js", stealthJS)).Do(ctx)
 			return err
 		}),
 		chromedp.Navigate(redirectURI),
