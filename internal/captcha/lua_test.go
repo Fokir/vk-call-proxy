@@ -194,6 +194,53 @@ func TestLuaMod_HTTP(t *testing.T) {
 	}
 }
 
+func TestLuaMod_Utils(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			-- Regex
+			local m = re.match("token=([^&]+)", "foo=bar&token=abc123&x=1")
+			if m == nil then error("re.match nil") end
+			if m[1] ~= "abc123" then error("re.match[1]: " .. tostring(m[1])) end
+
+			local all = re.find_all("\\d+", "a1b23c456")
+			if #all ~= 3 then error("re.find_all: " .. #all) end
+
+			local r = re.replace("world", "hello world", "lua")
+			if r ~= "hello lua" then error("re.replace: " .. r) end
+
+			-- URL
+			local enc = url.encode("hello world&foo")
+			if not string.find(enc, "hello") then error("url.encode") end
+			local dec = url.decode(enc)
+			if dec ~= "hello world&foo" then error("url.decode: " .. dec) end
+
+			local p = url.parse("https://api.vk.com/method/test?v=5.131&key=val")
+			if p.host ~= "api.vk.com" then error("url.parse host: " .. tostring(p.host)) end
+			if p.raw_query.v ~= "5.131" then error("url.parse query v") end
+
+			-- Time
+			local now = time.now()
+			if now < 1000000000000 then error("time.now") end
+
+			-- Log (no crash)
+			log.info("test", "k", "v")
+			log.debug("dbg")
+			log.warn("wrn", "code", 42)
+
+			return "utils-ok"
+		end
+	`))
+
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "utils-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
 func TestLuaSolver_ChallengeFields(t *testing.T) {
 	s := NewLuaSolver(nil)
 	s.SetScript([]byte(`

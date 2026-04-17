@@ -21,4 +21,8 @@ func RegisterAll(L *lua.LState, opts Options) {
 	RegisterJSON(L)
 	RegisterCrypto(L)
 	RegisterHTTP(L, opts)
+	RegisterRe(L)
+	RegisterURL(L)
+	RegisterTime(L, opts.Ctx)
+	RegisterLog(L, opts.Logger)
 }
