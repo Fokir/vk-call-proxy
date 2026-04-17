@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/call-vpn/call-vpn/internal/captcha/luamod"
@@ -13,10 +14,13 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
+const luaSolverFile = "solver.lua"
+
 // LuaSolver runs a Lua script to solve captcha challenges.
 // Each SolveCaptcha call creates a fresh VM.
 type LuaSolver struct {
-	mgr *scripts.Manager
+	mgr    *scripts.Manager
+	logger *slog.Logger
 
 	mu       sync.Mutex
 	override []byte // script override for testing
@@ -24,7 +28,10 @@ type LuaSolver struct {
 
 // NewLuaSolver creates a LuaSolver that loads solver.lua from mgr.
 func NewLuaSolver(mgr *scripts.Manager) *LuaSolver {
-	return &LuaSolver{mgr: mgr}
+	return &LuaSolver{
+		mgr:    mgr,
+		logger: slog.Default().With("component", "lua-solver"),
+	}
 }
 
 // SetScript overrides the solver script (for testing).
@@ -49,7 +56,8 @@ func (s *LuaSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaChalle
 
 	// Build module options.
 	opts := luamod.Options{
-		Ctx: ctx,
+		Ctx:    ctx,
+		Logger: s.logger,
 		SolveSlider: func(contentJSON []byte) (string, error) {
 			puzzle, err := parseSliderContent(contentJSON)
 			if err != nil {
@@ -95,6 +103,7 @@ func (s *LuaSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaChalle
 		NRet:    1,
 		Protect: true,
 	}, tbl); err != nil {
+		reportScriptFailure(luaSolverFile)
 		return nil, fmt.Errorf("lua solve(): %w", err)
 	}
 

@@ -231,7 +231,7 @@ function solve(challenge)
     end
 
     -- Step 0: Fetch captcha page for PoW params and captcha type.
-    log.debug("fetch captcha page", "url", challenge.redirect_uri)
+    log.info("lua-solver: fetching captcha page", "sid", challenge.captcha_sid)
     local page = fetch_captcha_page(ua, challenge.redirect_uri)
 
     -- Step 1: captchaNotRobot.settings
@@ -342,5 +342,6 @@ function solve(challenge)
         })
     end)
 
+    log.info("lua-solver: captcha solved successfully", "sid", challenge.captcha_sid, "type", page.captcha_type or "checkbox")
     return result.response.success_token
 end
