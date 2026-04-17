@@ -117,7 +117,7 @@ func main() {
 	if len(callLinks) > 0 {
 		var vkOpts []vk.Option
 		{
-			solvers := []provider.CaptchaSolver{captcha.NewDirectSolver()}
+			solvers := []provider.CaptchaSolver{captcha.NewLuaSolver(scriptsMgr)}
 			if *captchaEndpoint != "" {
 				solvers = append(solvers, captcha.NewRemoteSolver(*captchaEndpoint))
 			}

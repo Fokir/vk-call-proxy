@@ -112,12 +112,12 @@ func main() {
 	var solver provider.CaptchaSolver
 	if *captchaEndpoint != "" {
 		solver = captcha.NewChainSolver(
-			captcha.NewDirectSolver(),
+			captcha.NewLuaSolver(scriptsMgr),
 			captcha.NewRemoteSolver(*captchaEndpoint),
 		)
 	} else {
 		solver = captcha.NewChainSolver(
-			captcha.NewDirectSolver(),
+			captcha.NewLuaSolver(scriptsMgr),
 			captcha.NewInteractiveSolver(),
 		)
 	}

@@ -79,7 +79,7 @@ func main() {
 
 	s := &server{
 		solver: captcha.NewChainSolver(
-			captcha.NewDirectSolver(),
+			captcha.NewLuaSolver(scriptsMgr),
 			captcha.NewChromedpSolver(),
 		),
 		sem:            make(chan struct{}, *maxConcurrent),

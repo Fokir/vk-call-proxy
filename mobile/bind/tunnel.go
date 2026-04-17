@@ -424,7 +424,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	} else {
 		var vkOpts []vk.Option
 		{
-			solvers := []provider.CaptchaSolver{captcha.NewDirectSolver()}
+			solvers := []provider.CaptchaSolver{captcha.NewLuaSolver(t.scripts)}
 			if t.captchaCb != nil {
 				solvers = append(solvers, &callbackSolver{cb: t.captchaCb})
 			}
