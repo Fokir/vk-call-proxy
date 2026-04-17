@@ -7,8 +7,8 @@
       "url": "bundled://stealth.js"
     },
     "vk-config.json": {
-      "sha256": "1a7c2a653cb4eb0aa5fb58ab3cb6d74dd4a4141fdfec74cb96f6e55334859957",
-      "size": 2117,
+      "sha256": "a2fa31cc7aa8e40fb4fc24e1921e16bb4a1c22b1b14ebd18fa2dbc12a4aa39f8",
+      "size": 2140,
       "url": "bundled://vk-config.json"
     }
   },

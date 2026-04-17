@@ -68,7 +68,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	adFp := randomAdFp(r)
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+	ua := captchaUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 
 	// Step 0: Fetch the captcha page to extract PoW params (and slider settings if present).
 	pageData, err := fetchCaptchaPage(ctx, client, ua, redirectURI)
@@ -166,6 +166,13 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	// Proof-of-work hash (SHA-256 with leading zeros, computed from HTML page params).
 	hash := computeProofOfWork(pageData.powInput, pageData.powDifficulty)
 
+	slog.Info("captcha direct: submitting check",
+		"ua", ua,
+		"type", pageData.captchaType,
+		"pow_difficulty", pageData.powDifficulty,
+		"domain", domain,
+	)
+
 	checkResp, err := vkCaptchaPost(ctx, client, ua, "captchaNotRobot.check", url.Values{
 		"session_token":      {sessionToken},
 		"domain":             {domain},
@@ -186,6 +193,8 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("check: %w", err)
 	}
+
+	slog.Info("captcha direct: check response", "body", string(checkResp))
 
 	// Parse success_token from response.
 	var checkResult struct {
@@ -384,8 +393,8 @@ func generateDeviceInfo(r *rand.Rand) deviceInfo {
 		InnerWidth:              w/2 + r.Intn(200),
 		InnerHeight:             h - 100 - r.Intn(100),
 		DevicePixelRatio:        1,
-		Language:                "ru",
-		Languages:               []string{"ru"},
+		Language:                captchaLanguage("ru"),
+		Languages:               captchaLanguages([]string{"ru"}),
 		Webdriver:               false,
 		HardwareConcurrency:     []int{8, 12, 16, 24}[r.Intn(4)],
 		DeviceMemory:            []int{8, 16, 32}[r.Intn(3)],

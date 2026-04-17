@@ -49,6 +49,19 @@ func NewCallPool(cfg PoolConfig) *CallPool {
 	}
 }
 
+// closableCtx derives a context from ctx that is also cancelled when Close() is called.
+func (p *CallPool) closableCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-p.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // slotDelay returns the configured slot connect delay, falling back to the default constant.
 func (p *CallPool) slotDelay() time.Duration {
 	if p.cfg.SlotConnectDelay > 0 {
@@ -61,6 +74,9 @@ func (p *CallPool) slotDelay() time.Duration {
 // and returns the shared MUX for proxy to use.
 // First slot to establish connections makes the MUX available; remaining continue in background.
 func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
+	ctx, cancel := p.closableCtx(ctx)
+	defer cancel()
+
 	p.logger.Info("starting client pool", "calls", len(p.cfg.Services), "conns_per_call", p.cfg.ConnsPerCall)
 
 	p.mu.Lock()
@@ -138,6 +154,9 @@ func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
 
 // StartServer connects all slots, pre-allocates TURN, waits for clients.
 func (p *CallPool) StartServer(ctx context.Context) (*mux.Mux, error) {
+	ctx, cancel := p.closableCtx(ctx)
+	defer cancel()
+
 	p.logger.Info("starting server pool", "calls", len(p.cfg.Services), "conns_per_call", p.cfg.ConnsPerCall)
 
 	p.mu.Lock()

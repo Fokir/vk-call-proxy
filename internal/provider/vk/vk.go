@@ -257,22 +257,44 @@ func (s *Service) vkJoinToken(ctx context.Context, client *http.Client, ua strin
 		slog.Info("captcha required, solving...", "captcha_sid", errResp.Error.CaptchaSID)
 		start := time.Now()
 
-		result, solveErr := s.captcha.SolveCaptcha(ctx, &provider.CaptchaChallenge{
+		// refreshCaptcha re-triggers the same VK API call to obtain a fresh
+		// captcha_sid after a solver burns the current one.
+		refreshCaptcha := func() (*provider.CaptchaChallenge, error) {
+			freshBody, ferr := httpPost(ctx, client, ua, endpoint, data)
+			if ferr != nil {
+				return nil, ferr
+			}
+			var freshResp vkErrorResponse
+			if ferr := json.Unmarshal(freshBody, &freshResp); ferr != nil || freshResp.Error == nil || freshResp.Error.Code != 14 {
+				return nil, fmt.Errorf("expected captcha error on refresh, got: %s", string(freshBody))
+			}
+			return &provider.CaptchaChallenge{
+				RedirectURI: freshResp.Error.RedirectURI,
+				CaptchaSID:  freshResp.Error.CaptchaSID,
+				CaptchaTS:   freshResp.Error.CaptchaTS,
+				CaptchaImg:  freshResp.Error.CaptchaImg,
+				RefreshFunc: nil, // only one level of refresh
+			}, nil
+		}
+
+		ch := &provider.CaptchaChallenge{
 			RedirectURI: errResp.Error.RedirectURI,
 			CaptchaSID:  errResp.Error.CaptchaSID,
 			CaptchaTS:   errResp.Error.CaptchaTS,
 			CaptchaImg:  errResp.Error.CaptchaImg,
-		})
+			RefreshFunc: refreshCaptcha,
+		}
+		result, solveErr := s.captcha.SolveCaptcha(ctx, ch)
 		if solveErr != nil {
 			slog.Warn("captcha solve failed", "err", solveErr, "duration", time.Since(start))
 			return "", fmt.Errorf("captcha solve: %w", solveErr)
 		}
 		slog.Info("captcha solved", "duration", time.Since(start))
 
-		// Retry with captcha solution.
+		// Retry with captcha solution (use ch which may have been refreshed).
 		data.Set("success_token", result.SuccessToken)
-		data.Set("captcha_sid", errResp.Error.CaptchaSID)
-		data.Set("captcha_ts", fmt.Sprintf("%.2f", errResp.Error.CaptchaTS))
+		data.Set("captcha_sid", ch.CaptchaSID)
+		data.Set("captcha_ts", fmt.Sprintf("%.2f", ch.CaptchaTS))
 		data.Set("captcha_attempt", "1")
 
 		body, err = vkAPIPost(ctx, client, ua, endpoint, data)

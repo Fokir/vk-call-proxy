@@ -8,6 +8,10 @@ type CaptchaChallenge struct {
 	CaptchaSID  string  // captcha_sid from error
 	CaptchaTS   float64 // captcha_ts from error
 	CaptchaImg  string  // fallback: classic captcha image URL
+
+	// RefreshFunc, if set, is called between solver attempts to obtain a fresh
+	// captcha challenge (new captcha_sid) after a solver burns the current one.
+	RefreshFunc func() (*CaptchaChallenge, error)
 }
 
 // CaptchaResult contains the solution to a captcha challenge.

@@ -37,6 +37,17 @@ func (c *ChainSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaChal
 			"index", i,
 			"err", err,
 		)
+		// A failed solver may have burned the current captcha_sid.
+		// Refresh the challenge so the next solver gets a fresh one.
+		if ch.RefreshFunc != nil && i < len(c.solvers)-1 {
+			fresh, rerr := ch.RefreshFunc()
+			if rerr != nil {
+				slog.Warn("captcha refresh failed", "err", rerr)
+			} else {
+				*ch = *fresh
+				slog.Info("captcha refreshed", "new_sid", ch.CaptchaSID)
+			}
+		}
 	}
 	return nil, fmt.Errorf("all captcha solvers failed: %w", lastErr)
 }

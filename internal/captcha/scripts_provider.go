@@ -31,6 +31,31 @@ func captchaDebugInfo(defaultValue string) string {
 	return defaultValue
 }
 
+// captchaUserAgent returns the hot-reloaded User-Agent for DirectSolver or the
+// compiled-in default.
+func captchaUserAgent(defaultUA string) string {
+	if c := hotVKConfig(); c != nil && c.Captcha.DirectSolver.UserAgent != "" {
+		return c.Captcha.DirectSolver.UserAgent
+	}
+	return defaultUA
+}
+
+// captchaLanguage returns the hot-reloaded language for DirectSolver device info.
+func captchaLanguage(defaultLang string) string {
+	if c := hotVKConfig(); c != nil && c.Captcha.DirectSolver.Language != "" {
+		return c.Captcha.DirectSolver.Language
+	}
+	return defaultLang
+}
+
+// captchaLanguages returns the hot-reloaded languages list for DirectSolver device info.
+func captchaLanguages(defaultLangs []string) []string {
+	if c := hotVKConfig(); c != nil && len(c.Captcha.DirectSolver.Languages) > 0 {
+		return c.Captcha.DirectSolver.Languages
+	}
+	return defaultLangs
+}
+
 // captchaAPIVersion returns the hot-reloaded VK captcha API version or the
 // compiled-in default.
 func captchaAPIVersion(defaultVersion string) string {
