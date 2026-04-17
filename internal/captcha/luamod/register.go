@@ -17,7 +17,7 @@ type Options struct {
 }
 
 // RegisterAll registers all Go-backed Lua modules into L.
-// Modules will be added in later tasks.
 func RegisterAll(L *lua.LState, opts Options) {
-	// Empty for now — modules added in later tasks.
+	RegisterJSON(L)
+	RegisterCrypto(L)
 }

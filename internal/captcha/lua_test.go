@@ -77,6 +77,71 @@ func TestLuaSolver_Timeout(t *testing.T) {
 	}
 }
 
+func TestLuaMod_JSON(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			local t = json.decode('{"status":"OK","token":"abc","nums":[1,2,3]}')
+			if t.status ~= "OK" then error("decode status") end
+			if t.nums[2] ~= 2 then error("decode array") end
+			local s = json.encode({result = t.token, count = 42})
+			if not string.find(s, "abc") then error("encode missing abc") end
+			return t.token
+		end
+	`))
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "abc" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
+func TestLuaMod_Crypto(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			-- SHA-256
+			local h = crypto.sha256("hello")
+			if h ~= "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" then
+				error("sha256: " .. h)
+			end
+
+			-- MD5
+			local m = crypto.md5("hello")
+			if m ~= "5d41402abc4b2a76b9719d911017c592" then error("md5: " .. m) end
+
+			-- Base64 roundtrip
+			local enc = crypto.base64_encode("hello world")
+			local dec = crypto.base64_decode(enc)
+			if dec ~= "hello world" then error("base64 roundtrip") end
+
+			-- PoW (difficulty 4 bits = 1 hex zero, should be fast)
+			local nonce = crypto.pow_solve("test", 4)
+			if nonce == "" then error("pow failed") end
+
+			-- Random bytes
+			local r = crypto.random_bytes(16)
+			if #r ~= 16 then error("random_bytes length: " .. #r) end
+
+			-- XOR
+			local x = crypto.xor("ab", "cd")
+			if #x ~= 2 then error("xor length") end
+
+			return "crypto-ok"
+		end
+	`))
+
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "crypto-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
 func TestLuaSolver_ChallengeFields(t *testing.T) {
 	s := NewLuaSolver(nil)
 	s.SetScript([]byte(`
