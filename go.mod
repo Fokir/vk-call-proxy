@@ -12,6 +12,7 @@ require (
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v4 v4.1.4
 	github.com/pion/webrtc/v4 v4.2.9
+	github.com/yuin/gopher-lua v1.1.2
 	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0
 )
 
