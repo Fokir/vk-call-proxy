@@ -313,6 +313,43 @@ func TestLuaSolver_ChallengeFields(t *testing.T) {
 	}
 }
 
+func TestLuaMod_Config(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			if config == nil then error("config nil") end
+			-- config should be a table even if empty
+			if type(config) ~= "table" then error("config not table") end
+			return "config-ok"
+		end
+	`))
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "config-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
+func TestLuaMod_Native(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			if native == nil then error("native nil") end
+			if native.solve_slider == nil then error("solve_slider nil") end
+			return "native-ok"
+		end
+	`))
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "native-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
 func TestLuaMod_Img(t *testing.T) {
 	// Create test PNG
 	testImg := image.NewRGBA(image.Rect(0, 0, 10, 10))

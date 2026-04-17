@@ -2,6 +2,7 @@ package captcha
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -46,8 +47,31 @@ func (s *LuaSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaChalle
 	// Open only safe standard libraries.
 	openSafeLibs(L)
 
+	// Build module options.
+	opts := luamod.Options{
+		Ctx: ctx,
+		SolveSlider: func(contentJSON []byte) (string, error) {
+			puzzle, err := parseSliderContent(contentJSON)
+			if err != nil {
+				return "", err
+			}
+			answer, err := solveSlider(puzzle)
+			if err != nil {
+				return "", err
+			}
+			return encodeSliderAnswer(answer), nil
+		},
+	}
+	if c := hotVKConfig(); c != nil {
+		configBytes, _ := json.Marshal(c)
+		var configMap map[string]interface{}
+		if err := json.Unmarshal(configBytes, &configMap); err == nil {
+			opts.Config = configMap
+		}
+	}
+
 	// Register Go-backed modules.
-	luamod.RegisterAll(L, luamod.Options{Ctx: ctx})
+	luamod.RegisterAll(L, opts)
 
 	// Wire context for timeout/cancellation.
 	L.SetContext(ctx)
