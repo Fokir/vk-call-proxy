@@ -1,6 +1,5 @@
--- solver.lua v2 — Lua port of DirectSolver (internal/captcha/direct.go).
+-- solver.lua — Lua port of DirectSolver (internal/captcha/direct.go).
 -- Solves VK captchaNotRobot via API calls with browser-like telemetry.
-local SOLVER_VERSION = "v2-hot-update-test"
 
 -- Config helpers with hardcoded fallbacks.
 local function get_ua()
