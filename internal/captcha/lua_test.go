@@ -2,6 +2,10 @@ package captcha
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +142,54 @@ func TestLuaMod_Crypto(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.SuccessToken != "crypto-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
+func TestLuaMod_HTTP(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/get":
+			w.Header().Set("X-Test", "hello")
+			fmt.Fprintf(w, `{"method":"GET","ua":"%s"}`, r.Header.Get("User-Agent"))
+		case "/form":
+			r.ParseForm()
+			fmt.Fprintf(w, `{"f1":"%s","f2":"%s"}`, r.FormValue("f1"), r.FormValue("f2"))
+		case "/json":
+			body, _ := io.ReadAll(r.Body)
+			w.Write(body)
+		}
+	}))
+	defer ts.Close()
+
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(fmt.Sprintf(`
+		function solve(challenge)
+			-- GET
+			local r = http.get("%s/get", {["User-Agent"] = "TestBot"})
+			if r.status ~= 200 then error("status: " .. r.status) end
+			local d = json.decode(r.body)
+			if d.ua ~= "TestBot" then error("ua: " .. d.ua) end
+
+			-- POST form
+			local r2 = http.post_form("%s/form", {}, {f1 = "hello", f2 = "world"})
+			local d2 = json.decode(r2.body)
+			if d2.f1 ~= "hello" then error("f1: " .. tostring(d2.f1)) end
+
+			-- POST JSON
+			local r3 = http.post_json("%s/json", {}, {key = "val"})
+			local d3 = json.decode(r3.body)
+			if d3.key ~= "val" then error("key: " .. tostring(d3.key)) end
+
+			return "http-ok"
+		end
+	`, ts.URL, ts.URL, ts.URL)))
+
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "http-ok" {
 		t.Fatalf("got %s", result.SuccessToken)
 	}
 }

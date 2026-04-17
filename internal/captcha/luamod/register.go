@@ -20,4 +20,5 @@ type Options struct {
 func RegisterAll(L *lua.LState, opts Options) {
 	RegisterJSON(L)
 	RegisterCrypto(L)
+	RegisterHTTP(L, opts)
 }
