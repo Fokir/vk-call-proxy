@@ -203,17 +203,13 @@ local function fetch_captcha_page(ua, redirect_uri)
 end
 
 -- Compute proof-of-work hash.
--- Go's computeProofOfWork returns the SHA-256 hash (hex) that has `difficulty`
--- leading hex zeros.  Lua's crypto.pow_solve returns the nonce.  So we must
--- (1) convert hex-zero difficulty → bit difficulty (*4), (2) solve, and
--- (3) compute the final hash from powInput..nonce.
+-- crypto.pow_solve now matches Go's computeProofOfWork exactly:
+-- nonce is decimal int, difficulty is hex-zero count, returns the hash.
 local function compute_pow(pow_input, difficulty)
     if not pow_input or pow_input == "" or difficulty <= 0 then
         return ""
     end
-    local bit_difficulty = difficulty * 4
-    local nonce = crypto.pow_solve(pow_input, bit_difficulty)
-    return crypto.sha256(pow_input .. nonce)
+    return crypto.pow_solve(pow_input, difficulty)
 end
 
 -----------------------------------------------------------------------

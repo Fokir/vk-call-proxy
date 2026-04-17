@@ -12,8 +12,8 @@
       "url": "bundled://vk-config.json"
     },
     "solver.lua": {
-      "sha256": "f1f1996bb075ed8584e6acf0b284994166e0b4f562738c95dae057c1be382fea",
-      "size": 11570,
+      "sha256": "3c409b2c71761b88b92aed0063ead5108d5f1ac03ffcaaac69454978df4a55e4",
+      "size": 11326,
       "url": "bundled://solver.lua"
     }
   },

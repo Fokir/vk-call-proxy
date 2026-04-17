@@ -126,9 +126,10 @@ func TestLuaMod_Crypto(t *testing.T) {
 			local dec = crypto.base64_decode(enc)
 			if dec ~= "hello world" then error("base64 roundtrip") end
 
-			-- PoW (difficulty 4 bits = 1 hex zero, should be fast)
-			local nonce = crypto.pow_solve("test", 4)
-			if nonce == "" then error("pow failed") end
+			-- PoW (difficulty=1 = 1 leading hex zero, fast)
+			local hash = crypto.pow_solve("test", 1)
+			if hash == "" then error("pow failed") end
+			if #hash ~= 64 then error("pow hash length: " .. #hash) end
 
 			-- Random bytes
 			local r = crypto.random_bytes(16)

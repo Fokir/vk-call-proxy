@@ -10,10 +10,10 @@ import (
 	"crypto/sha1" //nolint:gosec
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math/bits"
+	"strconv"
+	"strings"
 
 	lua "github.com/yuin/gopher-lua"
 )
@@ -104,51 +104,38 @@ func cryptoRandomBytes(L *lua.LState) int {
 	return 1
 }
 
-const powMaxIterations = 10_000_000
+const powMaxIterations = 100_000_000
 
-// cryptoPowSolve implements crypto.pow_solve(prefix, difficulty) → nonce string.
-// Finds nonce (hex counter) where sha256(prefix+nonce) has `difficulty` leading zero bits.
+// cryptoPowSolve implements crypto.pow_solve(prefix, difficulty) → hash string.
+// Matches Go computeProofOfWork exactly: nonce is a decimal integer (1,2,3...),
+// finds sha256(prefix + nonce_decimal) with `difficulty` leading HEX zeros,
+// returns the hex hash string (not the nonce).
 func cryptoPowSolve(L *lua.LState) int {
 	prefix := L.CheckString(1)
 	difficulty := L.CheckInt(2)
-	if difficulty < 0 || difficulty > 256 {
-		L.RaiseError("crypto.pow_solve: difficulty must be 0..256")
+	if difficulty < 0 || difficulty > 64 {
+		L.RaiseError("crypto.pow_solve: difficulty must be 0..64 (hex zeros)")
 		return 0
 	}
+	if prefix == "" || difficulty == 0 {
+		L.Push(lua.LString(""))
+		return 1
+	}
 
-	prefixBytes := []byte(prefix)
-	var nonceBuf [8]byte
+	hexPrefix := strings.Repeat("0", difficulty)
 
-	for i := 0; i < powMaxIterations; i++ {
-		binary.BigEndian.PutUint64(nonceBuf[:], uint64(i))
-		nonce := hex.EncodeToString(nonceBuf[:])
-
-		var input []byte
-		input = append(input, prefixBytes...)
-		input = append(input, nonce...)
-
-		h := sha256.Sum256(input)
-		if leadingZeroBits(h[:]) >= difficulty {
-			L.Push(lua.LString(nonce))
+	for nonce := 1; nonce < powMaxIterations; nonce++ {
+		data := prefix + strconv.Itoa(nonce)
+		h := sha256.Sum256([]byte(data))
+		hexStr := hex.EncodeToString(h[:])
+		if strings.HasPrefix(hexStr, hexPrefix) {
+			L.Push(lua.LString(hexStr))
 			return 1
 		}
 	}
 
 	L.RaiseError("crypto.pow_solve: not found within %d iterations", powMaxIterations)
 	return 0
-}
-
-// leadingZeroBits counts the number of leading zero bits in a byte slice.
-func leadingZeroBits(b []byte) int {
-	count := 0
-	for _, v := range b {
-		lz := bits.LeadingZeros8(v)
-		count += lz
-		if lz < 8 {
-			break
-		}
-	}
-	return count
 }
 
 // cryptoXOR implements crypto.xor(data1, data2) → string.
