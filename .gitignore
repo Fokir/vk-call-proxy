@@ -56,6 +56,9 @@ test/integration/.env
 CLAUDE.md
 testdata/
 
+# Scripts local cache
+var/
+
 # Ed25519 signing keys
 secrets/
 /server
