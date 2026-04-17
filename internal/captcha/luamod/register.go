@@ -25,4 +25,6 @@ func RegisterAll(L *lua.LState, opts Options) {
 	RegisterURL(L)
 	RegisterTime(L, opts.Ctx)
 	RegisterLog(L, opts.Logger)
+	RegisterFP(L)
+	RegisterImg(L)
 }

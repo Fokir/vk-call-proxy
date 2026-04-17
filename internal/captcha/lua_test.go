@@ -1,8 +1,13 @@
 package captcha
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -241,6 +246,43 @@ func TestLuaMod_Utils(t *testing.T) {
 	}
 }
 
+func TestLuaMod_FP(t *testing.T) {
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(`
+		function solve(challenge)
+			local points = fp.mouse_path(100, 300, 400, 300, 20)
+			if #points < 10 then error("path too short: " .. #points) end
+			if points[1].x == nil then error("missing x") end
+
+			local dev = fp.device_info(nil)
+			if dev.screenWidth == nil then error("no screenWidth") end
+			if dev.language ~= "ru" then error("language: " .. tostring(dev.language)) end
+
+			local hash = fp.browser_fp(nil)
+			if #hash ~= 32 then error("fp length: " .. #hash) end
+
+			local rtt = fp.connection_rtt(5)
+			if #rtt ~= 5 then error("rtt count: " .. #rtt) end
+
+			local dl = fp.connection_downlink(3)
+			if #dl ~= 3 then error("dl count: " .. #dl) end
+
+			local adfp = fp.random_adfp()
+			if #adfp ~= 21 then error("adfp length: " .. #adfp) end
+
+			return "fp-ok"
+		end
+	`))
+
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "fp-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
+	}
+}
+
 func TestLuaSolver_ChallengeFields(t *testing.T) {
 	s := NewLuaSolver(nil)
 	s.SetScript([]byte(`
@@ -268,5 +310,57 @@ func TestLuaSolver_ChallengeFields(t *testing.T) {
 	}
 	if res.SuccessToken != "fields-ok" {
 		t.Fatalf("got token %q, want %q", res.SuccessToken, "fields-ok")
+	}
+}
+
+func TestLuaMod_Img(t *testing.T) {
+	// Create test PNG
+	testImg := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for x := 0; x < 10; x++ {
+		for y := 0; y < 10; y++ {
+			testImg.Set(x, y, color.RGBA{uint8(x * 25), uint8(y * 25), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, testImg)
+	imgB64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	solver := NewLuaSolver(nil)
+	solver.SetScript([]byte(fmt.Sprintf(`
+		function solve(challenge)
+			local image = img.decode_base64("%s")
+			if img.width(image) ~= 10 then error("width: " .. img.width(image)) end
+			if img.height(image) ~= 10 then error("height") end
+
+			local r, g, b, a = img.pixel(image, 0, 0)
+			if a ~= 255 then error("alpha: " .. a) end
+			if r ~= 0 then error("red: " .. r) end
+
+			local cropped = img.crop(image, 2, 2, 5, 5)
+			if img.width(cropped) ~= 5 then error("crop w: " .. img.width(cropped)) end
+			if img.height(cropped) ~= 5 then error("crop h") end
+
+			local gray = img.grayscale(image)
+			if img.width(gray) ~= 10 then error("gray width") end
+
+			local resized = img.resize(image, 20, 20)
+			if img.width(resized) ~= 20 then error("resize w") end
+
+			local edges = img.edge_detect(image)
+			if img.width(edges) ~= 10 then error("edge w") end
+
+			local encoded = img.encode(image, "png")
+			if #encoded < 50 then error("encode too small") end
+
+			return "img-ok"
+		end
+	`, imgB64)))
+
+	result, err := solver.SolveCaptcha(context.Background(), &provider.CaptchaChallenge{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SuccessToken != "img-ok" {
+		t.Fatalf("got %s", result.SuccessToken)
 	}
 }
