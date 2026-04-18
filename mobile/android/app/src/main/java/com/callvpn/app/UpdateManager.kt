@@ -51,13 +51,23 @@ class UpdateManager(private val context: Context) {
         return Update(version = version, url = url, sha256 = sha ?: "")
     }
 
+    /** Returns the APK destination file (for progress monitoring). */
+    fun apkFile(): File {
+        val dir = File(context.cacheDir, "updates").apply { mkdirs() }
+        return File(dir, "callvpn-update.apk")
+    }
+
+    /** Returns expected APK size from manifest, or 0 if unknown. */
+    fun expectedSize(tunnel: Tunnel): Long {
+        return try { tunnel.apkUpdateSize() } catch (_: Exception) { 0L }
+    }
+
     /**
      * Downloads the APK through the Go bridge (reuses the manifest's
      * URL + verifies sha256). Suspends until file is on disk.
      */
     suspend fun download(tunnel: Tunnel): File = withContext(Dispatchers.IO) {
-        val dir = File(context.cacheDir, "updates").apply { mkdirs() }
-        val apk = File(dir, "callvpn-update.apk")
+        val apk = apkFile()
         if (apk.exists()) apk.delete()
         tunnel.downloadAPK(apk.absolutePath)
         apk

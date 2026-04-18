@@ -70,6 +70,8 @@ class MainActivity : ComponentActivity() {
     private var speedTestProgress = mutableStateOf("")
     private var speedTestResult = mutableStateOf("")
     private var availableUpdate = mutableStateOf<UpdateManager.Update?>(null)
+    private var updateDownloading = mutableStateOf(false)
+    private var updateProgress = mutableStateOf("")
     private var scriptsVersion = mutableStateOf("")
     private lateinit var updateTunnel: bind.Tunnel
     private lateinit var updateManager: UpdateManager
@@ -227,6 +229,8 @@ class MainActivity : ComponentActivity() {
                         onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
                         onDisconnect = { stopVpn() },
                         availableUpdate = availableUpdate.value,
+                        updateDownloading = updateDownloading.value,
+                        updateProgress = updateProgress.value,
                         onInstallUpdate = { installAdvertisedUpdate() },
                         scriptsVersion = scriptsVersion.value,
                         onSyncScripts = {
@@ -244,17 +248,52 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun installAdvertisedUpdate() {
-        Toast.makeText(this, "Скачивание обновления…", Toast.LENGTH_SHORT).show()
+        if (updateDownloading.value) return
+
+        // Check "install unknown apps" permission (Android 8+).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            Toast.makeText(this, "Разрешите установку из этого источника", Toast.LENGTH_LONG).show()
+            startActivity(Intent(
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                android.net.Uri.parse("package:$packageName")
+            ))
+            return
+        }
+
+        updateDownloading.value = true
+        updateProgress.value = "0%"
         lifecycleScope.launch {
             try {
                 updateTunnel.triggerScriptsCheck()
+
+                // Monitor download progress by polling file size.
+                val update = availableUpdate.value
+                val expectedSize = update?.let { updateManager.expectedSize(updateTunnel) } ?: 0L
+                val destFile = updateManager.apkFile()
+
+                val progressJob = launch {
+                    while (true) {
+                        kotlinx.coroutines.delay(300)
+                        if (destFile.exists() && expectedSize > 0) {
+                            val pct = (destFile.length() * 100 / expectedSize).coerceAtMost(100)
+                            updateProgress.value = "${pct}%"
+                        }
+                    }
+                }
+
                 val apk = updateManager.download(updateTunnel)
+                progressJob.cancel()
+                updateProgress.value = "100%"
+
                 val ok = updateManager.install(apk)
                 if (!ok) {
                     Toast.makeText(this@MainActivity, "Не удалось запустить установку", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
                 Toast.makeText(this@MainActivity, "Ошибка: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                updateDownloading.value = false
+                updateProgress.value = ""
             }
         }
     }
@@ -373,6 +412,8 @@ fun CallVpnScreen(
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
     onDisconnect: () -> Unit,
     availableUpdate: UpdateManager.Update? = null,
+    updateDownloading: Boolean = false,
+    updateProgress: String = "",
     onInstallUpdate: () -> Unit = {},
     scriptsVersion: String = "",
     onSyncScripts: () -> Unit = {}
@@ -632,7 +673,7 @@ fun CallVpnScreen(
             }
         }
 
-        // App version + scripts version + update/sync buttons
+        // App version + scripts version + sync button
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -643,19 +684,6 @@ fun CallVpnScreen(
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (availableUpdate != null) {
-                TextButton(
-                    onClick = onInstallUpdate,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = "Обновить до ${availableUpdate.version}",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = Color(0xFF4CAF50)
-                    )
-                }
-            }
             TextButton(
                 onClick = onSyncScripts,
                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
@@ -665,6 +693,35 @@ fun CallVpnScreen(
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+
+        // Update button (separate row)
+        if (availableUpdate != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(top = 4.dp)
+            ) {
+                TextButton(
+                    onClick = onInstallUpdate,
+                    enabled = !updateDownloading,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = if (updateDownloading) "Скачивание…" else "Обновить до ${availableUpdate.version}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (updateDownloading) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFF4CAF50)
+                    )
+                }
+                if (updateDownloading && updateProgress.isNotEmpty()) {
+                    Text(
+                        text = updateProgress,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
 

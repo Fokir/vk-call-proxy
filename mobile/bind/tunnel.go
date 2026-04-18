@@ -295,6 +295,18 @@ func (t *Tunnel) APKUpdateSHA256() string {
 	return b.Manifest.APK.SHA256
 }
 
+// APKUpdateSize returns the size of the advertised APK in bytes, or 0.
+func (t *Tunnel) APKUpdateSize() int64 {
+	if t.scripts == nil {
+		return 0
+	}
+	b := t.scripts.Current()
+	if b == nil || b.Manifest == nil || b.Manifest.APK == nil {
+		return 0
+	}
+	return b.Manifest.APK.Size
+}
+
 // DownloadAPK fetches the APK advertised in the current manifest, verifies
 // its sha256, writes it to destPath, and returns the absolute path. Blocks
 // for up to 10 minutes.
