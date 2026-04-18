@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// DefaultURL and DefaultPublicKey are populated from environment variables
+// CALLVPN_SCRIPTS_URL and CALLVPN_SCRIPTS_PUBKEY respectively, or can be
+// overridden at build time via ldflags.
 var (
 	DefaultURL       = ""
 	DefaultPublicKey = ""
