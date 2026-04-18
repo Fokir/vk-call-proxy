@@ -943,6 +943,9 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
 	m.SetMaxStreams(10000)
+	// Grace period: when all connections die, wait before closing the session
+	// to allow reconnect handlers to add fresh connections.
+	m.SetDeathGracePeriod(60 * time.Second)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
@@ -1005,22 +1008,54 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 		}
 	}()
 
+	// Start reconnect handler early so client's WireConnNew messages are
+	// processed even while initial batch handshakes are still in progress.
+	// This covers the case where all AcceptOverTURN fail but the client's
+	// ReconnectManager successfully connects via WireConnNew.
+	go s.handleReconnections(sessCtx, sigClient, mgr, m)
+
 	// Wait for at least one connection before proceeding to the session loop.
-	// Use a short poll so we don't block the entire session on slow handshakes.
-	waitCtx, waitCancel := context.WithTimeout(sessCtx, 60*time.Second)
-	defer waitCancel()
-	for {
-		if added.Load() > 0 {
-			break
-		}
-		select {
-		case <-waitCtx.Done():
-			punchCancel()
-			wg.Wait()
-			if added.Load() == 0 {
-				return fmt.Errorf("no connections passed auth/session handshake")
+	// Check both batch handshake results (added) AND connections added by
+	// handleReconnections (m.ActiveConns) since client may reconnect via
+	// WireConnNew while initial handshakes are still failing.
+	{
+		waitCtx, waitCancel := context.WithTimeout(sessCtx, 60*time.Second)
+		defer waitCancel()
+		for {
+			if added.Load() > 0 || m.ActiveConns() > 0 {
+				break
 			}
-		case <-time.After(200 * time.Millisecond):
+			select {
+			case <-waitCtx.Done():
+				punchCancel()
+				wg.Wait()
+				// If a reconnect handler is in progress (handleOneReconnect
+				// called BeginReconnect), wait up to 15s more for it to finish.
+				if m.ActiveConns() == 0 && m.Reconnecting() {
+					s.cfg.Logger.Info("initial handshakes failed but reconnect in progress, waiting")
+					deadline := time.After(15 * time.Second)
+				waitReconnect:
+					for {
+						if m.ActiveConns() > 0 {
+							break
+						}
+						if !m.Reconnecting() {
+							break
+						}
+						select {
+						case <-deadline:
+							break waitReconnect
+						case <-sessCtx.Done():
+							break waitReconnect
+						case <-time.After(200 * time.Millisecond):
+						}
+					}
+				}
+				if m.ActiveConns() == 0 {
+					return fmt.Errorf("no connections passed auth/session handshake")
+				}
+			case <-time.After(200 * time.Millisecond):
+			}
 		}
 	}
 	// Cancel punch loops once at least one connection is live; remaining
@@ -1052,8 +1087,6 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 			}
 		}
 	}()
-
-	go s.handleReconnections(sessCtx, sigClient, mgr, m)
 
 	// Rolling connection rotation: close the oldest connection every
 	// rotationInterval if it exceeds maxConnAge. The client's ReconnectManager
@@ -1146,6 +1179,11 @@ func (s *Server) handleReconnections(ctx context.Context, sigClient provider.Sig
 func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.SignalingClient,
 	mgr *turn.Manager, m *mux.Mux, clientAddr string) error {
 
+	// Signal that a reconnect is in progress so the initial wait loop
+	// and allDead don't close the session while we're still trying.
+	m.BeginReconnect()
+	defer m.EndReconnect()
+
 	clientUDP, err := net.ResolveUDPAddr("udp", clientAddr)
 	if err != nil {
 		return fmt.Errorf("resolve client addr: %w", err)
@@ -1156,6 +1194,13 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 		return fmt.Errorf("allocate TURN: %w", err)
 	}
 	alloc := allocs[0]
+	// On failure, close and remove the allocation to free the quota.
+	closeAlloc := true
+	defer func() {
+		if closeAlloc {
+			mgr.RemoveAllocation(alloc)
+		}
+	}()
 	myAddr := alloc.RelayAddr.String()
 
 	if err := sigClient.SendPayload(ctx, internalsignal.WireConnOk, []byte(myAddr)); err != nil {
@@ -1169,7 +1214,7 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, clientUDP)
 	time.Sleep(200 * time.Millisecond)
 
-	reconnCtx, reconnCancel := context.WithTimeout(ctx, 3*time.Second)
+	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer reconnCancel()
 	dtlsConn, _, err := internaldtls.AcceptOverTURN(reconnCtx, alloc.RelayConn, clientUDP)
 	if err != nil {
@@ -1188,6 +1233,7 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 		return fmt.Errorf("read session id: %w", err)
 	}
 
+	closeAlloc = false // success: allocation is now in use
 	m.AddConn(dtlsConn)
 	s.cfg.Logger.Info("reconnect: new connection added to MUX",
 		"active", m.ActiveConns(),

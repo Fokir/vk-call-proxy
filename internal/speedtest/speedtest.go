@@ -180,6 +180,16 @@ func RunClient(m *mux.Mux, cb Callback, logger *slog.Logger) error {
 		results[i].stream = streams[i]
 	}
 
+	// Suppress health-based reconnects during speed test: the relay is
+	// intentionally saturated and pong delivery may be delayed.
+	m.SetSpeedTestActive(true)
+	defer m.SetSpeedTestActive(false)
+
+	// Temporarily increase idle timeout so connections don't die
+	// when congested relay delays frame delivery.
+	m.SetIdleTimeout(120 * time.Second)
+	defer m.SetIdleTimeout(90 * time.Second)
+
 	// Phase 1: Ping (sequential on stream 0 — measures single RTT)
 	cb.OnPhase("ping")
 	pingResult, err := runPing(streams[0], 20, logger)

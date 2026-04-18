@@ -106,9 +106,11 @@ func (rm *ReconnectManager) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	const (
-		normalMaxAttempts = 5
-		maxBackoff        = 30 * time.Second
+		normalMaxAttempts       = 5
+		maxBackoff              = 30 * time.Second
+		criticalMaxAttempts     = 10 // after this many consecutive critical failures, trigger full reconnect
 	)
+	var consecutiveCriticalFails int
 
 	for {
 		select {
@@ -170,6 +172,7 @@ func (rm *ReconnectManager) Run(ctx context.Context) {
 
 				err = rm.reconnectOne(ctx, ackCh)
 				if err == nil {
+					consecutiveCriticalFails = 0
 					break
 				}
 
@@ -177,6 +180,19 @@ func (rm *ReconnectManager) Run(ctx context.Context) {
 					logger.Warn("reconnect failed, will retry next cycle",
 						"attempts", attempt, "err", err)
 					break
+				}
+
+				// If all connections are dead and we keep failing, the server
+				// likely closed the session. Trigger full reconnect to start fresh.
+				if critical && m.ActiveConns() == 0 {
+					consecutiveCriticalFails++
+					if consecutiveCriticalFails >= criticalMaxAttempts {
+						logger.Warn("too many critical reconnect failures with zero active connections, triggering full session reconnect",
+							"consecutive_fails", consecutiveCriticalFails)
+						m.EndReconnect()
+						rm.cfg.OnFullReconnect()
+						return
+					}
 				}
 
 				logger.Warn("reconnect attempt failed",
@@ -212,6 +228,14 @@ func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan provi
 		return fmt.Errorf("allocate TURN: %w", err)
 	}
 	alloc := allocs[0]
+	// On failure, close and remove the allocation to free the quota.
+	// On success this is set to false so the allocation persists.
+	closeAlloc := true
+	defer func() {
+		if closeAlloc {
+			rm.mgr.RemoveAllocation(alloc)
+		}
+	}()
 	myAddr := alloc.RelayAddr.String()
 
 	// Send our new relay address to server.
@@ -270,6 +294,7 @@ func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan provi
 		return fmt.Errorf("write session id: %w", err)
 	}
 
+	closeAlloc = false // success: allocation is now in use by the MUX connection
 	rm.m.AddConn(dtlsConn)
 	rm.cfg.Logger.Info("reconnect: new connection added to MUX",
 		"active", rm.m.ActiveConns(),

@@ -341,6 +341,21 @@ func (m *Manager) Allocations() []*Allocation {
 	return out
 }
 
+// RemoveAllocation closes and removes a specific allocation by pointer.
+// Used to clean up failed reconnect allocations before they accumulate
+// and hit the TURN server's allocation quota (486).
+func (m *Manager) RemoveAllocation(alloc *Allocation) {
+	m.mu.Lock()
+	for i, a := range m.allocations {
+		if a == alloc {
+			m.allocations = append(m.allocations[:i], m.allocations[i+1:]...)
+			break
+		}
+	}
+	m.mu.Unlock()
+	alloc.Close()
+}
+
 // StartKeepalive sends periodic STUN Binding requests on all active
 // allocations to keep the TURN TCP connection alive. VK TURN servers
 // have a ~90s idle timeout on the control plane. While STUN Binding

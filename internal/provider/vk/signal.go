@@ -422,8 +422,14 @@ func (c *SignalingClient) recvRelayData(ctx context.Context, skipRole string, fi
 				c.logger.Debug("skipping own echoed relay data", "role", role)
 				continue
 			}
-			// Remember the sender's participantId so we can filter
-			// hungup notifications later (ignore anonymous TURN users).
+			// Reject messages from ghost participants: once we lock onto
+			// the real remote peer (from batch 0), ignore relay data from
+			// other participants sharing the same VK conference.
+			if !c.notifFromRemotePeer(notif) {
+				c.logger.Debug("skipping relay data from non-remote peer")
+				continue
+			}
+			// Lock onto the sender's participantId (first match wins).
 			c.setRemotePeerFromNotif(notif)
 			return &data, nil
 		}
@@ -690,7 +696,9 @@ func (c *SignalingClient) WaitForSessionEnd(ctx context.Context) (provider.Sessi
 }
 
 // setRemotePeerFromNotif extracts participantId from a VK notification
-// and stores it as the remote peer identity for hungup filtering.
+// and stores it as the remote peer identity. Once set, the remote peer
+// is locked — subsequent calls with a different ID are rejected to
+// prevent ghost participants from hijacking the session.
 func (c *SignalingClient) setRemotePeerFromNotif(notif notification) {
 	var data struct {
 		ParticipantID json.Number `json:"participantId"`
@@ -703,9 +711,35 @@ func (c *SignalingClient) setRemotePeerFromNotif(notif notification) {
 		return
 	}
 	c.mu.Lock()
-	c.remotePeer = pid
+	if c.remotePeer == "" {
+		c.remotePeer = pid
+		c.mu.Unlock()
+		c.logger.Info("remote peer identified", "participant_id", pid)
+	} else {
+		c.mu.Unlock()
+	}
+}
+
+// notifFromRemotePeer returns true if the notification came from the
+// locked remote peer, or if no peer has been identified yet (accept any).
+func (c *SignalingClient) notifFromRemotePeer(notif notification) bool {
+	c.mu.Lock()
+	rp := c.remotePeer
 	c.mu.Unlock()
-	c.logger.Info("remote peer identified", "participant_id", pid)
+	if rp == "" {
+		return true // not identified yet, accept any
+	}
+	var data struct {
+		ParticipantID json.Number `json:"participantId"`
+	}
+	if err := json.Unmarshal(notif.Raw, &data); err != nil {
+		return true // can't parse, let other filters handle it
+	}
+	pid := data.ParticipantID.String()
+	if pid == "" || pid == "0" {
+		return true // no participant info, accept
+	}
+	return pid == rp
 }
 
 // isRemotePeerHungup checks if the hungup notification came from the

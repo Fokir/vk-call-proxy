@@ -136,6 +136,9 @@ type Mux struct {
 
 	lastPongAt atomic.Int64 // unix nano of last received Pong on any connection
 
+	deathGraceNs   atomic.Int64 // nanoseconds; if >0, delay allDead close to allow reconnect
+	speedTestActive atomic.Bool  // when true, IsHealthy always returns true
+
 	maxStreams   int          // 0 = unlimited
 	streamCount atomic.Int32 // current active stream count
 
@@ -339,8 +342,7 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 		}
 
 		if m.activeReaders.Add(-1) == 0 && m.reconnecting.Load() == 0 {
-			m.allDeadOnce.Do(func() { close(m.allDead) })
-			m.closeInFrames.Do(func() { close(m.inFrames) })
+			m.closeAllDead()
 		}
 	}()
 	br := bufio.NewReaderSize(mc.conn, 16384)
@@ -809,10 +811,22 @@ func (m *Mux) ConnDied() <-chan int {
 	return m.connDied
 }
 
+// SetSpeedTestActive marks that a speed test is running. While active,
+// IsHealthy always returns true to prevent the reconnect manager from
+// killing connections that are busy transferring test data.
+func (m *Mux) SetSpeedTestActive(active bool) {
+	m.speedTestActive.Store(active)
+}
+
 // IsHealthy reports whether at least one Pong was received within the
 // given timeout. If no Pong has ever been received, the mux creation time
 // is used as baseline so the check doesn't fire during initial handshake.
+// During a speed test, always returns true since the relay is intentionally
+// saturated and pong delivery may be delayed.
 func (m *Mux) IsHealthy(timeout time.Duration) bool {
+	if m.speedTestActive.Load() {
+		return true
+	}
 	last := m.lastPongAt.Load()
 	if last == 0 {
 		// No pong yet — healthy as long as connections exist.
@@ -953,6 +967,42 @@ func (m *Mux) RemoveConn(idx int) {
 	})
 }
 
+// SetDeathGracePeriod sets a delay between the last reader dying and
+// the allDead channel being closed. This allows reconnect handlers to
+// add new connections before the session is torn down.
+// A zero or negative value disables the grace period (immediate close).
+func (m *Mux) SetDeathGracePeriod(d time.Duration) {
+	m.deathGraceNs.Store(int64(d))
+}
+
+// closeAllDead closes the allDead channel, optionally after a grace period.
+// If new connections are added during the grace period, the close is cancelled.
+func (m *Mux) closeAllDead() {
+	grace := time.Duration(m.deathGraceNs.Load())
+	if grace <= 0 {
+		m.allDeadOnce.Do(func() { close(m.allDead) })
+		m.closeInFrames.Do(func() { close(m.inFrames) })
+		return
+	}
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			if m.activeReaders.Load() == 0 && m.reconnecting.Load() == 0 {
+				m.allDeadOnce.Do(func() { close(m.allDead) })
+				m.closeInFrames.Do(func() { close(m.inFrames) })
+			}
+		case <-m.ctx.Done():
+		}
+	}()
+}
+
+// Reconnecting returns true if any reconnect attempts are in progress.
+func (m *Mux) Reconnecting() bool {
+	return m.reconnecting.Load() > 0
+}
+
 // BeginReconnect increments the reconnecting counter, preventing
 // the mux from closing allDead while reconnection is in progress.
 func (m *Mux) BeginReconnect() {
@@ -963,8 +1013,7 @@ func (m *Mux) BeginReconnect() {
 // readers remain and no reconnects are pending, allDead is closed.
 func (m *Mux) EndReconnect() {
 	if m.reconnecting.Add(-1) <= 0 && m.activeReaders.Load() == 0 {
-		m.allDeadOnce.Do(func() { close(m.allDead) })
-		m.closeInFrames.Do(func() { close(m.inFrames) })
+		m.closeAllDead()
 	}
 }
 
