@@ -352,5 +352,19 @@ function solve(challenge)
     end)
 
     log.info("lua-solver: captcha solved successfully", "sid", challenge.captcha_sid, "type", page.captcha_type or "checkbox")
-    return result.response.success_token
+
+    -- Format captcha_ts preserving original precision (VK expects 3 decimal places).
+    local ts_str = string.format("%.3f", challenge.captcha_ts)
+    -- Trim trailing zeros: "1776532009.430" → "1776532009.43"
+    ts_str = ts_str:gsub("0+$", ""):gsub("%.$", "")
+
+    return {
+        success_token = result.response.success_token,
+        retry_params = {
+            captcha_key = "",
+            is_sound_captcha = "0",
+            captcha_ts = ts_str,
+            captcha_attempt = "1",
+        },
+    }
 end

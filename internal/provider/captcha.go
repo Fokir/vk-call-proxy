@@ -18,6 +18,12 @@ type CaptchaChallenge struct {
 type CaptchaResult struct {
 	SuccessToken string // from captchaNotRobot.check (priority)
 	CaptchaKey   string // from classic image captcha (fallback)
+
+	// RetryParams are additional key-value pairs that the solver wants
+	// injected into the retry API call (e.g. captcha_key, is_sound_captcha,
+	// captcha_ts, captcha_attempt).  When set, the caller should iterate
+	// over this map and Set each pair on the retry form data.
+	RetryParams map[string]string
 }
 
 // CaptchaSolver solves VK captcha challenges.

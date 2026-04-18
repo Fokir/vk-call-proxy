@@ -30,40 +30,56 @@ s = m.get('scripts',{}).get('$name',{})
 print(s.get('sha256',''))
 " 2>/dev/null || echo "")
 
-  old_size=$(python3 -c "
-import json, sys
-m = json.load(open('$MANIFEST'))
-s = m.get('scripts',{}).get('$name',{})
-print(s.get('size',0))
-" 2>/dev/null || echo "0")
-
-  if [[ "$sha" != "$old_sha" || "$size" != "$old_size" ]]; then
-    echo "  $name: sha256=$sha size=$size (was: $old_sha / $old_size)"
+  if [[ -z "$old_sha" ]]; then
+    echo "  $name: NEW file (sha256=${sha:0:16}... size=$size)"
+    UPDATED=1
+  elif [[ "$sha" != "$old_sha" ]]; then
+    echo "  $name: CHANGED (sha256=$sha)"
     UPDATED=1
   fi
 done
 
 if [[ $UPDATED -eq 0 ]]; then
   echo "All hashes match — manifest is up to date."
-  exit 0
 fi
 
-# Rewrite manifest with updated hashes
+# Rewrite manifest with updated hashes and auto-add new files
 python3 -c "
-import json, os, hashlib
+import json, os, hashlib, glob
 
 bundled = '$BUNDLED_DIR'
 mpath = os.path.join(bundled, 'manifest.json')
 with open(mpath) as f:
     m = json.load(f)
 
-for name in list(m.get('scripts', {})):
-    fpath = os.path.join(bundled, name)
-    if not os.path.isfile(fpath):
+if 'scripts' not in m:
+    m['scripts'] = {}
+
+# Update existing + auto-add new script files
+for fpath in sorted(glob.glob(os.path.join(bundled, '*'))):
+    name = os.path.basename(fpath)
+    if name == 'manifest.json' or not os.path.isfile(fpath):
         continue
     data = open(fpath, 'rb').read()
-    m['scripts'][name]['sha256'] = hashlib.sha256(data).hexdigest()
-    m['scripts'][name]['size'] = len(data)
+    sha = hashlib.sha256(data).hexdigest()
+    size = len(data)
+    if name not in m['scripts']:
+        print(f'  + {name}: NEW file (sha256={sha[:16]}... size={size})')
+    m['scripts'][name] = {
+        'sha256': sha,
+        'size': size,
+        'url': f'bundled://{name}',
+    }
+
+# Remove entries for deleted files
+for name in list(m['scripts']):
+    if not os.path.isfile(os.path.join(bundled, name)):
+        print(f'  - {name}: REMOVED')
+        del m['scripts'][name]
+
+import datetime
+m['version'] = 'bundled-' + datetime.date.today().strftime('%Y.%m.%d')
+m['published_at'] = datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 with open(mpath, 'w') as f:
     json.dump(m, f, indent=2)

@@ -126,6 +126,15 @@ func (s *LuaSolver) SolveCaptcha(ctx context.Context, ch *provider.CaptchaChalle
 		if s, ok := key.(lua.LString); ok {
 			res.CaptchaKey = string(s)
 		}
+		// Parse retry_params sub-table if present.
+		if rp, ok := v.RawGetString("retry_params").(*lua.LTable); ok {
+			res.RetryParams = make(map[string]string)
+			rp.ForEach(func(k, val lua.LValue) {
+				if ks, ok := k.(lua.LString); ok {
+					res.RetryParams[string(ks)] = val.String()
+				}
+			})
+		}
 		if res.SuccessToken == "" && res.CaptchaKey == "" {
 			return nil, errors.New("lua solve() returned table with no success_token or captcha_key")
 		}

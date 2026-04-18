@@ -453,6 +453,12 @@ fi
 
 trap cleanup EXIT
 
+# --- Resign bundled scripts (auto-add new files, recompute hashes) ---
+echo "[$(ts)] Updating bundled scripts manifest..."
+bash scripts/resign-bundled.sh
+# Clear local scripts cache so the fresh bundled version takes priority.
+rm -rf var/scripts/current
+
 # --- Build ---
 echo "[$(ts)] Building binaries..."
 go build -o "callvpn-server${EXE}" ./cmd/server

@@ -1,5 +1,5 @@
 {
-  "published_at": "2026-04-15T15:18:58Z",
+  "published_at": "2026-04-18T17:43:31Z",
   "scripts": {
     "stealth.js": {
       "sha256": "1a23eaa195177bc87e69746b77a02e4b9a5cf3a59ba6508f7efdb03a9ada0045",
@@ -7,16 +7,21 @@
       "url": "bundled://stealth.js"
     },
     "vk-config.json": {
-      "sha256": "692cdbbcdd75302aed25d431548428936e74b544d70b8c9f79a8c662f452a1db",
-      "size": 2140,
+      "sha256": "37b594d35083ef1ec84f51007f21d3fe52629dca131e0d8d2f9875fba5c9d218",
+      "size": 2478,
       "url": "bundled://vk-config.json"
     },
     "solver.lua": {
-      "sha256": "6fcf0fed41c13130a7176540c9cc8ecb578a08cb37c6d02342fc1c53007cde83",
-      "size": 12149,
+      "sha256": "6b860272c72b9b30ee5a908144ed899c6b99ed78ee473fad6cb8c917f5f99f40",
+      "size": 12990,
       "url": "bundled://solver.lua"
+    },
+    "auth.lua": {
+      "sha256": "4deddb5c6643e7db077a17cfece7d35dfd769c73e17366e4b6a4e09c0f1e3a0e",
+      "size": 16725,
+      "url": "bundled://auth.lua"
     }
   },
   "signature": "",
-  "version": "bundled-2026.04.15"
+  "version": "bundled-2026.04.18"
 }

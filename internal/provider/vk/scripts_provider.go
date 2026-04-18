@@ -21,14 +21,6 @@ func hotVKConfig() *scripts.VKConfig {
 	return nil
 }
 
-// apiVersion returns the hot-reloaded VK API version or the compiled-in default.
-func apiVersion() string {
-	if c := hotVKConfig(); c != nil && c.VK.APIVersion != "" {
-		return c.VK.APIVersion
-	}
-	return vkAPIVersion
-}
-
 // userAgents returns the hot-reloaded user-agent pool or the compiled-in default.
 func userAgents() []string {
 	if c := hotVKConfig(); c != nil && len(c.VK.UserAgents) > 0 {
