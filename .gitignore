@@ -59,6 +59,11 @@ testdata/
 # Scripts local cache
 var/
 
+# Bundled scripts (generated from hot-scripts/ by scripts/resign-bundled.sh)
+internal/scripts/bundled/*.lua
+internal/scripts/bundled/*.js
+internal/scripts/bundled/vk-config.json
+
 # Ed25519 signing keys
 secrets/
 /server
