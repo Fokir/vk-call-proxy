@@ -292,7 +292,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 				if !ok {
 					return
 				}
-				go handleStream(sessCtx, sessLogger, stream)
+				go handleStream(sessCtx, sessLogger, stream, s.cfg.DialContext)
 			case <-m.Dead():
 				s.cfg.Siren.AlertDisconnect(sessCtx, fmt.Sprintf("session-%x", id))
 				return
@@ -563,7 +563,7 @@ func (s *Server) runMultiRelaySession(ctx context.Context) {
 			if !ok {
 				return
 			}
-			go handleStream(ctx, logger, stream)
+			go handleStream(ctx, logger, stream, s.cfg.DialContext)
 		case <-m.Dead():
 			logger.Warn("all connections dead in multi-relay mode")
 			return
@@ -1105,7 +1105,7 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 			if !ok {
 				return nil
 			}
-			go handleStream(sessCtx, s.cfg.Logger, stream)
+			go handleStream(sessCtx, s.cfg.Logger, stream, s.cfg.DialContext)
 		case <-m.Dead():
 			return nil
 		case <-sessCtx.Done():
@@ -1196,7 +1196,7 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 	return nil
 }
 
-func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) {
+func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) {
 	defer stream.Close()
 
 	if speedtest.IsSpeedTestStream(stream.ID) {
@@ -1214,8 +1214,13 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 
 	logger.Info("stream opened", "stream_id", stream.ID, "target", target)
 
-	dialer := net.Dialer{}
-	outConn, err := dialer.DialContext(ctx, "tcp", target)
+	var outConn net.Conn
+	if dialContext != nil {
+		outConn, err = dialContext(ctx, "tcp", target)
+	} else {
+		dialer := net.Dialer{}
+		outConn, err = dialer.DialContext(ctx, "tcp", target)
+	}
 	if err != nil {
 		logger.Warn("dial target failed", "target", target, "err", err)
 		return
