@@ -1,9 +1,9 @@
 {
-  "published_at": "2026-04-18T11:14:44Z",
+  "published_at": "2026-04-18T11:21:38Z",
   "scripts": {
     "solver.lua": {
-      "sha256": "051806f3e3acbeebeed36b8dd8cc02dc64d4ff2acf77fa82a63454b37c46d477",
-      "size": 12142,
+      "sha256": "6fcf0fed41c13130a7176540c9cc8ecb578a08cb37c6d02342fc1c53007cde83",
+      "size": 12149,
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/solver.lua"
     },
     "stealth.js": {
@@ -12,11 +12,11 @@
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/stealth.js"
     },
     "vk-config.json": {
-      "sha256": "1503b69305674faa13507496c9db07e64126ee3d6a95bc3dbf712466385f9764",
+      "sha256": "04d6a737f0ecc6de704ad6af54b48ad6c6939dc66533a44605ffc9df90224032",
       "size": 2093,
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/vk-config.json"
     }
   },
-  "signature": "ZHSepeLUE9WoZfI+895pmOJuQPZjSL4+CW0iAB1SsgmMYvVvOt998fOFzNbmxYXnM2FQ4YSjF1/cKBqLcVX2DQ==",
-  "version": "2026.04.18-111444-d1698dc"
+  "signature": "I1l4yhy0x2rIOQw2PmBBb60VPoStb+Jd+heA9502fbV3XlBZHj7hiJZvVmF1bGWYaxKyN5rvkzvdH3BZbw0lDQ==",
+  "version": "2026.04.18-112138-17b84c2"
 }
