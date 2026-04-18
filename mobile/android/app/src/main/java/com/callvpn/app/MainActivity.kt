@@ -70,6 +70,7 @@ class MainActivity : ComponentActivity() {
     private var speedTestProgress = mutableStateOf("")
     private var speedTestResult = mutableStateOf("")
     private var availableUpdate = mutableStateOf<UpdateManager.Update?>(null)
+    private var scriptsVersion = mutableStateOf("")
     private lateinit var updateTunnel: bind.Tunnel
     private lateinit var updateManager: UpdateManager
     private var pendingCallLink = ""
@@ -187,10 +188,12 @@ class MainActivity : ComponentActivity() {
         // for APK updates and kept alive for the app lifetime.
         val scriptsDir = java.io.File(filesDir, "scripts").apply { mkdirs() }
         updateTunnel = bind.Tunnel().apply { initScripts("", "", scriptsDir.absolutePath) }
+        scriptsVersion.value = updateTunnel.scriptsVersion()
         updateManager = UpdateManager(this)
         lifecycleScope.launch {
             while (isActive) {
                 availableUpdate.value = updateManager.check(updateTunnel)
+                scriptsVersion.value = updateTunnel.scriptsVersion()
                 delay(5 * 60 * 1000L)
             }
         }
@@ -224,7 +227,16 @@ class MainActivity : ComponentActivity() {
                         onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
                         onDisconnect = { stopVpn() },
                         availableUpdate = availableUpdate.value,
-                        onInstallUpdate = { installAdvertisedUpdate() }
+                        onInstallUpdate = { installAdvertisedUpdate() },
+                        scriptsVersion = scriptsVersion.value,
+                        onSyncScripts = {
+                            lifecycleScope.launch {
+                                updateTunnel.triggerScriptsCheck()
+                                delay(2000)
+                                scriptsVersion.value = updateTunnel.scriptsVersion()
+                                Toast.makeText(this@MainActivity, "Scripts: ${scriptsVersion.value}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     )
                 }
             }
@@ -361,7 +373,9 @@ fun CallVpnScreen(
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
     onDisconnect: () -> Unit,
     availableUpdate: UpdateManager.Update? = null,
-    onInstallUpdate: () -> Unit = {}
+    onInstallUpdate: () -> Unit = {},
+    scriptsVersion: String = "",
+    onSyncScripts: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val profileManager = remember { ProfileManager(context) }
@@ -618,13 +632,14 @@ fun CallVpnScreen(
             }
         }
 
-        // App version + optional update button
+        // App version + scripts version + update/sync buttons
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "v${BuildConfig.VERSION_NAME}",
+                text = "v${BuildConfig.VERSION_NAME}" +
+                    if (scriptsVersion.isNotEmpty()) " | $scriptsVersion" else "",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -640,6 +655,16 @@ fun CallVpnScreen(
                         color = Color(0xFF4CAF50)
                     )
                 }
+            }
+            TextButton(
+                onClick = onSyncScripts,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "\u21BB",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 

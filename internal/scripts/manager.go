@@ -63,7 +63,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	if m.cfg.URL != "" {
 		// Check for updates synchronously before returning, so the first
 		// consumer (e.g. captcha solver) gets the latest scripts immediately.
-		m.tryUpdate(ctx)
+		// Use a short timeout to avoid blocking startup when offline.
+		startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		m.tryUpdate(startCtx)
+		cancel()
 		m.wg.Add(1)
 		go m.runLoop(ctx)
 	} else {
