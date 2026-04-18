@@ -1,5 +1,5 @@
 {
-  "published_at": "2026-04-18T18:01:08Z",
+  "published_at": "2026-04-18T18:02:07Z",
   "scripts": {
     "auth.lua": {
       "sha256": "4deddb5c6643e7db077a17cfece7d35dfd769c73e17366e4b6a4e09c0f1e3a0e",
@@ -22,6 +22,6 @@
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/vk-config.json"
     }
   },
-  "signature": "vxf/JR5yl8tDz0cY6fmoD/q69WBx7N6jLrnwE6SiSr+WxvI2l+UP14N9RKEOwpJDc03vDHi9wwDyV5zCmlHFCw==",
-  "version": "2026.04.18-180103-e77466d"
+  "signature": "PePVv0bDhCztPV7JfXuymQsfBdzpr4rtmjZ3KZu/9YNizgkXVFJHKXgst5WhnrArNlsxX8dLsdr4B0UJkvbuCA==",
+  "version": "2026.04.18-180207-f3cb83c"
 }
