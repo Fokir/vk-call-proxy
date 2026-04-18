@@ -35,8 +35,9 @@ type Config struct {
 	AlsoDirect bool               // Also run direct DTLS listener alongside relay mode
 	UseTCP     bool               // Use TCP for TURN connections
 	NumConns   int                // Number of parallel connections (Telemost mode)
-	Logger     *slog.Logger
-	Siren      *monitoring.Siren
+	Logger      *slog.Logger
+	Siren       *monitoring.Siren
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // Server manages VPN server operations.

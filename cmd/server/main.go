@@ -16,6 +16,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/proxy/upstream"
 	"github.com/call-vpn/call-vpn/internal/scripts"
 	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/server"
@@ -46,6 +47,7 @@ func main() {
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
 	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
 	captchaEndpoint := flag.String("captcha-endpoint", "", "captcha-service URL (e.g. http://captcha:8090, env: CAPTCHA_ENDPOINT)")
+	proxyURL := flag.String("proxy", "", "upstream proxy URL (socks5://host:port or http://user:pass@host:port, env: PROXY_URL)")
 	scriptsFlags := scripts.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -87,6 +89,9 @@ func main() {
 			*alsoDirect = true
 		}
 	}
+	if *proxyURL == "" {
+		*proxyURL = os.Getenv("PROXY_URL")
+	}
 
 	logLevel := slog.LevelInfo
 	if *verbose {
@@ -103,14 +108,23 @@ func main() {
 	defer scriptsMgr.Stop()
 	scriptshook.Register(scriptsMgr)
 
+	proxyDial, err := upstream.ParseProxyURL(*proxyURL)
+	if err != nil {
+		log.Fatalf("invalid --proxy URL: %v", err)
+	}
+	if proxyDial != nil {
+		logger.Info("upstream proxy configured", "url", *proxyURL)
+	}
+
 	cfg := server.Config{
-		ListenAddr: *listenAddr,
-		AuthToken:  *authToken,
-		VKTokens:   []string(vkTokens),
-		AlsoDirect: *alsoDirect,
-		UseTCP:     *useTCP,
-		NumConns:   *numConns,
-		Logger:     logger,
+		ListenAddr:  *listenAddr,
+		AuthToken:   *authToken,
+		VKTokens:    []string(vkTokens),
+		AlsoDirect:  *alsoDirect,
+		UseTCP:      *useTCP,
+		NumConns:    *numConns,
+		Logger:      logger,
+		DialContext: proxyDial,
 	}
 
 	// Enable relay-to-relay mode with the appropriate service(s).
