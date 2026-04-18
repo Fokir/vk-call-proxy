@@ -42,7 +42,7 @@
         <service
             android:name=".VpnTileService"
             android:icon="@drawable/ic_vpn_tile"
-            android:label="CallVPN"
+            android:label="@string/app_name"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
@@ -68,7 +68,7 @@
             android:name=".UpdateInstallReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.callvpn.app.UPDATE_INSTALL_RESULT" />
+                <action android:name="${applicationId}.UPDATE_INSTALL_RESULT" />
             </intent-filter>
         </receiver>
 

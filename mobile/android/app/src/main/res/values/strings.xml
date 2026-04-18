@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">CallVPN</string>
+
     <string name="status_disconnected">Отключён</string>
     <string name="status_connecting">Подключение…</string>
     <string name="status_connected">Подключён</string>

@@ -23,7 +23,7 @@ class UpdateManager(private val context: Context) {
 
     companion object {
         private const val TAG = "UpdateManager"
-        private const val INSTALL_ACTION = "com.callvpn.app.UPDATE_INSTALL_RESULT"
+        private val INSTALL_ACTION = "${BuildConfig.APPLICATION_ID}.UPDATE_INSTALL_RESULT"
     }
 
     data class Update(

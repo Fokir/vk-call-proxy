@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PKG="com.callvpn.app"
+PKG="com.callvpn.app.debug"
 APK="$PROJECT_ROOT/mobile/android/app/build/outputs/apk/debug/app-debug.apk"
 AAR="$PROJECT_ROOT/mobile/android/app/libs/bind.aar"
 BACKUP="/tmp/callvpn_backup.xml"
