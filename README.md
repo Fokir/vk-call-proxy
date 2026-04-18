@@ -269,8 +269,9 @@ gomobile bind -target=ios -o mobile/ios/Bind.xcframework ./mobile/bind
 | `--token` | *(пусто)* | Токен аутентификации клиентов (env: `VPN_TOKEN`) |
 | `--n` | `4` | Количество TURN-соединений (relay mode) |
 | `--tcp` | `true` | TCP для TURN (relay mode) |
+| `--proxy` | *(пусто)* | Upstream-прокси для клиентского трафика (env: `PROXY_URL`). Формат: `socks5://host:port` или `http://user:pass@host:port` |
 
-Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `ALSO_DIRECT=1` — dual mode, `SIREN_SLACK_WEBHOOK` — Slack-алерты, `CALLVPN_SCRIPTS_URL` / `CALLVPN_SCRIPTS_PUBKEY` / `CALLVPN_SCRIPTS_DIR` — override источника hot-update скриптов.
+Env: `VK_CALL_LINK` — ссылка ██-звонка (relay mode), `VPN_TOKEN` — токен, `ALSO_DIRECT=1` — dual mode, `PROXY_URL` — upstream-прокси, `SIREN_SLACK_WEBHOOK` — Slack-алерты, `CALLVPN_SCRIPTS_URL` / `CALLVPN_SCRIPTS_PUBKEY` / `CALLVPN_SCRIPTS_DIR` — override источника hot-update скриптов.
 
 **Hot-update флаги (применимы ко всем бинарям, включая `scripts-updater`):**
 

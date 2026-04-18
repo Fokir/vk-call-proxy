@@ -60,6 +60,7 @@ services:
       - VPN_TOKEN=${VPN_TOKEN:-}
       - VK_CALL_LINK=${VK_CALL_LINK:-}
       - ALSO_DIRECT=${ALSO_DIRECT:-}
+      - PROXY_URL=${PROXY_URL:-}
       - TURN_CONNS=${TURN_CONNS:-4}
       - SIREN_SLACK_WEBHOOK=${SIREN_SLACK_WEBHOOK:-}
       - CAPTCHA_ENDPOINT=http://captcha:8090
@@ -279,6 +280,7 @@ TURN_CONNS=4
 | `VK_CALL_LINK` | *(пусто)* | ID ссылки ██-звонка. Если задан — включается relay-to-relay mode |
 | `ALSO_DIRECT` | *(пусто)* | `1` — также слушать на UDP-порту в relay mode (dual mode) |
 | `TURN_CONNS` | `4` | Количество TURN-соединений (только relay mode) |
+| `PROXY_URL` | *(пусто)* | Upstream-прокси для клиентского трафика (`socks5://host:port` или `http://user:pass@host:port`). VK/TURN — напрямую |
 | `SIREN_SLACK_WEBHOOK` | *(пусто)* | URL Slack webhook для алертов мониторинга |
 | `CAPTCHA_ENDPOINT` | `http://captcha:8090` | URL captcha-сервиса (auto-configured в docker-compose) |
 | `CAPTCHA_MAX_CONCURRENT` | `1` | Макс. одновременных Chrome-инстансов для решения капчи |
