@@ -360,8 +360,74 @@ jobs:
           fail_on_unmatched_files: false
           make_latest: true
 
-  notify-discord:
+  update-manifest:
     needs: [release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release.apk
+          path: .tmp-release
+
+      - name: Write signing key
+        env:
+          SCRIPTS_SIGNING_KEY: ${{ secrets.SCRIPTS_SIGNING_KEY }}
+        run: |
+          if [ -z "$SCRIPTS_SIGNING_KEY" ]; then
+            echo "::warning::SCRIPTS_SIGNING_KEY not set, skipping manifest update"
+            exit 0
+          fi
+          mkdir -p .tmp-scripts
+          printf "%s" "$SCRIPTS_SIGNING_KEY" > .tmp-scripts/signing.key
+          chmod 600 .tmp-scripts/signing.key
+
+      - name: Re-sign manifest with APK entry
+        env:
+          SCRIPTS_SIGNING_KEY: ${{ secrets.SCRIPTS_SIGNING_KEY }}
+        if: env.SCRIPTS_SIGNING_KEY != ''
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APK_URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/app-release.apk"
+          MANIFEST_VERSION="$(date -u +'%Y.%m.%d-%H%M%S')-${GITHUB_SHA::7}"
+
+          go run ./tools/scripts-sign sign \
+            -dir hot-scripts \
+            -priv .tmp-scripts/signing.key \
+            -base-url "${SCRIPTS_URL}" \
+            -version "$MANIFEST_VERSION" \
+            -apk ".tmp-release/app-release.apk:${VERSION}:${APK_URL}"
+
+          echo "Signed manifest with APK $VERSION → $APK_URL"
+
+      - name: Clean up key
+        if: always()
+        run: rm -rf .tmp-scripts .tmp-release
+
+      - name: Commit & push updated manifest
+        run: |
+          if git diff --quiet hot-scripts/manifest.json; then
+            echo "manifest.json unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add hot-scripts/manifest.json
+          git commit -m "chore(scripts): add APK ${GITHUB_REF_NAME} to manifest [skip ci]"
+          git push origin HEAD:master
+
+  notify-discord:
+    needs: [release, update-manifest]
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

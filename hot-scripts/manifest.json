@@ -17,6 +17,11 @@
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/vk-config.json"
     }
   },
+  "apk": {
+    "version": "0.24.8",
+    "url": "https://github.com/Fokir/vk-call-proxy/releases/download/v0.24.8/app-release.apk",
+    "sha256": "b092ad3ea8c024d24aae5e4351c6b439edcc67eb3e82999305ecb8fea339eb61"
+  },
   "signature": "I1l4yhy0x2rIOQw2PmBBb60VPoStb+Jd+heA9502fbV3XlBZHj7hiJZvVmF1bGWYaxKyN5rvkzvdH3BZbw0lDQ==",
   "version": "2026.04.18-112138-17b84c2"
 }
