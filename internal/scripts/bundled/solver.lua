@@ -7,7 +7,7 @@ local function get_ua()
         local ua = config.captcha.direct_solver.user_agent
         if ua and ua ~= "" then return ua end
     end
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 end
 
 local function get_api_version()
@@ -31,7 +31,7 @@ local function get_debug_info()
         local d = config.captcha.debug_info_fallback
         if d and d ~= "" then return d end
     end
-    return "8526f575cd75b95c7974b2ed50c7d67ed07f71048b48f88c64ed9cb498c0942d"
+    return "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 end
 
 -- VK captcha API POST with required headers.
@@ -50,39 +50,29 @@ local function vk_captcha_post(ua, method, params)
     return resp.body
 end
 
--- Generate cursor movement data (matches generateSliderCursor in Go).
+-- Generate cursor movement data for checkbox captcha.
+-- Real browser sends only 2-4 points (mouse enters area → clicks checkbox).
 local function generate_cursor()
     local points = {}
 
-    -- Start near slider area.
-    local x = 500 + math.random(200)
+    -- Start position (mouse enters captcha area).
+    local x = 900 + math.random(200)
     local y = 400 + math.random(200)
     table.insert(points, {x = x, y = y})
 
-    -- Move towards slider handle.
-    local target_x = 580 + math.random(40)
-    local target_y = 830 + math.random(20)
-    local steps = 5 + math.random(5)
-    for i = 1, steps do
-        local px = x + math.floor((target_x - x) * i / steps) + math.random(6) - 3
-        local py = y + math.floor((target_y - y) * i / steps) + math.random(6) - 3
-        table.insert(points, {x = px, y = py})
+    -- Move towards checkbox (1-2 intermediate points).
+    local target_x = 580 + math.random(60)
+    local target_y = 380 + math.random(30)
+    if math.random(2) == 1 then
+        -- Optional intermediate point.
+        table.insert(points, {
+            x = x + math.floor((target_x - x) / 2) + math.random(20) - 10,
+            y = y + math.floor((target_y - y) / 2) + math.random(20) - 10,
+        })
     end
 
-    -- Drag slider right.
-    local drag_steps = 10 + math.random(15)
-    local cx, cy = target_x, target_y
-    for _ = 1, drag_steps do
-        cx = cx + 5 + math.random(15)
-        cy = cy + math.random(4) - 2
-        table.insert(points, {x = cx, y = cy})
-    end
-
-    -- Final hold positions.
-    local hold = 2 + math.random(3)
-    for _ = 1, hold do
-        table.insert(points, {x = cx + math.random(2), y = cy + math.random(2)})
-    end
+    -- Final click position.
+    table.insert(points, {x = target_x, y = target_y})
 
     return points
 end
@@ -143,21 +133,23 @@ local function random_adfp()
     return table.concat(buf)
 end
 
--- Generate connection RTT array (11 entries, same base value).
+-- Generate connection RTT array (4-6 entries matching sensors_delay collection).
 local function generate_rtt()
     local base = 50 + math.random(100)
+    local count = 4 + math.random(2)
     local rtt = {}
-    for i = 1, 11 do
+    for i = 1, count do
         rtt[i] = base
     end
     return rtt
 end
 
--- Generate connection downlink array (11 entries, same base value).
+-- Generate connection downlink array (4-6 entries matching sensors_delay collection).
 local function generate_downlink()
-    local base = 5.0 + math.random(15)
+    local base = 5.0 + math.random() * 15.0
+    local count = 4 + math.random(2)
     local dl = {}
-    for i = 1, 11 do
+    for i = 1, count do
         dl[i] = base
     end
     return dl
@@ -197,6 +189,23 @@ local function fetch_captcha_page(ua, redirect_uri)
     m = re.match([[difficulty\s*=\s*(%d+)]], body)
     if m then
         data.pow_difficulty = tonumber(m[1]) or 2
+    end
+
+    -- Extract debug_info from the JS bundle.
+    -- The HTML includes <script src="https://static.vk.com/vkid/.../not_robot_captcha.js">.
+    -- The JS contains a hardcoded debug_info:"<hex>" that VK rotates on each deploy.
+    m = re.match([[src="(https://[^"]+not_robot_captcha[^"]*\.js)"]], body)
+    if m then
+        local js_url = m[1]
+        log.debug("lua-solver: fetching captcha JS for debug_info", "url", js_url)
+        local js_resp = http.get(js_url, {["User-Agent"] = ua})
+        if js_resp.status == 200 then
+            local dm = re.match([[debug_info:"([a-f0-9]{64})"]], js_resp.body)
+            if dm then
+                data.debug_info = dm[1]
+                log.debug("lua-solver: extracted debug_info from JS", "value", data.debug_info)
+            end
+        end
     end
 
     return data
@@ -313,7 +322,7 @@ function solve(challenge)
         browser_fp = browser_fp,
         hash = hash,
         answer = answer,
-        debug_info = get_debug_info(),
+        debug_info = page.debug_info or get_debug_info(),
         access_token = "",
     })
 

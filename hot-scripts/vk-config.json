@@ -21,11 +21,11 @@
   "captcha": {
     "api_version": "5.131",
     "checkbox_answer": "e30=",
-    "debug_info_fallback": "8526f575cd75b95c7974b2ed50c7d67ed07f71048b48f88c64ed9cb498c0942d",
+    "debug_info_fallback": "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c",
     "direct_solver": {
-      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       "language": "ru",
-      "languages": ["ru-RU", "ru", "en-US", "en"]
+      "languages": ["ru"]
     },
     "chromedp_solver": {
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",

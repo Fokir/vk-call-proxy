@@ -32,7 +32,7 @@ const checkboxAnswer = "e30="
 // debugInfoFallback is the hardcoded fallback for `debug_info` inside
 // not_robot_captcha.js (window.vk.brlefapmjnpg || "8526f575..."). VK never sets
 // brlefapmjnpg in its own code paths, so the fallback is always sent.
-const debugInfoFallback = "8526f575cd75b95c7974b2ed50c7d67ed07f71048b48f88c64ed9cb498c0942d"
+const debugInfoFallback = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 
 // DirectSolver solves VK captcha by making direct API calls,
 // mimicking the browser captchaNotRobot flow without actual browser.
@@ -68,7 +68,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	adFp := randomAdFp(r)
-	ua := captchaUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+	ua := captchaUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 
 	// Step 0: Fetch the captcha page to extract PoW params (and slider settings if present).
 	pageData, err := fetchCaptchaPage(ctx, client, ua, redirectURI)
@@ -166,6 +166,12 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 	// Proof-of-work hash (SHA-256 with leading zeros, computed from HTML page params).
 	hash := computeProofOfWork(pageData.powInput, pageData.powDifficulty)
 
+	// Use debug_info from JS bundle if available, otherwise fall back to config/hardcoded.
+	debugInfo := pageData.debugInfo
+	if debugInfo == "" {
+		debugInfo = captchaDebugInfo(debugInfoFallback)
+	}
+
 	slog.Info("captcha direct: submitting check",
 		"ua", ua,
 		"type", pageData.captchaType,
@@ -187,7 +193,7 @@ func solveDirectAPI(ctx context.Context, redirectURI string) (string, error) {
 		"browser_fp":         {browserFp},
 		"hash":               {hash},
 		"answer":             {sliderAnswer},
-		"debug_info":         {captchaDebugInfo(debugInfoFallback)},
+		"debug_info":         {debugInfo},
 		"access_token":       {""},
 	})
 	if err != nil {
@@ -239,6 +245,7 @@ type captchaPageData struct {
 	sliderSettings string // captcha_settings for slider type
 	powInput       string // proof-of-work input string
 	powDifficulty  int    // number of leading hex zeros required
+	debugInfo      string // debug_info extracted from JS bundle (rotated by VK on each deploy)
 }
 
 // fetchCaptchaPage fetches the captcha HTML page and extracts
@@ -291,43 +298,52 @@ func fetchCaptchaPage(ctx context.Context, client *http.Client, ua, redirectURI 
 		}
 	}
 
+	// Extract debug_info from the JS bundle.
+	// HTML has <script src="https://static.vk.com/vkid/.../not_robot_captcha.js">.
+	// JS contains debug_info:"<64-hex>" which VK rotates on each deploy.
+	reJS := regexp.MustCompile(`src="(https://[^"]+not_robot_captcha[^"]*\.js)"`)
+	if match := reJS.FindSubmatch(body); match != nil {
+		jsURL := string(match[1])
+		slog.Debug("captcha direct: fetching JS for debug_info", "url", jsURL)
+		jsReq, err := http.NewRequestWithContext(ctx, "GET", jsURL, nil)
+		if err == nil {
+			jsReq.Header.Set("User-Agent", ua)
+			if jsResp, err := client.Do(jsReq); err == nil {
+				defer jsResp.Body.Close()
+				jsBody, _ := io.ReadAll(jsResp.Body)
+				reDebug := regexp.MustCompile(`debug_info:"([a-f0-9]{64})"`)
+				if dm := reDebug.FindSubmatch(jsBody); dm != nil {
+					data.debugInfo = string(dm[1])
+					slog.Debug("captcha direct: extracted debug_info from JS", "value", data.debugInfo)
+				}
+			}
+		}
+	}
+
 	return data, nil
 }
 
-// generateSliderCursor generates realistic cursor movement for slider interaction.
-// Simulates: mouse enters → moves to slider → drags right → releases.
+// generateSliderCursor generates realistic cursor movement for checkbox captcha.
+// Real browser sends only 2-4 points (mouse enters area → clicks checkbox).
 func generateSliderCursor(r *rand.Rand) []cursorPoint {
-	n := 20 + r.Intn(30)
-	points := make([]cursorPoint, 0, n)
+	points := make([]cursorPoint, 0, 4)
 
-	// Start near the slider area.
-	x := 500 + r.Intn(200)
+	// Start position (mouse enters captcha area).
+	x := 900 + r.Intn(200)
 	y := 400 + r.Intn(200)
 	points = append(points, cursorPoint{X: x, Y: y})
 
-	// Move towards slider handle.
-	targetX := 580 + r.Intn(40)
-	targetY := 830 + r.Intn(20)
-	steps := 5 + r.Intn(5)
-	for i := 1; i <= steps; i++ {
-		px := x + (targetX-x)*i/steps + r.Intn(6) - 3
-		py := y + (targetY-y)*i/steps + r.Intn(6) - 3
-		points = append(points, cursorPoint{X: px, Y: py})
+	// Optional intermediate point.
+	targetX := 580 + r.Intn(60)
+	targetY := 380 + r.Intn(30)
+	if r.Intn(2) == 0 {
+		midX := x + (targetX-x)/2 + r.Intn(20) - 10
+		midY := y + (targetY-y)/2 + r.Intn(20) - 10
+		points = append(points, cursorPoint{X: midX, Y: midY})
 	}
 
-	// Drag slider right (increasing x).
-	dragSteps := 10 + r.Intn(15)
-	cx, cy := targetX, targetY
-	for i := 0; i < dragSteps; i++ {
-		cx += 5 + r.Intn(15)
-		cy += r.Intn(4) - 2
-		points = append(points, cursorPoint{X: cx, Y: cy})
-	}
-
-	// Final position (hold).
-	for i := 0; i < 2+r.Intn(3); i++ {
-		points = append(points, cursorPoint{X: cx + r.Intn(2), Y: cy + r.Intn(2)})
-	}
+	// Final click position.
+	points = append(points, cursorPoint{X: targetX, Y: targetY})
 
 	return points
 }
@@ -410,7 +426,8 @@ type cursorPoint struct {
 
 func generateConnectionRtt(r *rand.Rand) []int {
 	base := 50 + r.Intn(100)
-	rtt := make([]int, 11)
+	count := 4 + r.Intn(3)
+	rtt := make([]int, count)
 	for i := range rtt {
 		rtt[i] = base
 	}
@@ -418,8 +435,9 @@ func generateConnectionRtt(r *rand.Rand) []int {
 }
 
 func generateConnectionDownlink(r *rand.Rand) []float64 {
-	base := 5.0 + float64(r.Intn(15))
-	dl := make([]float64, 11)
+	base := 5.0 + r.Float64()*15.0
+	count := 4 + r.Intn(3)
+	dl := make([]float64, count)
 	for i := range dl {
 		dl[i] = base
 	}
