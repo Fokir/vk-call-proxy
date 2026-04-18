@@ -15,6 +15,8 @@ import (
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/scripts"
+	"github.com/call-vpn/call-vpn/internal/scriptshook"
 )
 
 type config struct {
@@ -66,6 +68,16 @@ func main() {
 		logger.Info("interrupted, shutting down...")
 		cancel()
 	}()
+
+	// Initialize scripts manager (required for auth.lua).
+	scriptsMgr := scripts.NewManager(scripts.Config{
+		Logger: scripts.NewSlogLogger(logger.With("component", "scripts")),
+	})
+	if err := scriptsMgr.Start(ctx); err != nil {
+		logger.Warn("scripts manager start failed", "err", err)
+	}
+	defer scriptsMgr.Stop()
+	scriptshook.Register(scriptsMgr)
 
 	// Create call service and fetch join info for signaling.
 	svc := vk.NewService(cfg.callLink)
