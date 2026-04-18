@@ -61,6 +61,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.cfg.Logger.Warnf("scripts: initial load: %v", err)
 	}
 	if m.cfg.URL != "" {
+		// Check for updates synchronously before returning, so the first
+		// consumer (e.g. captcha solver) gets the latest scripts immediately.
+		m.tryUpdate(ctx)
 		m.wg.Add(1)
 		go m.runLoop(ctx)
 	} else {
@@ -246,14 +249,8 @@ func (m *Manager) loadInitial() error {
 
 func (m *Manager) runLoop(ctx context.Context) {
 	defer m.wg.Done()
-	initial := m.cfg.CheckInterval
-	if initial > time.Second {
-		initial = time.Second
-	}
-	if initial <= 0 {
-		initial = 100 * time.Millisecond
-	}
-	t := time.NewTimer(initial)
+	// First check already done synchronously in Start(), so wait the full interval.
+	t := time.NewTimer(m.cfg.CheckInterval)
 	defer t.Stop()
 
 	for {
