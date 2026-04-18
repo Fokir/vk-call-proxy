@@ -1,10 +1,10 @@
 {
   "apk": {
-    "sha256": "b092ad3ea8c024d24aae5e4351c6b439edcc67eb3e82999305ecb8fea339eb61",
-    "url": "https://github.com/Fokir/vk-call-proxy/releases/download/v0.24.8/app-release.apk",
-    "version": "0.24.8"
+    "sha256": "15415d175ae255222443909c9a253b2297e1668e3f28af513d304ccdaa429c80",
+    "url": "https://github.com/Fokir/vk-call-proxy/releases/download/v0.24.9/app-release.apk",
+    "version": "0.24.9"
   },
-  "published_at": "2026-04-18T18:47:43Z",
+  "published_at": "2026-04-18T19:12:53Z",
   "scripts": {
     "auth.lua": {
       "sha256": "4deddb5c6643e7db077a17cfece7d35dfd769c73e17366e4b6a4e09c0f1e3a0e",
@@ -27,6 +27,6 @@
       "url": "https://raw.githubusercontent.com/Fokir/vk-call-proxy/master/hot-scripts/vk-config.json"
     }
   },
-  "signature": "u899ETVjxL6HdDYOXRg4RYu6lSFqEZGHZqC4/HZFLngR6OLZj+KKwGraFa89V1KPvIp8nOzqlMWlBgU5pp8LDg==",
-  "version": "2026.04.18-184738-5898450"
+  "signature": "QuUYY5GZHi4I+HEiTBSZPatb4RPpdZlVgtDo0bBea0FWW2ih3l6VR7HDN+G5LI6zyHQJsCoPOAAM8ushTFnrAQ==",
+  "version": "2026.04.18-191253-fabbe0c"
 }
