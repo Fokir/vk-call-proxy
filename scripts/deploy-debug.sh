@@ -21,7 +21,17 @@ for arg in "$@"; do
   esac
 done
 
-adb_() { MSYS_NO_PATHCONV=1 adb "$@"; }
+# adb wrapper: MSYS_NO_PATHCONV prevents path mangling for remote args.
+# For 'adb push', convert the local path to Windows format so adb.exe can find it.
+adb_() {
+  if [[ "${1:-}" == "push" && -n "${2:-}" && "$2" == /* ]]; then
+    local winpath
+    winpath="$(cygpath -w "$2" 2>/dev/null || echo "$2")"
+    MSYS_NO_PATHCONV=1 adb push "$winpath" "${@:3}"
+  else
+    MSYS_NO_PATHCONV=1 adb "$@"
+  fi
+}
 su_()  { adb_ shell "su -c '$*'"; }
 
 echo "=== Checking device ==="
