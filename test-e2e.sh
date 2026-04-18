@@ -15,6 +15,7 @@
 #                     Uses DIRECT_SERVER from .env (e.g. 85.198.85.223:9000)
 #   --direct=H:P      Direct mode with explicit server address
 #   --listen=ADDR     Server listen address for direct mode (default: 0.0.0.0:9000)
+#   --proxy=URL       Upstream proxy for server traffic (socks5://host:port or http://host:port)
 #
 # Examples:
 #   ./test-e2e.sh --n=1                     # relay: 1 call × 1 conn
@@ -44,6 +45,7 @@ CAPTCHA_PORT=18090
 DIRECT_MODE=""         # empty=relay, "env"=from .env, "host:port"=explicit
 LISTEN_ADDR="0.0.0.0:9000"
 USE_TELEMOST=""        # "1" = use TELEMOST_LINK from .env instead of VK_CALL_LINK
+UPSTREAM_PROXY=""      # upstream proxy URL for server (socks5:// or http://)
 
 for arg in "$@"; do
   case $arg in
@@ -59,6 +61,7 @@ for arg in "$@"; do
     --verbose) VERBOSE="--verbose" ;;
     --striping) STRIPING=1 ;;
     --telemost) USE_TELEMOST=1 ;;
+    --proxy=*) UPSTREAM_PROXY="${arg#*=}" ;;
   esac
 done
 
@@ -158,6 +161,7 @@ echo "  Connections:  $CONNS"
 echo "  Links:        $LINKS"
 echo "  Monitor:      ${MONITOR_MIN}m"
 echo "  Verbose:      $([ -n "$VERBOSE" ] && echo yes || echo no)"
+echo "  Proxy:        $([ -n "$UPSTREAM_PROXY" ] && echo "$UPSTREAM_PROXY" || echo none)"
 echo "  Striping:     $([ -n "$STRIPING" ] && echo forced || echo adaptive)"
 echo ""
 
@@ -493,11 +497,16 @@ fi
 # --- Start server ---
 echo ""
 TOTAL_CONNS=$((CONNS * LINKS))
+PROXY_ARG=""
+if [[ -n "$UPSTREAM_PROXY" ]]; then
+  PROXY_ARG="--proxy=$UPSTREAM_PROXY"
+fi
 if [[ -n "$DIRECT_SERVER" ]]; then
   echo "[$(ts)] Starting server in DIRECT mode (listen=$LISTEN_ADDR)..."
   VK_CALL_LINK="" ./callvpn-server${EXE} \
     --listen="$LISTEN_ADDR" \
     --token="$VPN_TOKEN" \
+    $PROXY_ARG \
     $VERBOSE \
     2>&1 | sed "s/^/  [server] /" &
   SERVER_PID=$!
@@ -508,6 +517,7 @@ elif [[ -n "$USE_TELEMOST" ]]; then
     $LINK_ARGS \
     --n="$CONNS" \
     --token="$VPN_TOKEN" \
+    $PROXY_ARG \
     $VERBOSE \
     2>&1 | sed "s/^/  [server] /" &
   SERVER_PID=$!
@@ -521,6 +531,7 @@ else
     --token="$VPN_TOKEN" \
     --captcha-endpoint="$CAPTCHA_ENDPOINT" \
     $VK_TOKEN_ARGS_SERVER \
+    $PROXY_ARG \
     $VERBOSE \
     2>&1 | sed "s/^/  [server] /" &
   SERVER_PID=$!
@@ -613,6 +624,18 @@ if [[ $READY -ne 1 ]]; then
   echo "FATAL: proxy not ready after $((PROXY_ATTEMPTS*2))s"
   exit 1
 fi
+
+# --- IP check ---
+echo ""
+echo "====== IP CHECK ======"
+DIRECT_IP=$(curl -s --max-time 10 httpbin.org/ip 2>/dev/null | grep -oP '"origin":\s*"\K[^"]+' || echo "unknown")
+TUNNEL_IP=$(curl -x socks5://127.0.0.1:$SOCKS_PORT -s --max-time 10 httpbin.org/ip 2>/dev/null | grep -oP '"origin":\s*"\K[^"]+' || echo "unknown")
+echo "  Direct IP:  $DIRECT_IP"
+echo "  Tunnel IP:  $TUNNEL_IP"
+if [[ "$DIRECT_IP" == "$TUNNEL_IP" && "$DIRECT_IP" != "unknown" ]]; then
+  echo "  WARNING: IPs match — traffic may not be proxied!"
+fi
+echo "======================"
 
 # --- Speed test ---
 run_speed_test "n=$CONNS"
