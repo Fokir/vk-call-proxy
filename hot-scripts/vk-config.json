@@ -21,7 +21,7 @@
   "captcha": {
     "api_version": "5.131",
     "checkbox_answer": "e30=",
-    "debug_info_fallback": "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c",
+    "debug_info_fallback": "f3ef768dab7a20f574c6461f34e4257894d2a3c30a53d8727a3edaf7ab70847d",
     "direct_solver": {
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       "language": "ru",

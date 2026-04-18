@@ -32,7 +32,7 @@ const checkboxAnswer = "e30="
 // debugInfoFallback is the hardcoded fallback for `debug_info` inside
 // not_robot_captcha.js (window.vk.brlefapmjnpg || "8526f575..."). VK never sets
 // brlefapmjnpg in its own code paths, so the fallback is always sent.
-const debugInfoFallback = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
+const debugInfoFallback = "f3ef768dab7a20f574c6461f34e4257894d2a3c30a53d8727a3edaf7ab70847d"
 
 // DirectSolver solves VK captcha by making direct API calls,
 // mimicking the browser captchaNotRobot flow without actual browser.
@@ -311,7 +311,7 @@ func fetchCaptchaPage(ctx context.Context, client *http.Client, ua, redirectURI 
 			if jsResp, err := client.Do(jsReq); err == nil {
 				defer jsResp.Body.Close()
 				jsBody, _ := io.ReadAll(jsResp.Body)
-				reDebug := regexp.MustCompile(`debug_info:"([a-f0-9]{64})"`)
+				reDebug := regexp.MustCompile(`debug_info:.*?\|\|"([a-f0-9]{64})"`)
 				if dm := reDebug.FindSubmatch(jsBody); dm != nil {
 					data.debugInfo = string(dm[1])
 					slog.Debug("captcha direct: extracted debug_info from JS", "value", data.debugInfo)

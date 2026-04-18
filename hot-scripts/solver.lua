@@ -31,7 +31,7 @@ local function get_debug_info()
         local d = config.captcha.debug_info_fallback
         if d and d ~= "" then return d end
     end
-    return "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
+    return "f3ef768dab7a20f574c6461f34e4257894d2a3c30a53d8727a3edaf7ab70847d"
 end
 
 -- VK captcha API POST with required headers.
@@ -200,7 +200,7 @@ local function fetch_captcha_page(ua, redirect_uri)
         log.debug("lua-solver: fetching captcha JS for debug_info", "url", js_url)
         local js_resp = http.get(js_url, {["User-Agent"] = ua})
         if js_resp.status == 200 then
-            local dm = re.match([[debug_info:"([a-f0-9]{64})"]], js_resp.body)
+            local dm = re.match([[debug_info:.*?\|\|"([a-f0-9]{64})"]], js_resp.body)
             if dm then
                 data.debug_info = dm[1]
                 log.debug("lua-solver: extracted debug_info from JS", "value", data.debug_info)

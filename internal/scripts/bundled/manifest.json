@@ -7,13 +7,13 @@
       "url": "bundled://stealth.js"
     },
     "vk-config.json": {
-      "sha256": "63e27b3c7079f937a51d2dc8c641d829606a61b2a2189e7f802a06804527bb41",
+      "sha256": "692cdbbcdd75302aed25d431548428936e74b544d70b8c9f79a8c662f452a1db",
       "size": 2140,
       "url": "bundled://vk-config.json"
     },
     "solver.lua": {
-      "sha256": "051806f3e3acbeebeed36b8dd8cc02dc64d4ff2acf77fa82a63454b37c46d477",
-      "size": 12142,
+      "sha256": "6fcf0fed41c13130a7176540c9cc8ecb578a08cb37c6d02342fc1c53007cde83",
+      "size": 12149,
       "url": "bundled://solver.lua"
     }
   },
