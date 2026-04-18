@@ -36,18 +36,20 @@ const (
 // Stack wraps gVisor's userspace TCP/IP stack to process raw IP packets
 // from mobile clients and proxy them to the real network.
 type Stack struct {
-	s      *stack.Stack
-	ep     *channel.Endpoint
-	m      *mux.Mux
-	logger *slog.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	s           *stack.Stack
+	ep          *channel.Endpoint
+	m           *mux.Mux
+	logger      *slog.Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // New creates a gVisor netstack that handles raw IP packets from the mux.
 // TCP and UDP connections are forwarded to real destinations via net.Dial.
-func New(logger *slog.Logger, m *mux.Mux) *Stack {
+// If dialContext is non-nil, it is used to dial TCP connections (e.g. through an upstream proxy).
+func New(logger *slog.Logger, m *mux.Mux, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) *Stack {
 	ep := channel.New(chanSz, mtu, "")
 
 	s := stack.New(stack.Options{
@@ -80,10 +82,11 @@ func New(logger *slog.Logger, m *mux.Mux) *Stack {
 	})
 
 	ns := &Stack{
-		s:      s,
-		ep:     ep,
-		m:      m,
-		logger: logger.With("component", "netstack"),
+		s:           s,
+		ep:          ep,
+		m:           m,
+		logger:      logger.With("component", "netstack"),
+		dialContext: dialContext,
 	}
 
 	// Set up TCP forwarder.
@@ -317,7 +320,15 @@ func (ns *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
 	// Dial real destination.
-	outConn, err := net.DialTimeout("tcp", dst, 10*time.Second)
+	var outConn net.Conn
+	var err error
+	if ns.dialContext != nil {
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dialCancel()
+		outConn, err = ns.dialContext(dialCtx, "tcp", dst)
+	} else {
+		outConn, err = net.DialTimeout("tcp", dst, 10*time.Second)
+	}
 	if err != nil {
 		ns.logger.Debug("tcp dial failed", "dst", dst, "err", err)
 		r.Complete(true) // send RST

@@ -253,7 +253,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 	go m.DispatchLoop(sessCtx)
 	go m.StartPingLoop(sessCtx, 10*time.Second)
 
-	ns := netstack.New(sessLogger, m)
+	ns := netstack.New(sessLogger, m, s.cfg.DialContext)
 	if ns != nil {
 		ns.Start(sessCtx)
 	}
@@ -537,7 +537,7 @@ func (s *Server) runMultiRelaySession(ctx context.Context) {
 	go m.DispatchLoop(ctx)
 	go m.StartPingLoop(ctx, 10*time.Second)
 
-	ns := netstack.New(logger, m)
+	ns := netstack.New(logger, m, s.cfg.DialContext)
 	if ns != nil {
 		ns.Start(ctx)
 		defer ns.Close()
@@ -956,7 +956,7 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	go m.StartPingLoop(pingCtx, 10*time.Second)
 	go mgr.StartKeepalive(sessCtx, 10*time.Second)
 
-	ns := netstack.New(s.cfg.Logger, m)
+	ns := netstack.New(s.cfg.Logger, m, s.cfg.DialContext)
 	if ns != nil {
 		ns.Start(sessCtx)
 		defer ns.Close()
