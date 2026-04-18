@@ -114,6 +114,7 @@ func main() {
 	}
 	if proxyDial != nil {
 		logger.Info("upstream proxy configured", "url", *proxyURL)
+		proxyDial = upstream.WithFallback(proxyDial, logger)
 	}
 
 	cfg := server.Config{

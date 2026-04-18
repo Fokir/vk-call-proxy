@@ -352,6 +352,9 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":"invalid proxy URL: %s"}`, err), http.StatusBadRequest)
 		return
 	}
+	if proxyDial != nil {
+		proxyDial = upstream.WithFallback(proxyDial, logger)
+	}
 
 	srvCfg := server.Config{
 		Service:     svc,

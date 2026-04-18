@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -105,5 +106,19 @@ func httpConnectDialer(u *url.URL) DialContextFunc {
 		}
 
 		return conn, nil
+	}
+}
+
+// WithFallback wraps a proxy dialer so that on failure it logs the error
+// and falls back to a direct connection.
+func WithFallback(proxyDial DialContextFunc, logger *slog.Logger) DialContextFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := proxyDial(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		logger.Warn("proxy dial failed, falling back to direct", "addr", addr, "err", err)
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
 	}
 }
