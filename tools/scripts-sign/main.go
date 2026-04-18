@@ -209,6 +209,17 @@ func cmdSign() {
 			"url":     apk.url,
 			"sha256":  apk.sha256,
 		}
+	} else {
+		// Preserve existing APK entry from current manifest if present.
+		existingManifest := filepath.Join(absDir, "manifest.json")
+		if raw, err := os.ReadFile(existingManifest); err == nil {
+			var existing map[string]any
+			if json.Unmarshal(raw, &existing) == nil {
+				if apk, ok := existing["apk"]; ok {
+					mf["apk"] = apk
+				}
+			}
+		}
 	}
 
 	payload := canonicalize(mf)
