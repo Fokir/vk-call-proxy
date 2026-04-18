@@ -485,6 +485,10 @@ function createInstanceHTML(idx) {
         <div class="parsed-id" id="parsed_${idx}"></div>
       </div>
       <div class="field">
+        <label>Proxy URL</label>
+        <input type="text" id="proxy_${idx}" placeholder="socks5://host:port or http://user:pass@host:port" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
         <label>Auth Token</label>
         <div class="input-row">
           <input type="password" id="token_${idx}" placeholder="Token (or set VPN_TOKEN env var)" autocomplete="off" spellcheck="false">
@@ -548,6 +552,7 @@ function renderInstances(configs) {
 
     if (cfg.call_link) el('link', idx).value = cfg.call_link;
     if (cfg.auth_token) el('token', idx).value = cfg.auth_token;
+    if (cfg.proxy_url) el('proxy', idx).value = cfg.proxy_url;
 
     el('link', idx).addEventListener('input', e => {
       const id = parseLink(e.target.value);
@@ -622,7 +627,7 @@ async function toggleConnection(idx) {
       const res = await fetch('/api/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: idx, link, token: el('token', idx).value })
+        body: JSON.stringify({ id: idx, link, token: el('token', idx).value, proxy_url: el('proxy', idx).value })
       });
       if (res.ok) {
         setStatus(idx, true, 'Connected');

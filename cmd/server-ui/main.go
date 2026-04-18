@@ -23,6 +23,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/proxy/upstream"
 	"github.com/call-vpn/call-vpn/internal/scripts"
 	"github.com/call-vpn/call-vpn/internal/scriptshook"
 	"github.com/call-vpn/call-vpn/internal/server"
@@ -110,6 +111,7 @@ type instanceConfig struct {
 	CallLink  string   `json:"call_link"`            // single link (backward compat)
 	CallLinks []string `json:"call_links,omitempty"` // multi-link pool
 	AuthToken string   `json:"auth_token"`
+	ProxyURL  string   `json:"proxy_url,omitempty"` // upstream proxy (socks5:// or http://)
 }
 
 // links returns all configured links, preferring CallLinks over CallLink.
@@ -293,9 +295,10 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ID    int    `json:"id"`
-		Link  string `json:"link"`
-		Token string `json:"token"`
+		ID       int    `json:"id"`
+		Link     string `json:"link"`
+		Token    string `json:"token"`
+		ProxyURL string `json:"proxy_url"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -324,7 +327,7 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 	for len(cfg.Instances) <= req.ID {
 		cfg.Instances = append(cfg.Instances, instanceConfig{})
 	}
-	cfg.Instances[req.ID] = instanceConfig{CallLink: req.Link, AuthToken: req.Token}
+	cfg.Instances[req.ID] = instanceConfig{CallLink: req.Link, AuthToken: req.Token, ProxyURL: req.ProxyURL}
 	saveConfig(cfg)
 
 	logger := slog.New(slog.NewTextHandler(inst.logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -344,11 +347,18 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 		svc = vk.NewService(link, vk.WithCaptchaSolver(solver))
 	}
 
+	proxyDial, err := upstream.ParseProxyURL(req.ProxyURL)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"invalid proxy URL: %s"}`, err), http.StatusBadRequest)
+		return
+	}
+
 	srvCfg := server.Config{
-		Service:   svc,
-		AuthToken: authToken,
-		UseTCP:    true,
-		Logger:    logger,
+		Service:     svc,
+		AuthToken:   authToken,
+		UseTCP:      true,
+		Logger:      logger,
+		DialContext: proxyDial,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
